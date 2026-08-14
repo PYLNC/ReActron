@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ReActron</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app" id="app">
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">AI</div>
+        <div class="brand-text">
+          <h1>ReActron</h1>
+          <p id="modelLabel">Agent</p>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <button id="toggleSessionsBtn" class="panel-toggle active" type="button">会话</button>
+        <button id="toggleInfoBtn" class="panel-toggle active" type="button">信息</button>
+        <button id="settingsBtn" class="icon-button" type="button">设置</button>
+        <div class="status" id="statusPill">
+          <span class="status-dot" id="statusDot"></span>
+          <span id="statusText">就绪</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar sessions-panel" id="sessionsPanel">
+        <div class="panel-head">
+          <h2>会话</h2>
+          <div class="panel-head-actions">
+            <button id="newProjectBtn" class="small-btn" type="button">项目</button>
+            <button id="newSessionBtn" class="small-btn" type="button">新建</button>
+            <button id="closeSessionsBtn" class="panel-close" type="button">收起</button>
+          </div>
+        </div>
+        <select id="projectAssignSelect" class="project-select" title="将当前会话归入项目">
+          <option value="">未分组</option>
+        </select>
+        <ul class="session-list" id="sessionList"></ul>
+      </aside>
+
+      <main class="chat" id="chat">
+        <div class="empty-state" id="emptyState">
+          <div class="empty-mark" aria-hidden="true">AI</div>
+          <h2>开始对话</h2>
+        </div>
+      </main>
+
+      <aside class="info-panel" id="infoPanel">
+        <div class="panel-head">
+          <h2>信息</h2>
+          <button id="closeInfoBtn" class="panel-close" type="button">收起</button>
+        </div>
+
+        <section class="info-section open" id="skillsSection">
+          <button class="info-section-toggle" type="button">
+            <span>技能</span>
+            <span class="chevron" aria-hidden="true">⌄</span>
+          </button>
+          <div class="info-section-body">
+            <ul class="skill-list" id="skillList"></ul>
+          </div>
+        </section>
+
+        <section class="info-section open" id="toolsSection">
+          <button class="info-section-toggle" type="button">
+            <span>可用工具</span>
+            <span class="chevron" aria-hidden="true">⌄</span>
+          </button>
+          <div class="info-section-body">
+            <ul class="tool-list" id="toolList"></ul>
+          </div>
+        </section>
+
+        <section class="info-section" id="paramsSection">
+          <button class="info-section-toggle" type="button">
+            <span>运行参数</span>
+            <span class="chevron" aria-hidden="true">⌄</span>
+          </button>
+          <div class="info-section-body">
+            <dl class="meta-list">
+              <div>
+                <dt>最大轮数</dt>
+                <dd id="maxRoundsValue">5</dd>
+              </div>
+              <div>
+                <dt>流式输出</dt>
+                <dd>SSE</dd>
+              </div>
+            </dl>
+          </div>
+        </section>
+      </aside>
+    </div>
+
+    <footer class="composer-wrap">
+      <form class="composer" id="composer">
+        <input type="file" id="fileInput" hidden>
+        <button id="uploadBtn" class="upload-btn" type="button">上传</button>
+        <textarea id="input" rows="1" placeholder="输入消息..." autocomplete="off"></textarea>
+        <button type="submit" id="sendBtn">发送</button>
+      </form>
+    </footer>
+  </div>
+
+  <div class="modal-backdrop" id="settingsModal" hidden>
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <h2>API 设置</h2>
+        <button id="closeSettingsBtn" class="icon-button" type="button">关闭</button>
+      </div>
+
+      <form id="settingsForm">
+        <label>
+          API Key
+          <input type="password" id="apiKeyInput" autocomplete="off" placeholder="可选">
+        </label>
+        <label>
+          Base URL
+          <input type="text" id="baseUrlInput">
+        </label>
+        <label>
+          模型
+          <input type="text" id="modelInput">
+        </label>
+        <div class="modal-grid">
+          <label>
+            最大轮数
+            <input type="number" id="maxRoundsInput" min="1" step="1">
+          </label>
+          <label>
+            工具超时
+            <input type="number" id="timeoutInput" min="0.1" step="0.1">
+          </label>
+        </div>
+        <div class="modal-actions">
+          <button type="submit">保存并加密</button>
+          <span id="settingsStatus"></span>
+        </div>
+      </form>
+
+      <section class="mcp-panel">
+        <div class="mcp-head">
+          <h3>MCP 服务器</h3>
+          <span id="mcpStatus"></span>
+        </div>
+        <ul id="mcpServerList" class="mcp-server-list"></ul>
+        <div class="mcp-form">
+          <input id="mcpNameInput" type="text" placeholder="名称">
+          <select id="mcpTransportInput">
+            <option value="stdio">stdio</option>
+            <option value="sse">sse</option>
+          </select>
+          <input id="mcpCommandInput" type="text" placeholder="命令，例如 npx">
+          <input id="mcpArgsInput" type="text" placeholder='参数 JSON，例如 ["-y", "server"]'>
+          <input id="mcpUrlInput" type="text" placeholder="SSE URL">
+          <div class="mcp-actions">
+            <button id="addMcpBtn" type="button">添加并刷新</button>
+            <button id="refreshMcpBtn" type="button">重新发现</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
