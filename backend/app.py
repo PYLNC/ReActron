@@ -4,13 +4,25 @@ import logging
 import os
 import sys
 import time
+import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+STATIC_DIR = BASE_DIR / "static"
+
+# 配置文件必须先于日志设置和会创建运行资源的模块导入。
+load_dotenv(BASE_DIR / ".env")
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+from backend.config import load_config
 
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -23,19 +35,8 @@ logging.basicConfig(
 logger = logging.getLogger("agent.app")
 logger.info("日志配置：LOG_LEVEL=%s，LOG_STREAM=%s", LOG_LEVEL, LOG_STREAM)
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-STATIC_DIR = BASE_DIR / "static"
-
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
-
-from backend.api import router
-from backend.config import load_config
-from backend.db import DB_PATH
-
-
-# 只加载正式 .env；.env.example 只是模板，不再作为运行配置读取。
-load_dotenv(BASE_DIR / ".env")
 
 
 def _warn_if_secret_in_example():
@@ -56,32 +57,48 @@ def _warn_if_secret_in_example():
 
 
 _warn_if_secret_in_example()
-
-app = FastAPI(title="ReActron Agent 框架", version="0.9.0")
-
-cfg = load_config()
-logger.info(
-    "FastAPI 应用初始化完成，BASE_DIR=%s，model=%s，max_rounds=%d，db=%s",
-    BASE_DIR,
-    cfg.model,
-    cfg.max_rounds,
-    DB_PATH,
-)
-
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-app.include_router(router)
+_api_router_loaded = False
 
 
-@app.on_event("startup")
-async def startup_mcp():
-    """启动时自动刷新 MCP 工具注册。"""
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    """按配置、数据库和 MCP 的现有边界启动，并反序关闭。"""
+    global _api_router_loaded
+
+    cfg = load_config()
+    application.state.config = cfg
+
+    # 延迟导入把当前 DB/迁移副作用收进 lifespan；A 将提供显式 open 接口。
+    from backend import api as api_module
+    from backend.db import DB_PATH, db
+
+    if not _api_router_loaded:
+        application.include_router(api_module.router)
+        _api_router_loaded = True
+
+    logger.info(
+        "应用启动：model=%s，max_rounds=%d，db=%s",
+        cfg.model,
+        cfg.max_rounds,
+        DB_PATH,
+    )
+
     from backend.mcp.manager import get_manager
 
     try:
-        result = await get_manager().refresh_registry()
-        logger.info("MCP 启动刷新完成：%s", result)
-    except Exception as exc:
-        logger.warning("MCP 启动刷新失败：%s", exc)
+        try:
+            result = await get_manager().refresh_registry()
+            logger.info("MCP 启动刷新完成：%s", result)
+        except Exception as exc:
+            logger.warning("MCP 启动刷新失败：%s", exc)
+        yield
+    finally:
+        db.close()
+        logger.info("应用关闭：数据库连接已关闭")
+
+
+app = FastAPI(title="ReActron Agent 框架", version="0.9.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/")
@@ -93,10 +110,19 @@ async def index():
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     """把 Pydantic 校验错误转换成统一 JSON 格式。"""
-    logger.warning("请求校验失败：%s", exc.errors())
+    details = [
+        {"type": error["type"], "loc": error["loc"], "message": error["msg"]}
+        for error in exc.errors()
+    ]
+    logger.warning("请求校验失败：path=%s，errors=%d", request.url.path, len(details))
     return JSONResponse(
         status_code=422,
-        content={"error": "请求参数校验失败", "detail": exc.errors()},
+        content={
+            "code": "request_validation_error",
+            "message": "请求参数校验失败",
+            "details": details,
+            "trace_id": uuid.uuid4().hex,
+        },
     )
 
 

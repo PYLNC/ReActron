@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,35 @@ router = APIRouter(prefix="/api")
 UPLOAD_DIR = DATA_DIR / "uploads"
 ALLOWED_UPLOAD_EXTENSIONS = {".xlsx", ".pptx", ".csv", ".txt", ".md", ".json", ".log"}
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024
+
+# ponytail: single-process gate; delete when P1's persisted active-Run index lands.
+_active_session_ids = set()
+_active_session_lock = threading.Lock()
+
+
+def _reserve_session(session_id: str) -> bool:
+    with _active_session_lock:
+        if session_id in _active_session_ids:
+            return False
+        _active_session_ids.add(session_id)
+        return True
+
+
+def _release_session(session_id: str):
+    with _active_session_lock:
+        _active_session_ids.discard(session_id)
+
+
+def _error_response(status_code: int, code: str, message: str, details=None):
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "code": code,
+            "message": message,
+            "details": details or {},
+            "trace_id": uuid.uuid4().hex,
+        },
+    )
 
 
 def _sse(event: dict) -> str:
@@ -406,7 +436,7 @@ async def chat(payload: ChatRequest):
     """接收消息，按会话持久化并 SSE 流式返回 Agent 执行过程。"""
     message = payload.message.strip()
     if not message:
-        return JSONResponse({"error": "message 不能为空"}, status_code=400)
+        return _error_response(400, "invalid_request", "message 不能为空")
 
     session_id = (payload.session_id or "").strip() or None
     if session_id:
@@ -421,14 +451,25 @@ async def chat(payload: ChatRequest):
         session_id = session["id"]
         logger.info("自动创建会话：%s", session_id)
 
-    # 用户消息立即持久化，保证即使模型调用失败也不会丢失
-    db.add_message(session_id, "user", message)
-    # 首条消息自动生成会话标题
-    session = db.get_session(session_id)
-    if session and session["title"] in ("新会话", ""):
-        db.rename_session(session_id, _make_session_title(message))
-    history = db.get_messages(session_id)
-    cfg = get_runtime_config()
+    if not _reserve_session(session_id):
+        return _error_response(
+            409,
+            "run_already_active",
+            "该会话已有活动执行",
+            {"session_id": session_id},
+        )
+
+    try:
+        # reserve 必须先于消息写入，拒绝请求不能留下孤立 user message。
+        db.add_message(session_id, "user", message)
+        session = db.get_session(session_id)
+        if session and session["title"] in ("新会话", ""):
+            db.rename_session(session_id, _make_session_title(message))
+        history = db.get_messages(session_id)
+        cfg = get_runtime_config()
+    except Exception:
+        _release_session(session_id)
+        raise
     logger.info(
         "聊天请求输入：session_id=%s，message=%s，历史消息数=%d",
         session_id,
@@ -476,6 +517,8 @@ async def chat(payload: ChatRequest):
         except Exception as exc:
             logger.exception("处理 /api/chat 请求失败：%s", exc)
             yield _sse({"type": "error", "message": f"请求失败: {exc}"})
+        finally:
+            _release_session(session_id)
 
     return StreamingResponse(
         event_stream(),

@@ -2,31 +2,30 @@
 setlocal
 cd /d "%~dp0"
 
-set "PYTHON=E:\anaconda\envs\countbot\python.exe"
-set "PORT=8001"
+set "PYTHON=%~dp0.venv\Scripts\python.exe"
+if not defined PORT set "PORT=8001"
 set "URL=http://127.0.0.1:%PORT%"
 set "PYTHONIOENCODING=utf-8"
-set "LOG_LEVEL=INFO"
-set "LOG_STREAM=1"
+if not defined LOG_LEVEL set "LOG_LEVEL=INFO"
+if not defined LOG_STREAM set "LOG_STREAM=1"
 
 if not exist "%PYTHON%" (
-  echo [countboter] Python not found: %PYTHON%
-  pause
+  echo [ReActron] Missing .venv Python: "%PYTHON%"
+  echo [ReActron] Create the repository .venv from requirements.lock first.
   exit /b 1
 )
 
 netstat -ano | findstr "LISTENING" | findstr "127.0.0.1:%PORT%" >nul
 if not errorlevel 1 (
-  echo [countboter] Service already running: %URL%
-  pause
+  echo [ReActron] Service already running: %URL%
   exit /b 0
 )
 
-echo [countboter] Starting %URL%
-"%PYTHON%" -m uvicorn backend.app:app --host 127.0.0.1 --port %PORT%
+echo [ReActron] Starting %URL%
+"%PYTHON%" -m uvicorn backend.app:app --host 127.0.0.1 --port "%PORT%" --workers 1
 if errorlevel 1 (
-  echo [countboter] Startup failed, see errors above.
-  pause
+  echo [ReActron] Startup failed, see errors above.
+  exit /b 1
 )
 
 endlocal
