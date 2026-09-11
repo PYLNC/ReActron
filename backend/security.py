@@ -1,8 +1,9 @@
 """API Key 加密与解密：使用 Fernet 对称加密。"""
 
-import base64
 import logging
 import os
+import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -18,22 +19,64 @@ _lock = threading.Lock()
 _fernet = None
 
 
-def _load_key() -> bytes:
-    """优先读取 APP_SECRET_KEY，否则自动生成并保存密钥文件。"""
-    env_key = os.getenv("APP_SECRET_KEY", "").strip()
-    if env_key:
-        try:
-            return base64.urlsafe_b64decode(env_key.encode("ascii"))
-        except Exception:
-            logger.warning("APP_SECRET_KEY 不是有效的 base64，回退到本地密钥文件")
-
-    if SECRET_FILE.exists():
-        return SECRET_FILE.read_bytes()
-
-    key = Fernet.generate_key()
-    SECRET_FILE.write_bytes(key)
-    logger.info("已生成加密密钥文件：%s", SECRET_FILE)
+def _validate_key(key: bytes, source: str) -> bytes:
+    """验证并原样返回标准 Fernet 编码。"""
+    try:
+        Fernet(key)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{source} 不是有效的 Fernet 密钥") from exc
     return key
+
+
+def _create_posix_key_file() -> bytes:
+    """完整写入临时文件后，以不覆盖方式原子发布 0600 密钥文件。"""
+    key = Fernet.generate_key()
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{SECRET_FILE.name}.",
+        dir=SECRET_FILE.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.chmod(temporary_path, 0o600)
+        stream = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with stream:
+            stream.write(key)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        try:
+            os.link(temporary_path, SECRET_FILE)
+            logger.info("已生成加密密钥文件：%s", SECRET_FILE)
+        except FileExistsError:
+            pass
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
+
+    return _validate_key(SECRET_FILE.read_bytes(), str(SECRET_FILE))
+
+
+def _load_key() -> bytes:
+    """优先验证 APP_SECRET_KEY，否则读取或安全创建本地密钥文件。"""
+    if "APP_SECRET_KEY" in os.environ:
+        try:
+            env_key = os.environ["APP_SECRET_KEY"].encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise RuntimeError("APP_SECRET_KEY 必须是 ASCII Fernet 密钥") from exc
+        return _validate_key(env_key, "APP_SECRET_KEY")
+
+    try:
+        return _validate_key(SECRET_FILE.read_bytes(), str(SECRET_FILE))
+    except FileNotFoundError:
+        pass
+
+    if sys.platform == "win32":
+        raise RuntimeError(
+            "Windows 首次启动必须设置 APP_SECRET_KEY；本阶段不自动创建密钥文件"
+        )
+    return _create_posix_key_file()
 
 
 def _get_fernet() -> Fernet:
@@ -44,6 +87,11 @@ def _get_fernet() -> Fernet:
             if _fernet is None:
                 _fernet = Fernet(_load_key())
     return _fernet
+
+
+def validate_secret_key() -> None:
+    """供应用启动阶段主动验证或初始化 Fernet 密钥。"""
+    _get_fernet()
 
 
 def encrypt_text(plain_text: str) -> str:
