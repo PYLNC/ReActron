@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Scan for committed secrets
+        run: python -B scripts/check_secrets.py
+
+      - name: Parse Python sources
+        run: >-
+          python -B -c "import ast, pathlib;
+          roots = ('backend', 'scripts', 'tests');
+          files = [path for root in roots for path in pathlib.Path(root).rglob('*.py')];
+          [ast.parse(path.read_text(encoding='utf-8'), filename=str(path)) for path in files];
+          print(f'Parsed {len(files)} Python files')"
+
+      - name: Parse browser JavaScript
+        run: node --check static/app.js
+
+      - name: Install locked dependencies in a clean venv
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock
+          .\.venv\Scripts\python.exe -m pip check
+
+      - name: Run tests
+        run: .\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
+
+      - name: Smoke-test health with external services disabled
+        shell: pwsh
+        run: |
+          $pythonPath = Join-Path $env:GITHUB_WORKSPACE ".venv\Scripts\python.exe"
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "reactron-health-smoke"
+          git worktree add --detach $smokeRoot HEAD
+          try {
+            Set-Location $smokeRoot
+            $env:APP_SECRET_KEY = & $pythonPath -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode('ascii'))"
+            $env:DEEPSEEK_API_KEY = ""
+            $env:MCP_SERVERS = "[]"
+            $env:HARNESS_MODE = "enforce"
+            $env:LOG_STREAM = "0"
+            & $pythonPath -B -c "from fastapi.testclient import TestClient; from backend.app import app; client = TestClient(app); client.__enter__(); response = client.get('/api/health'); print(f'health_status={response.status_code}'); response.raise_for_status(); client.__exit__(None, None, None)"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Health smoke failed with exit code $LASTEXITCODE"
+            }
+          } finally {
+            Set-Location $env:GITHUB_WORKSPACE
+            git worktree remove --force $smokeRoot
+          }
+          $changes = git status --porcelain --untracked-files=all
+          if ($changes) {
+            throw "Health smoke left source-tree artifacts: $changes"
+          }
