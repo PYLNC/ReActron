@@ -81,7 +81,7 @@ class Agent:
             )
 
     async def _notify_message(self, message: dict):
-        """持久化单条消息，失败时只记录日志，不中断 Agent。"""
+        """持久化单条消息；失败时终止当前 Agent step。"""
         if not self.on_message:
             return
         logger.info(
@@ -96,10 +96,7 @@ class Agent:
             ),
             message.get("tool_call_id"),
         )
-        try:
-            await self.on_message(message)
-        except Exception as exc:
-            logger.warning("消息持久化失败：%s", exc)
+        await self.on_message(message)
 
     async def _execute_tool(self, call: dict, round_index: int, call_index: int) -> dict:
         """并发执行单个工具调用，返回统一的执行结果。"""
@@ -232,6 +229,12 @@ class Agent:
                                 entry["function"]["arguments"] += item.function.arguments
 
             ordered_calls = [tool_calls[i] for i in sorted(tool_calls)]
+            call_ids = set()
+            for call_index, call in enumerate(ordered_calls, start=1):
+                call["id"] = call.get("id") or f"call_{round_index}_{call_index}"
+                if call["id"] in call_ids:
+                    raise ValueError(f"模型返回重复的 tool_call_id：{call['id']}")
+                call_ids.add(call["id"])
             elapsed = time.perf_counter() - round_started
             logger.info(
                 "模型输出摘要：round=%d，chunks=%d，文本=%s，工具调用=%s，"
@@ -266,10 +269,6 @@ class Agent:
             current_messages.append(assistant_message)
             await self._notify_message(assistant_message)
 
-            # 先为所有工具调用分配稳定 ID，并立即并行启动
-            for call_index, call in enumerate(ordered_calls, start=1):
-                # 个别兼容接口可能不返回 tool_call_id，这里补一个稳定 ID
-                call["id"] = call.get("id") or f"call_{round_index}_{call_index}"
             tasks = [
                 asyncio.create_task(self._execute_tool(call, round_index, call_index))
                 for call_index, call in enumerate(ordered_calls, start=1)
