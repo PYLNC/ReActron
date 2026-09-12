@@ -163,7 +163,7 @@ async def upload_file(file: UploadFile = File(...)):
     filename = Path(file.filename or "upload").name
     extension = Path(filename).suffix.lower()
     if extension not in ALLOWED_UPLOAD_EXTENSIONS:
-        raise HTTPException(status_code=400, detail=f"不支持的文件类型: {extension or '无扩展名'}")
+        raise HTTPException(status_code=415, detail="文件类型不受支持")
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     file_id = str(uuid.uuid4())
@@ -174,9 +174,17 @@ async def upload_file(file: UploadFile = File(...)):
             while chunk := await file.read(1024 * 1024):
                 size += len(chunk)
                 if size > MAX_UPLOAD_SIZE:
-                    raise HTTPException(status_code=400, detail="文件超过大小限制")
+                    raise HTTPException(status_code=413, detail="文件超过大小限制")
                 handle.write(chunk)
-        parsed = await asyncio.to_thread(parse_uploaded_file, stored_path)
+        try:
+            parsed = await asyncio.to_thread(parse_uploaded_file, stored_path)
+        except ValueError as exc:
+            if extension in {".xlsx", ".pptx"}:
+                if str(exc) in {"ZIP entry limit exceeded", "ZIP expansion limit exceeded"}:
+                    raise HTTPException(status_code=413, detail="压缩文件超过限制") from exc
+                if str(exc) == "Invalid ZIP container":
+                    raise HTTPException(status_code=415, detail="文件内容与类型不符") from exc
+            raise
         db.register_upload(file_id, filename, stored_path, size, file.content_type, parsed)
     except Exception:
         stored_path.unlink(missing_ok=True)
@@ -236,7 +244,7 @@ async def create_mcp_server(payload: MCPServerCreateRequest):
         command=payload.command,
         args=payload.args or [],
         url=payload.url,
-        enabled=payload.enabled,
+        enabled=False,
     )
     logger.info("创建 MCP Server：%s", row["id"])
     return row

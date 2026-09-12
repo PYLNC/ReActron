@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from zipfile import ZipFile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -345,6 +346,86 @@ class AuthWiringTest(unittest.TestCase):
 
 
 class UploadCleanupTest(unittest.TestCase):
+    def _rejected(self, filename, content, expected_status, expected_code, parser=None):
+        from backend import api
+        from backend.app import http_error_handler
+
+        marker = "private-upload-marker"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            upload_dir = Path(temp_dir) / "uploads"
+            database = Mock()
+            file = UploadFile(file=io.BytesIO(content), filename=filename)
+            with patch.object(api, "UPLOAD_DIR", upload_dir), patch.object(api, "db", database):
+                with patch.object(api, "parse_uploaded_file", side_effect=parser) as parse:
+                    with self.assertRaises(HTTPException) as raised:
+                        asyncio.run(api.upload_file(file))
+            response = asyncio.run(http_error_handler(
+                SimpleNamespace(url=SimpleNamespace(path="/api/upload")), raised.exception
+            ))
+            body = json.loads(response.body)
+            self.assertEqual(response.status_code, expected_status)
+            self.assertEqual(body["code"], expected_code)
+            self.assertEqual(set(body), {"code", "message", "details", "trace_id"})
+            self.assertNotIn(marker, response.body.decode())
+            self.assertEqual(list(upload_dir.iterdir()) if upload_dir.exists() else [], [])
+            database.register_upload.assert_not_called()
+            return parse.call_count
+
+    def test_raw_limit_and_exact_boundary(self):
+        from backend import api
+
+        limit = api.MAX_UPLOAD_SIZE
+        self.assertEqual(self._rejected(
+            "private-upload-marker.txt", b"x" * (limit + 1),
+            413, "upload_limit_exceeded",
+        ), 0)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            upload_dir = Path(temp_dir) / "uploads"
+            database = Mock()
+            with (
+                patch.object(api, "UPLOAD_DIR", upload_dir),
+                patch.object(api, "db", database),
+                patch.object(api, "parse_uploaded_file", return_value={"type": "text"}),
+            ):
+                result = asyncio.run(api.upload_file(UploadFile(
+                    file=io.BytesIO(b"x" * limit), filename="exact.txt"
+                )))
+            self.assertEqual(result["size"], limit)
+            database.register_upload.assert_called_once()
+
+    def test_invalid_extension_and_non_zip_signature(self):
+        from backend import file_parser
+
+        parser = (file_parser.parse_uploaded_file if hasattr(file_parser, "_check_zip_limits")
+                  else ValueError("Invalid ZIP container"))
+        self.assertEqual(self._rejected(
+            "private-upload-marker.exe", b"bad", 415, "upload_type_mismatch",
+        ), 0)
+        with patch.object(file_parser, "_parse_excel") as heavy_parser:
+            self.assertEqual(self._rejected(
+                "private-upload-marker.xlsx", b"not a ZIP",
+                415, "upload_type_mismatch",
+                parser=parser,
+            ), 1)
+            heavy_parser.assert_not_called()
+
+    def test_zip_entry_bomb_maps_to_413(self):
+        from backend import file_parser
+
+        parser = (file_parser.parse_uploaded_file if hasattr(file_parser, "_check_zip_limits")
+                  else ValueError("ZIP entry limit exceeded"))
+        archive_bytes = io.BytesIO()
+        with ZipFile(archive_bytes, "w") as archive:
+            for index in range(2_001):
+                archive.writestr(f"entry-{index}", b"")
+        with patch.object(file_parser, "_parse_excel") as heavy_parser:
+            self.assertEqual(self._rejected(
+                "private-upload-marker.xlsx", archive_bytes.getvalue(),
+                413, "upload_limit_exceeded",
+                parser=parser,
+            ), 1)
+            heavy_parser.assert_not_called()
+
     def test_parser_failure_removes_uploaded_file(self):
         from backend import api
 
@@ -379,6 +460,28 @@ class UploadCleanupTest(unittest.TestCase):
                     asyncio.run(api.upload_file(file))
             self.assertEqual(list(upload_dir.iterdir()), [])
             database.register_upload.assert_called_once()
+
+
+class MCPCreateContractTest(unittest.TestCase):
+    def test_new_server_stays_disabled_even_when_request_enables_it(self):
+        from backend import api
+        from backend.db import Database
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "mcp.db")
+            try:
+                with patch.object(api, "db", database):
+                    response = asyncio.run(api.create_mcp_server(
+                        api.MCPServerCreateRequest(
+                            name="new", transport="stdio", command="C:\\tools\\fake.exe",
+                            enabled=True,
+                        )
+                    ))
+                stored = database.get_mcp_server(response["id"])
+                self.assertEqual(response["enabled"], 0)
+                self.assertEqual(stored["enabled"], 0)
+            finally:
+                database.close()
 
 
 class ChatContextWiringTest(unittest.TestCase):

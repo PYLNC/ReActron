@@ -120,11 +120,15 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException):
         403: "forbidden",
         404: "not_found",
         405: "method_not_allowed",
+        413: "upload_limit_exceeded",
+        415: "upload_type_mismatch",
     }.get(exc.status_code, "http_error")
     message = {
         401: "请先完成本地认证",
         403: "无权执行此操作",
         404: "资源不存在",
+        413: "上传文件超过限制",
+        415: "上传文件类型不符",
     }.get(exc.status_code, str(exc.detail))
     return JSONResponse(
         status_code=exc.status_code,

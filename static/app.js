@@ -853,7 +853,6 @@ async function addMcpServer() {
     command: mcpCommandInput.value.trim(),
     args,
     url: mcpUrlInput.value.trim(),
-    enabled: true,
   };
   if (!payload.name) {
     mcpStatus.textContent = "请输入服务器名称";

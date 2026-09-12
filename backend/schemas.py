@@ -103,7 +103,7 @@ class MCPServerCreateRequest(BaseModel):
     command: Optional[str] = None
     args: Optional[List[str]] = None
     url: Optional[str] = None
-    enabled: bool = True
+    enabled: bool = False
 
 
 class HealthResponse(BaseModel):
