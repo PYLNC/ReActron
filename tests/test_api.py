@@ -144,12 +144,18 @@ class AppLifespanTest(unittest.TestCase):
             TestClient(app_module.app) as client,
         ):
             health = client.get("/api/health")
+            missing_route = client.get("/api/does-not-exist")
             marker = "validation-secret-marker"
             with self.assertLogs("agent.app", level="WARNING") as logs:
                 invalid = client.post("/api/chat", json={"message": {"value": marker}})
 
         self.assertEqual(health.status_code, 200)
         self.assertEqual(health.json()["status"], "ok")
+        self.assertEqual(missing_route.status_code, 404)
+        self.assertEqual(missing_route.json()["code"], "not_found")
+        self.assertEqual(
+            set(missing_route.json()), {"code", "message", "details", "trace_id"}
+        )
         self.assertEqual(invalid.status_code, 422)
         self.assertEqual(
             set(invalid.json()), {"code", "message", "details", "trace_id"}
@@ -314,6 +320,15 @@ class ChatGateTest(unittest.TestCase):
 
 
 class ConflictResponseTest(unittest.TestCase):
+    def test_chat_missing_project_uses_four_field_error(self):
+        from backend import api
+
+        response = asyncio.run(api.chat(api.ChatRequest(message="hello")))
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(body["code"], "invalid_request")
+        self.assertEqual(set(body), {"code", "message", "details", "trace_id"})
+
     def test_http_provider_conflict_keeps_database_row_unchanged(self):
         from fastapi import FastAPI
 

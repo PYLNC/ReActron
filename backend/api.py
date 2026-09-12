@@ -456,7 +456,7 @@ async def chat(payload: ChatRequest):
             raise HTTPException(status_code=404, detail="会话不存在")
     else:
         if not payload.project_id:
-            return JSONResponse({"error": "请先创建并选择项目"}, status_code=400)
+            return _error_response(400, "invalid_request", "请先创建并选择项目")
         if not db.get_project(payload.project_id):
             raise HTTPException(status_code=404, detail="项目不存在")
         session = db.create_session(_make_session_title(message), payload.project_id)

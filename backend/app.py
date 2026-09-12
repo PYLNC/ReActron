@@ -21,6 +21,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.config import load_config
 
@@ -108,6 +109,24 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 async def index():
     """返回聊天页面入口。"""
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(request: Request, exc: StarletteHTTPException):
+    """将现有路由和框架的 HTTP 错误统一为 P0 错误体。"""
+    code = {400: "invalid_request", 403: "forbidden", 404: "not_found"}.get(
+        exc.status_code, "http_error"
+    )
+    message = "资源不存在" if exc.status_code == 404 else str(exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": code,
+            "message": message,
+            "details": {},
+            "trace_id": uuid.uuid4().hex,
+        },
+    )
 
 
 @app.exception_handler(RequestValidationError)
