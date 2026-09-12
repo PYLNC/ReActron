@@ -1,16 +1,15 @@
 """最小 Agent 循环：流式调用模型，处理工具调用并继续下一轮。"""
 
-import asyncio
-import json
 import logging
 import os
 import threading
 import time
+from dataclasses import replace
 from typing import Callable, Optional
 
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
-from backend.skills import TOOL_DEFINITIONS, execute_tool
+from backend.skills import TOOL_DEFINITIONS
 
 
 MAX_ROUNDS = 5
@@ -48,6 +47,7 @@ class Agent:
         on_message: Optional[Callable] = None,
         log_stream: Optional[bool] = None,
         system_prompt: str = "",
+        run_context=None,
     ):
         self.client = _get_shared_client(api_key, base_url)
         self.base_url = base_url
@@ -57,6 +57,7 @@ class Agent:
         # 可选回调，用于把助手消息和工具消息写入数据库
         self.on_message = on_message
         self.system_prompt = system_prompt
+        self.run_context = run_context
         self.log_stream = os.getenv("LOG_STREAM", "1") == "1" if log_stream is None else log_stream
         logger.info(
             "Agent 已创建，model=%s，base_url=%s，max_rounds=%d，tool_timeout=%.1f，log_stream=%s",
@@ -67,73 +68,23 @@ class Agent:
             self.log_stream,
         )
 
-    def _log_messages(self, messages):
-        """输出本轮发送给模型的完整消息输入。"""
-        logger.info("模型输入消息数=%d", len(messages))
-        for index, message in enumerate(messages):
-            tool_calls = message.get("tool_calls")
-            tool_calls_text = (
-                json.dumps(tool_calls, ensure_ascii=False, default=str) if tool_calls else ""
-            )
-            logger.info(
-                "模型输入[%d] role=%s content=%s tool_calls=%s tool_call_id=%s",
-                index,
-                message.get("role"),
-                _truncate(message.get("content") or "", 300),
-                _truncate(tool_calls_text, 300),
-                message.get("tool_call_id"),
-            )
-
     async def _notify_message(self, message: dict):
         """持久化单条消息；失败时终止当前 Agent step。"""
         if not self.on_message:
             return
-        logger.info(
-            "持久化消息：role=%s content=%s tool_calls=%s tool_call_id=%s",
-            message.get("role"),
-            _truncate(message.get("content") or "", 300),
-            _truncate(
-                json.dumps(message.get("tool_calls"), ensure_ascii=False, default=str)
-                if message.get("tool_calls")
-                else "",
-                300,
-            ),
-            message.get("tool_call_id"),
-        )
         await self.on_message(message)
 
-    async def _execute_tool(self, call: dict, round_index: int, call_index: int) -> dict:
-        """并发执行单个工具调用，返回统一的执行结果。"""
-        name = call["function"]["name"]
-        raw_arguments = call["function"]["arguments"]
-        logger.info(
-            "工具输入：name=%s，arguments=%s",
-            name,
-            _truncate(raw_arguments, 300),
+    async def _execute_tool(self, call: dict):
+        """唯一工具入口；Gateway 负责参数、权限、超时与结果脱敏。"""
+        if self.run_context is None:
+            raise RuntimeError("缺少工具执行上下文")
+        from backend.tool_gateway import execute_tool
+
+        return await execute_tool(
+            replace(self.run_context, call_id=call["id"]),
+            call["function"]["name"],
+            call["function"]["arguments"],
         )
-        try:
-            arguments = json.loads(raw_arguments) if raw_arguments else {}
-            if not isinstance(arguments, dict):
-                raise ValueError("工具参数必须是 JSON 对象")
-            result = await asyncio.wait_for(
-                asyncio.to_thread(execute_tool, name, arguments),
-                timeout=self.tool_timeout,
-            )
-            result_text = json.dumps(result, ensure_ascii=False)
-            logger.info(
-                "工具输出：name=%s，ok=True，result=%s",
-                name,
-                _truncate(result_text, 500),
-            )
-            return {"ok": True, "name": name, "message": result_text}
-        except asyncio.TimeoutError:
-            result_text = f"调用失败: 工具执行超时（{self.tool_timeout}s）"
-            logger.warning("工具执行超时，name=%s", name)
-            return {"ok": False, "name": name, "message": result_text}
-        except Exception as exc:
-            result_text = f"调用失败: {exc}"
-            logger.warning("工具执行失败，name=%s，error=%s", name, exc)
-            return {"ok": False, "name": name, "message": result_text}
 
     async def run(self, messages):
         """逐轮与模型对话，产出一系列供前端展示的 SSE 事件。"""
@@ -163,8 +114,6 @@ class Agent:
                 len(current_messages),
                 len(TOOL_DEFINITIONS),
             )
-            self._log_messages(current_messages)
-
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=current_messages,
@@ -189,26 +138,13 @@ class Agent:
                 delta = choice.delta
 
                 if self.log_stream:
-                    delta_tool_calls = []
-                    if delta and delta.tool_calls:
-                        for item in delta.tool_calls:
-                            function = item.function
-                            delta_tool_calls.append({
-                                "index": item.index,
-                                "id": item.id,
-                                "name": function.name if function else None,
-                                "arguments": function.arguments if function else None,
-                            })
                     logger.info(
-                        "[stream] round=%d chunk=%d finish_reason=%s text=%s tool_calls=%s",
+                        "[stream] round=%d chunk=%d finish_reason=%s text_chars=%d tool_calls=%d",
                         round_index,
                         chunk_count,
                         finish_reason,
-                        _truncate(delta.content if delta and delta.content else "", 200),
-                        _truncate(
-                            json.dumps(delta_tool_calls, ensure_ascii=False, default=str),
-                            300,
-                        ),
+                        len(delta.content or "") if delta else 0,
+                        len(delta.tool_calls or ()) if delta else 0,
                     )
 
                 if delta and delta.content:
@@ -241,15 +177,12 @@ class Agent:
                 call_ids.add(call["id"])
             elapsed = time.perf_counter() - round_started
             logger.info(
-                "模型输出摘要：round=%d，chunks=%d，文本=%s，工具调用=%s，"
+                "模型输出摘要：round=%d，chunks=%d，文本字符数=%d，工具调用数=%d，"
                 "finish_reason=%s，耗时=%.2fs",
                 round_index,
                 chunk_count,
-                _truncate("".join(content_parts), 500),
-                _truncate(
-                    json.dumps(ordered_calls, ensure_ascii=False, default=str),
-                    500,
-                ),
+                sum(map(len, content_parts)),
+                len(ordered_calls),
                 finish_reason,
                 elapsed,
             )
@@ -273,25 +206,26 @@ class Agent:
             current_messages.append(assistant_message)
             await self._notify_message(assistant_message)
 
-            tasks = [
-                asyncio.create_task(self._execute_tool(call, round_index, call_index))
-                for call_index, call in enumerate(ordered_calls, start=1)
-            ]
-
-            for call_index, (call, task) in enumerate(zip(ordered_calls, tasks), start=1):
+            for call in ordered_calls:
                 name = call["function"]["name"]
                 raw_arguments = call["function"]["arguments"]
                 yield {"type": "tool_call", "name": name, "arguments": raw_arguments}
 
-                result = await task
-                ok = result["ok"]
-                result_text = result["message"]
+                outcome = await self._execute_tool(call)
+                if outcome.call_id != call["id"]:
+                    raise ValueError("工具结果 call_id 不匹配")
+                ok = outcome.status == "ok"
+                result_text = outcome.model_text
                 yield {
                     "type": "tool_result",
                     "name": name,
                     "ok": ok,
-                    "message": _truncate(result_text),
+                    "message": result_text,
                 }
+
+                if outcome.status == "outcome_unknown":
+                    yield {"type": "error", "message": "工具结果未确认，需要人工核实"}
+                    return
 
                 tool_message = {
                     "role": "tool",
@@ -301,9 +235,9 @@ class Agent:
                 current_messages.append(tool_message)
                 await self._notify_message(tool_message)
                 logger.info(
-                    "工具结果回填：name=%s，content=%s，当前消息数=%d",
+                    "工具结果回填：name=%s，content_chars=%d，当前消息数=%d",
                     name,
-                    _truncate(result_text, 300),
+                    len(result_text),
                     len(current_messages),
                 )
 
@@ -314,10 +248,3 @@ class Agent:
             "message": f"已达到最大轮数 {self.max_rounds}",
             "total_ms": total_ms,
         }
-
-
-def _truncate(text: str, limit: int = 500):
-    """限制工具结果长度，避免把前端和上下文撑爆。"""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "...(已截断)"
