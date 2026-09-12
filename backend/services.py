@@ -3,16 +3,26 @@
 import ipaddress
 import logging
 import re
+import threading
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from backend.config import AppConfig, load_config
 from backend.db import db
-from backend.security import decrypt_text
+from backend.security import decrypt_text, encrypt_text
 
 
 logger = logging.getLogger("agent.services")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_settings_update_lock = threading.Lock()
+
+
+class ProviderKeyReentryRequired(ValueError):
+    """Provider 目标无法安全复用当前凭据。"""
+
+
+class InvalidBaseUrl(ValueError):
+    """设置请求包含无效的 Provider Base URL。"""
 
 
 def _canonical_host(raw_host: str) -> tuple[str, bool]:
@@ -90,6 +100,66 @@ def normalize_base_url(base_url: str) -> str:
 def credential_origin(base_url: str) -> tuple[str, str, int]:
     """返回凭据绑定使用的 scheme、IDNA host 与有效端口。"""
     return _parse_base_url(base_url)[1]
+
+
+def save_public_settings(
+    *,
+    api_key=None,
+    base_url=None,
+    model=None,
+    max_rounds=None,
+    tool_timeout=None,
+) -> dict:
+    """验证 Provider 绑定并原子保存当前设置行。"""
+    new_key = api_key.strip() if api_key and api_key.strip() else None
+    # P0 固定单应用进程；串行化 read/check/write，避免 origin 检查竞态。
+    with _settings_update_lock:
+        cfg = load_config()
+        existing = db.get_settings() or {}
+        try:
+            environment_url = normalize_base_url(cfg.base_url)
+            target_url = normalize_base_url(
+                base_url
+                if base_url is not None
+                else existing.get("base_url") or environment_url
+            )
+            target_origin = credential_origin(target_url)
+        except ValueError as exc:
+            raise InvalidBaseUrl(str(exc)) from exc
+
+        encrypted_key = None
+        credential_base_url = None
+        existing_key = existing.get("api_key_encrypted")
+        if new_key:
+            encrypted_key = encrypt_text(new_key)
+            credential_base_url = target_url
+        elif existing_key and base_url is not None:
+            bound_url = existing.get("credential_base_url")
+            try:
+                bound_origin = credential_origin(bound_url) if bound_url else None
+            except ValueError:
+                bound_origin = None
+            if bound_origin is None or bound_origin != target_origin:
+                raise ProviderKeyReentryRequired(
+                    "更改 Provider origin 必须在同一请求中重新输入 API Key"
+                )
+            credential_base_url = target_url
+        elif not existing_key and cfg.api_key:
+            environment_origin = credential_origin(environment_url)
+            if target_origin != environment_origin:
+                raise ProviderKeyReentryRequired(
+                    "更改 Provider origin 必须在同一请求中重新输入 API Key"
+                )
+
+        db.save_settings(
+            api_key_encrypted=encrypted_key,
+            base_url=target_url,
+            credential_base_url=credential_base_url,
+            model=model,
+            max_rounds=max_rounds,
+            tool_timeout=tool_timeout,
+        )
+        return get_public_settings()
 
 
 def get_runtime_config() -> AppConfig:

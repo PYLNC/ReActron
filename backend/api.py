@@ -32,8 +32,13 @@ from backend.schemas import (
     SettingsResponse,
     ToolsResponse,
 )
-from backend.security import encrypt_text
-from backend.services import get_public_settings, get_runtime_config
+from backend.services import (
+    InvalidBaseUrl,
+    ProviderKeyReentryRequired,
+    get_public_settings,
+    get_runtime_config,
+    save_public_settings,
+)
 from backend.skills import (
     SKILLS,
     TOOL_DEFINITIONS,
@@ -283,22 +288,22 @@ async def get_settings():
 @router.put("/settings", response_model=SettingsResponse)
 async def update_settings(payload: SettingsRequest):
     """保存前端设置，API Key 加密后写入 SQLite。"""
-    api_key_encrypted = None
-    if payload.api_key and payload.api_key.strip():
-        api_key_encrypted = encrypt_text(payload.api_key.strip())
-        logger.info(
-            "前端 API Key 输入：长度=%d，已加密",
-            len(payload.api_key.strip()),
+    try:
+        settings = save_public_settings(
+            api_key=payload.api_key,
+            base_url=payload.base_url,
+            model=payload.model,
+            max_rounds=payload.max_rounds,
+            tool_timeout=payload.tool_timeout,
         )
-
-    db.save_settings(
-        api_key_encrypted=api_key_encrypted,
-        base_url=payload.base_url,
-        model=payload.model,
-        max_rounds=payload.max_rounds,
-        tool_timeout=payload.tool_timeout,
-    )
-    settings = get_public_settings()
+    except ProviderKeyReentryRequired:
+        return _error_response(
+            409,
+            "provider_key_reentry_required",
+            "当前 Provider 凭据需要重新输入 API Key",
+        )
+    except InvalidBaseUrl as exc:
+        return _error_response(422, "invalid_base_url", str(exc))
     logger.info(
         "设置保存完成，输入 base_url=%s model=%s max_rounds=%s tool_timeout=%s，"
         "输出 api_key_configured=%s",
@@ -371,7 +376,14 @@ async def delete_project(project_id: str):
     project = db.get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
-    db.delete_project(project_id)
+    try:
+        db.delete_project(project_id)
+    except ValueError:
+        return _error_response(
+            409,
+            "default_project_protected",
+            "默认项目不能删除",
+        )
     return {"ok": True}
 
 

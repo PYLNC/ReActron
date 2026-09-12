@@ -66,9 +66,12 @@ async def lifespan(application: FastAPI):
     global _api_router_loaded
 
     cfg = load_config()
+    from backend.security import validate_secret_key
+
+    validate_secret_key()
     application.state.config = cfg
 
-    # 延迟导入把当前 DB/迁移副作用收进 lifespan；A 将提供显式 open 接口。
+    # 密钥验证成功后才允许导入会打开 DB/MCP 的现有模块。
     from backend import api as api_module
     from backend.db import DB_PATH, db
 

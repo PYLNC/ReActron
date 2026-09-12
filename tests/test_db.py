@@ -73,6 +73,27 @@ def create_v0_database(path: Path, orphan_message=False):
     conn.close()
 
 
+def create_v1_settings_database(path: Path):
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            api_key_encrypted TEXT,
+            base_url TEXT,
+            model TEXT,
+            max_rounds INTEGER,
+            tool_timeout REAL,
+            updated_at TEXT
+        );
+        INSERT INTO settings VALUES (
+            1, 'legacy-ciphertext', 'https://api.example/v1',
+            'legacy-model', 5, 10.0, '2026-01-01 00:00:00'
+        );
+        PRAGMA user_version = 1;
+    """)
+    conn.close()
+
+
 def snapshot(db: Database):
     schema = db._query_all("""
         SELECT type, name, tbl_name, sql
@@ -94,7 +115,7 @@ class MigrationTest(unittest.TestCase):
             create_v0_database(path)
 
             db = Database(path)
-            self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 2)
             defaults = db._query_all(
                 "SELECT id FROM projects WHERE is_default = 1"
             )
@@ -139,8 +160,33 @@ class MigrationTest(unittest.TestCase):
             try:
                 self.assertEqual(snapshot(reopened), first_snapshot)
                 self.assertEqual(
-                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 1
+                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 2
                 )
+            finally:
+                reopened.close()
+
+    def test_v1_settings_key_migrates_to_nullable_unbound_origin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "v1.db"
+            create_v1_settings_database(path)
+
+            db = Database(path)
+            try:
+                self.assertEqual(
+                    db._conn.execute("PRAGMA user_version").fetchone()[0], 2
+                )
+                settings = db.get_settings()
+                self.assertEqual(settings["api_key_encrypted"], "legacy-ciphertext")
+                self.assertIsNone(settings["credential_base_url"])
+            finally:
+                db.close()
+
+            reopened = Database(path)
+            try:
+                self.assertEqual(
+                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 2
+                )
+                self.assertIsNone(reopened.get_settings()["credential_base_url"])
             finally:
                 reopened.close()
 
@@ -169,6 +215,38 @@ class MigrationTest(unittest.TestCase):
 
 
 class DatabaseConsistencyTest(unittest.TestCase):
+    def test_provider_settings_update_rolls_back_the_entire_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "settings-rollback.db")
+            try:
+                db.save_settings(
+                    api_key_encrypted="old-ciphertext",
+                    base_url="https://api.example/v1",
+                    credential_base_url="https://api.example/v1",
+                    model="old-model",
+                )
+                before = db.get_settings()
+                db._execute("""
+                    CREATE TRIGGER injected_settings_failure
+                    BEFORE UPDATE ON settings
+                    WHEN NEW.base_url = 'https://other.example/v1'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'injected failure');
+                    END
+                """)
+
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db.save_settings(
+                        api_key_encrypted="new-ciphertext",
+                        base_url="https://other.example/v1",
+                        credential_base_url="https://other.example/v1",
+                        model="new-model",
+                    )
+
+                self.assertEqual(db.get_settings(), before)
+            finally:
+                db.close()
+
     def test_message_insert_rolls_back_when_session_touch_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "message-rollback.db")

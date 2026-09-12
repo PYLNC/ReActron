@@ -139,6 +139,7 @@ class AppLifespanTest(unittest.TestCase):
         fake_manager = FakeManager()
         with (
             patch.object(db_module, "db", fake_db),
+            patch("backend.security.validate_secret_key") as validate_secret_key,
             patch("backend.mcp.manager.get_manager", return_value=fake_manager),
             TestClient(app_module.app) as client,
         ):
@@ -157,8 +158,55 @@ class AppLifespanTest(unittest.TestCase):
         self.assertTrue(invalid.json()["trace_id"])
         self.assertNotIn(marker, invalid.text)
         self.assertNotIn(marker, "\n".join(logs.output))
+        validate_secret_key.assert_called_once_with()
         self.assertTrue(fake_manager.refreshed)
         self.assertTrue(fake_db.closed)
+
+    def test_invalid_secret_fails_before_database_or_mcp_import(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            temp_backend = temp_root / "backend"
+            temp_backend.mkdir()
+            (temp_root / "static").mkdir()
+            for filename in ("__init__.py", "app.py", "config.py", "security.py"):
+                shutil.copy2(ROOT / "backend" / filename, temp_backend / filename)
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "APP_SECRET_KEY": "not-a-fernet-key",
+                    "PYTHONPATH": str(temp_root),
+                    "WEB_CONCURRENCY": "1",
+                }
+            )
+            script = """
+import sys
+from fastapi.testclient import TestClient
+import backend.app as app_module
+
+try:
+    with TestClient(app_module.app):
+        pass
+except RuntimeError as exc:
+    assert "APP_SECRET_KEY" in str(exc), exc
+    assert "backend.api" not in sys.modules
+    assert "backend.db" not in sys.modules
+    assert "backend.mcp.manager" not in sys.modules
+else:
+    raise AssertionError("invalid secret unexpectedly started the application")
+"""
+            result = subprocess.run(
+                [sys.executable, "-B", "-c", script],
+                cwd=temp_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((temp_root / "data").exists())
 
     def test_multiple_workers_are_rejected_before_startup(self):
         from backend import app as app_module
@@ -263,6 +311,112 @@ class ChatGateTest(unittest.TestCase):
         self.assertTrue(any('"type": "error"' in chunk for chunk in chunks))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(self.db.messages), 2)
+
+
+class ConflictResponseTest(unittest.TestCase):
+    def test_http_provider_conflict_keeps_database_row_unchanged(self):
+        from fastapi import FastAPI
+
+        from backend import api, services
+        from backend.config import AppConfig
+        from backend.db import Database
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "provider.db")
+            try:
+                database.save_settings(
+                    api_key_encrypted="old-ciphertext",
+                    base_url="https://api.example/v1",
+                    credential_base_url="https://api.example/v1",
+                    model="old-model",
+                )
+                before = database.get_settings()
+                application = FastAPI()
+                application.include_router(api.router)
+                config = AppConfig("", "https://api.example/v1", "model", 5, 10.0)
+                with (
+                    patch.object(services, "db", database),
+                    patch.object(services, "load_config", return_value=config),
+                    TestClient(application) as client,
+                ):
+                    response = client.put(
+                        "/api/settings",
+                        json={
+                            "base_url": "https://other.example/v1",
+                            "model": "must-not-save",
+                        },
+                    )
+
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(
+                    response.json()["code"], "provider_key_reentry_required"
+                )
+                self.assertEqual(
+                    set(response.json()),
+                    {"code", "message", "details", "trace_id"},
+                )
+                self.assertEqual(database.get_settings(), before)
+            finally:
+                database.close()
+
+    def test_provider_reentry_conflict_has_four_fields_and_no_key(self):
+        from backend import api
+
+        marker = "must-not-leak-provider-key"
+        with patch.object(
+            api,
+            "save_public_settings",
+            side_effect=api.ProviderKeyReentryRequired("blocked"),
+        ):
+            response = asyncio.run(
+                api.update_settings(
+                    api.SettingsRequest(
+                        api_key=marker,
+                        base_url="https://other.example/v1",
+                    )
+                )
+            )
+
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(body["code"], "provider_key_reentry_required")
+        self.assertEqual(set(body), {"code", "message", "details", "trace_id"})
+        self.assertNotIn(marker, response.body.decode("utf-8"))
+
+    def test_invalid_base_url_has_four_field_error(self):
+        from backend import api
+
+        with patch.object(
+            api,
+            "save_public_settings",
+            side_effect=api.InvalidBaseUrl("Base URL 格式无效"),
+        ):
+            response = asyncio.run(
+                api.update_settings(api.SettingsRequest(base_url="not-a-url"))
+            )
+
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(body["code"], "invalid_base_url")
+        self.assertEqual(set(body), {"code", "message", "details", "trace_id"})
+
+    def test_default_project_delete_conflict_has_four_fields(self):
+        from backend import api
+
+        class FakeDatabase:
+            def get_project(self, project_id):
+                return {"id": project_id, "is_default": 1}
+
+            def delete_project(self, project_id):
+                raise ValueError("默认项目不能删除")
+
+        with patch.object(api, "db", FakeDatabase()):
+            response = asyncio.run(api.delete_project("default-project"))
+
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(body["code"], "default_project_protected")
+        self.assertEqual(set(body), {"code", "message", "details", "trace_id"})
 
 
 class RunBatContractTest(unittest.TestCase):

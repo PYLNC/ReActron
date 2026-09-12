@@ -5,6 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from backend import agent as agent_module
 from backend.agent import Agent
 
 
@@ -107,6 +108,39 @@ class AgentPersistenceTest(unittest.IsolatedAsyncioTestCase):
                     pass
         self.assertEqual(persisted, [])
         execute.assert_not_called()
+
+
+class ProviderRedirectTest(unittest.TestCase):
+    def test_model_client_does_not_follow_redirects_with_authorization(self):
+        fake_http_client = object()
+        fake_openai_client = object()
+        with agent_module._client_lock:
+            agent_module._clients.clear()
+        with (
+            patch.object(
+                agent_module,
+                "DefaultAsyncHttpxClient",
+                return_value=fake_http_client,
+            ) as http_client,
+            patch.object(
+                agent_module,
+                "AsyncOpenAI",
+                return_value=fake_openai_client,
+            ) as openai_client,
+        ):
+            result = agent_module._get_shared_client(
+                "provider-key", "https://api.example/v1"
+            )
+        with agent_module._client_lock:
+            agent_module._clients.clear()
+
+        http_client.assert_called_once_with(follow_redirects=False)
+        openai_client.assert_called_once_with(
+            api_key="provider-key",
+            base_url="https://api.example/v1",
+            http_client=fake_http_client,
+        )
+        self.assertIs(result, fake_openai_client)
 
 
 if __name__ == "__main__":

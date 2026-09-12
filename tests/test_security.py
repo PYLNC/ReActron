@@ -14,6 +14,7 @@ from cryptography.fernet import Fernet
 
 from backend import security, services
 from backend.config import AppConfig
+from backend.db import Database
 
 
 class SecretKeyTest(unittest.TestCase):
@@ -245,6 +246,110 @@ class RuntimeCredentialBindingTest(unittest.TestCase):
 
         decrypt.assert_called_once_with("ciphertext")
         self.assertEqual(result.api_key, "database-key")
+
+
+class SettingsUpdateTest(unittest.TestCase):
+    config = AppConfig(
+        api_key="environment-key",
+        base_url="https://api.example/v1",
+        model="model",
+        max_rounds=5,
+        tool_timeout=10.0,
+    )
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temporary_directory.name) / "settings.db")
+
+    def tearDown(self):
+        self.db.close()
+        self.temporary_directory.cleanup()
+
+    def _seed_bound_key(self):
+        self.db.save_settings(
+            api_key_encrypted="old-ciphertext",
+            base_url="https://api.example/v1",
+            credential_base_url="https://api.example/v1",
+            model="model",
+        )
+
+    def test_cross_origin_without_new_key_leaves_entire_row_unchanged(self):
+        self._seed_bound_key()
+        before = self.db.get_settings()
+        with (
+            patch.object(services, "db", self.db),
+            patch.object(services, "load_config", return_value=self.config),
+            patch.object(services, "encrypt_text") as encrypt,
+        ):
+            with self.assertRaises(services.ProviderKeyReentryRequired):
+                services.save_public_settings(
+                    base_url="https://other.example/v1",
+                    model="must-not-save",
+                )
+
+        encrypt.assert_not_called()
+        self.assertEqual(self.db.get_settings(), before)
+
+    def test_cross_origin_with_new_key_rebinds_all_provider_fields(self):
+        self._seed_bound_key()
+        with (
+            patch.object(services, "db", self.db),
+            patch.object(services, "load_config", return_value=self.config),
+            patch.object(
+                services, "encrypt_text", return_value="new-ciphertext"
+            ) as encrypt,
+            patch.object(services, "decrypt_text", return_value="new-key"),
+        ):
+            result = services.save_public_settings(
+                api_key="  new-key  ",
+                base_url="HTTPS://Other.Example:443/v2/",
+                model="new-model",
+            )
+
+        encrypt.assert_called_once_with("new-key")
+        settings = self.db.get_settings()
+        self.assertEqual(settings["api_key_encrypted"], "new-ciphertext")
+        self.assertEqual(settings["base_url"], "https://other.example/v2")
+        self.assertEqual(
+            settings["credential_base_url"], "https://other.example/v2"
+        )
+        self.assertEqual(settings["model"], "new-model")
+        self.assertTrue(result["api_key_configured"])
+
+    def test_same_origin_path_change_reuses_and_rebinds_existing_key(self):
+        self._seed_bound_key()
+        with (
+            patch.object(services, "db", self.db),
+            patch.object(services, "load_config", return_value=self.config),
+            patch.object(services, "encrypt_text") as encrypt,
+            patch.object(services, "decrypt_text", return_value="old-key"),
+        ):
+            services.save_public_settings(
+                base_url="https://API.example:443/v2/",
+            )
+
+        encrypt.assert_not_called()
+        settings = self.db.get_settings()
+        self.assertEqual(settings["api_key_encrypted"], "old-ciphertext")
+        self.assertEqual(settings["base_url"], "https://api.example/v2")
+        self.assertEqual(
+            settings["credential_base_url"], "https://api.example/v2"
+        )
+
+    def test_legacy_unbound_key_requires_reentry_before_provider_update(self):
+        self.db.save_settings(
+            api_key_encrypted="legacy-ciphertext",
+            base_url="https://api.example/v1",
+        )
+        before = self.db.get_settings()
+        with (
+            patch.object(services, "db", self.db),
+            patch.object(services, "load_config", return_value=self.config),
+        ):
+            with self.assertRaises(services.ProviderKeyReentryRequired):
+                services.save_public_settings(base_url="https://api.example/v1")
+
+        self.assertEqual(self.db.get_settings(), before)
 
 
 if __name__ == "__main__":

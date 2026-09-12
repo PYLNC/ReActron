@@ -14,7 +14,7 @@ from backend.config import BASE_DIR
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "countboter.db"
 logger = logging.getLogger("agent.db")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _truncate(text: str, limit: int = 300):
@@ -70,7 +70,11 @@ class Database:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version == 0:
                 self._migrate_0_to_1()
-            elif version != SCHEMA_VERSION:
+                version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == 1:
+                self._migrate_1_to_2()
+                version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version != SCHEMA_VERSION:
                 raise RuntimeError(f"不支持的数据库版本：{version}")
             self._verify_integrity()
 
@@ -82,7 +86,7 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             # 另一个进程可能已在等待 writer lock 时完成同一迁移。
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version == SCHEMA_VERSION:
+            if version in (1, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 0:
@@ -294,13 +298,34 @@ class Database:
             integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
             if integrity != "ok":
                 raise sqlite3.DatabaseError(f"数据库完整性检查失败：{integrity}")
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("PRAGMA user_version = 1")
             conn.commit()
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.execute("PRAGMA foreign_keys = ON")
+
+    def _migrate_1_to_2(self):
+        """给旧设置行增加 nullable 的 Provider 凭据 origin 绑定。"""
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == SCHEMA_VERSION:
+                conn.commit()
+                return
+            if version != 1:
+                raise RuntimeError(f"不支持的数据库版本：{version}")
+
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(settings)")}
+            if "credential_base_url" not in columns:
+                conn.execute("ALTER TABLE settings ADD COLUMN credential_base_url TEXT")
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     def _verify_integrity(self):
         violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -327,44 +352,95 @@ class Database:
         self,
         api_key_encrypted=None,
         base_url=None,
+        credential_base_url=None,
         model=None,
         max_rounds=None,
         tool_timeout=None,
     ):
-        existing = self.get_settings() or {}
-        new_api_key = api_key_encrypted if api_key_encrypted is not None else existing.get("api_key_encrypted")
-        new_base_url = base_url if base_url is not None else existing.get("base_url")
-        new_model = model if model is not None else existing.get("model")
-        new_max_rounds = max_rounds if max_rounds is not None else existing.get("max_rounds")
-        new_tool_timeout = tool_timeout if tool_timeout is not None else existing.get("tool_timeout")
-        now = self._now()
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT * FROM settings WHERE id = 1"
+                ).fetchone()
+                existing = dict(row) if row else {}
+                new_api_key = (
+                    api_key_encrypted
+                    if api_key_encrypted is not None
+                    else existing.get("api_key_encrypted")
+                )
+                new_base_url = (
+                    base_url if base_url is not None else existing.get("base_url")
+                )
+                new_credential_base_url = (
+                    credential_base_url
+                    if credential_base_url is not None
+                    else existing.get("credential_base_url")
+                )
+                new_model = model if model is not None else existing.get("model")
+                new_max_rounds = (
+                    max_rounds
+                    if max_rounds is not None
+                    else existing.get("max_rounds")
+                )
+                new_tool_timeout = (
+                    tool_timeout
+                    if tool_timeout is not None
+                    else existing.get("tool_timeout")
+                )
+                now = self._now()
 
-        if existing:
-            self._execute(
-                """
-                UPDATE settings
-                SET api_key_encrypted = ?, base_url = ?, model = ?,
-                    max_rounds = ?, tool_timeout = ?, updated_at = ?
-                WHERE id = 1
-                """,
-                (new_api_key, new_base_url, new_model, new_max_rounds, new_tool_timeout, now),
-            )
-        else:
-            self._execute(
-                """
-                INSERT INTO settings
-                    (id, api_key_encrypted, base_url, model, max_rounds, tool_timeout, updated_at)
-                VALUES (1, ?, ?, ?, ?, ?, ?)
-                """,
-                (new_api_key, new_base_url, new_model, new_max_rounds, new_tool_timeout, now),
-            )
+                if existing:
+                    self._conn.execute(
+                        """
+                        UPDATE settings
+                        SET api_key_encrypted = ?, base_url = ?,
+                            credential_base_url = ?, model = ?, max_rounds = ?,
+                            tool_timeout = ?, updated_at = ?
+                        WHERE id = 1
+                        """,
+                        (
+                            new_api_key,
+                            new_base_url,
+                            new_credential_base_url,
+                            new_model,
+                            new_max_rounds,
+                            new_tool_timeout,
+                            now,
+                        ),
+                    )
+                else:
+                    self._conn.execute(
+                        """
+                        INSERT INTO settings
+                            (id, api_key_encrypted, base_url,
+                             credential_base_url, model, max_rounds,
+                             tool_timeout, updated_at)
+                        VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            new_api_key,
+                            new_base_url,
+                            new_credential_base_url,
+                            new_model,
+                            new_max_rounds,
+                            new_tool_timeout,
+                            now,
+                        ),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
         logger.info(
-            "DB 设置输出：base_url=%s model=%s max_rounds=%s tool_timeout=%s api_key_encrypted=%s",
+            "DB 设置输出：base_url=%s model=%s max_rounds=%s tool_timeout=%s "
+            "api_key_encrypted=%s credential_bound=%s",
             new_base_url,
             new_model,
             new_max_rounds,
             new_tool_timeout,
             bool(new_api_key),
+            bool(new_credential_base_url),
         )
 
     def list_sessions(self):

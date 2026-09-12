@@ -8,7 +8,7 @@ import threading
 import time
 from typing import Callable, Optional
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
 from backend.skills import TOOL_DEFINITIONS, execute_tool
 
@@ -26,7 +26,11 @@ def _get_shared_client(api_key: str, base_url: str) -> AsyncOpenAI:
     key = (api_key, base_url)
     with _client_lock:
         if key not in _clients:
-            _clients[key] = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            _clients[key] = AsyncOpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                http_client=DefaultAsyncHttpxClient(follow_redirects=False),
+            )
             logger.info("创建共享 AsyncOpenAI 客户端：base_url=%s", base_url)
         return _clients[key]
 
