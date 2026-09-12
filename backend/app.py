@@ -80,21 +80,16 @@ async def lifespan(application: FastAPI):
         application.include_router(api_module.router)
         _api_router_loaded = True
 
-    logger.info(
-        "应用启动：model=%s，max_rounds=%d，db=%s",
-        cfg.model,
-        cfg.max_rounds,
-        DB_PATH,
-    )
+    logger.info("应用启动：max_rounds=%d，db=%s", cfg.max_rounds, DB_PATH)
 
     from backend.mcp.manager import get_manager
 
     try:
         try:
-            result = await get_manager().refresh_registry()
-            logger.info("MCP 启动刷新完成：%s", result)
-        except Exception as exc:
-            logger.warning("MCP 启动刷新失败：%s", exc)
+            await get_manager().refresh_registry()
+            logger.info("MCP 启动刷新完成")
+        except Exception:
+            logger.warning("MCP 启动刷新失败")
         yield
     finally:
         db.close()
@@ -114,10 +109,18 @@ async def index():
 @app.exception_handler(StarletteHTTPException)
 async def http_error_handler(request: Request, exc: StarletteHTTPException):
     """将现有路由和框架的 HTTP 错误统一为 P0 错误体。"""
-    code = {400: "invalid_request", 403: "forbidden", 404: "not_found"}.get(
-        exc.status_code, "http_error"
-    )
-    message = "资源不存在" if exc.status_code == 404 else str(exc.detail)
+    code = {
+        400: "invalid_request",
+        401: "unauthenticated",
+        403: "forbidden",
+        404: "not_found",
+        405: "method_not_allowed",
+    }.get(exc.status_code, "http_error")
+    message = {
+        401: "请先完成本地认证",
+        403: "无权执行此操作",
+        404: "资源不存在",
+    }.get(exc.status_code, str(exc.detail))
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -132,18 +135,34 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException):
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     """把 Pydantic 校验错误转换成统一 JSON 格式。"""
-    details = [
+    errors = [
         {"type": error["type"], "loc": error["loc"], "message": error["msg"]}
         for error in exc.errors()
     ]
-    logger.warning("请求校验失败：path=%s，errors=%d", request.url.path, len(details))
+    logger.warning("请求校验失败：path=%s，errors=%d", request.url.path, len(errors))
     return JSONResponse(
         status_code=422,
         content={
             "code": "request_validation_error",
             "message": "请求参数校验失败",
-            "details": details,
+            "details": {"errors": errors},
             "trace_id": uuid.uuid4().hex,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def internal_error_handler(request: Request, exc: Exception):
+    """未处理的异常只向客户端暴露稳定错误码与追踪号。"""
+    trace_id = uuid.uuid4().hex
+    logger.error("请求失败：trace_id=%s path=%s", trace_id, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "code": "internal_error",
+            "message": "服务器内部错误",
+            "details": {},
+            "trace_id": trace_id,
         },
     )
 

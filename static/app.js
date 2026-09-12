@@ -59,6 +59,11 @@ function log(message) {
 }
 
 
+function errorMessage(data, fallback) {
+  return data && (data.message || data.error || data.detail) || fallback;
+}
+
+
 function setPanelState(name, open) {
   appEl.classList.toggle(name + "-collapsed", !open);
   const button = name === "sessions" ? toggleSessionsBtn : toggleInfoBtn;
@@ -793,7 +798,7 @@ async function refreshMcp() {
     const response = await fetch("/api/mcp/refresh", { method: "POST" });
     if (!response.ok) {
       const data = await response.json().catch(() => null);
-      throw new Error(data && data.detail ? data.detail : "刷新失败");
+      throw new Error(errorMessage(data, "刷新失败"));
     }
     const data = await response.json();
     mcpStatus.textContent = "工具 " + data.tool_count + " 个";
@@ -839,7 +844,7 @@ async function addMcpServer() {
     });
     if (!response.ok) {
       const data = await response.json().catch(() => null);
-      throw new Error(data && data.detail ? data.detail : "添加失败");
+      throw new Error(errorMessage(data, "添加失败"));
     }
     mcpNameInput.value = "";
     mcpCommandInput.value = "";
@@ -909,7 +914,7 @@ async function saveSettings(event) {
     });
     if (!response.ok) {
       const data = await response.json().catch(() => null);
-      throw new Error(data && data.error ? data.error : "保存失败");
+      throw new Error(errorMessage(data, "保存失败"));
     }
     apiKeyInput.value = "";
     settingsStatus.textContent = "已保存并加密";
@@ -943,7 +948,7 @@ async function uploadFile(event) {
     });
     if (!response.ok) {
       const data = await response.json().catch(() => null);
-      throw new Error(data && data.detail ? data.detail : "HTTP " + response.status);
+      throw new Error(errorMessage(data, "HTTP " + response.status));
     }
     const data = await response.json();
     const parsedType = data.parsed && data.parsed.type ? data.parsed.type : "unsupported";
@@ -992,7 +997,7 @@ async function sendMessage() {
 
     if (!response.ok) {
       const data = await response.json().catch(() => null);
-      throw new Error(data && data.error ? data.error : "HTTP " + response.status);
+      throw new Error(errorMessage(data, "HTTP " + response.status));
     }
 
     const reader = response.body.getReader();

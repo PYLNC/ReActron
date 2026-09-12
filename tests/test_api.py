@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -221,6 +222,57 @@ else:
             with self.assertRaisesRegex(ValueError, "WEB_CONCURRENCY"):
                 with TestClient(app_module.app):
                     pass
+
+
+class ErrorContractTest(unittest.TestCase):
+    def test_http_auth_and_hidden_resource_errors(self):
+        from backend.app import http_error_handler
+
+        request = SimpleNamespace(url=SimpleNamespace(path="/api/private"))
+        for status, code, message in (
+            (401, "unauthenticated", "请先完成本地认证"),
+            (403, "forbidden", "无权执行此操作"),
+            (404, "not_found", "资源不存在"),
+        ):
+            response = asyncio.run(
+                http_error_handler(request, StarletteHTTPException(status, "secret-marker"))
+            )
+            body = json.loads(response.body)
+            self.assertEqual(response.status_code, status)
+            self.assertEqual(body["code"], code)
+            self.assertEqual(body["message"], message)
+            self.assertEqual(set(body), {"code", "message", "details", "trace_id"})
+            self.assertNotIn("secret-marker", response.body.decode())
+
+    def test_unexpected_error_does_not_expose_exception(self):
+        from backend.app import internal_error_handler
+
+        request = SimpleNamespace(url=SimpleNamespace(path="/api/private"))
+        with self.assertLogs("agent.app", level="ERROR") as logs:
+            response = asyncio.run(
+                internal_error_handler(request, RuntimeError("private-marker"))
+            )
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(body["code"], "internal_error")
+        self.assertEqual(set(body), {"code", "message", "details", "trace_id"})
+        self.assertNotIn("private-marker", response.body.decode())
+        self.assertNotIn("private-marker", "\n".join(logs.output))
+
+    def test_sse_info_log_omits_model_and_tool_payloads(self):
+        from backend.api import _log_sse_event
+
+        marker = "private-tool-marker"
+        with self.assertLogs("agent.api", level="INFO") as logs:
+            for event_type in ("text", "tool_call", "tool_result", marker):
+                _log_sse_event({
+                    "type": event_type,
+                    "content": marker,
+                    "name": marker,
+                    "arguments": marker,
+                    "message": marker,
+                })
+        self.assertNotIn(marker, "\n".join(logs.output))
 
 
 class ChatGateTest(unittest.TestCase):

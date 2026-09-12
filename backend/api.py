@@ -95,37 +95,11 @@ def _make_session_title(message: str) -> str:
     return title[:20] + ("..." if len(title) > 20 else "") or "新会话"
 
 
-def _truncate(text: str, limit: int = 500):
-    """截断日志文本，避免单条日志过大。"""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "...(已截断)"
-
-
 def _log_sse_event(event: dict):
-    """输出每一个 SSE 事件，包含文本、工具参数和工具结果。"""
+    """只记录受控事件类型，不记录模型或工具产生的内容。"""
     event_type = event.get("type")
-    if event_type == "text":
-        logger.info("[SSE] text += %s", _truncate(event.get("content", ""), 200))
-    elif event_type == "tool_call":
-        logger.info(
-            "[SSE] tool_call name=%s arguments=%s",
-            event.get("name"),
-            _truncate(event.get("arguments", ""), 300),
-        )
-    elif event_type == "tool_result":
-        logger.info(
-            "[SSE] tool_result name=%s ok=%s message=%s",
-            event.get("name"),
-            event.get("ok"),
-            _truncate(event.get("message", ""), 300),
-        )
-    else:
-        logger.info(
-            "[SSE] event=%s data=%s",
-            event_type,
-            _truncate(json.dumps(event, ensure_ascii=False), 300),
-        )
+    allowed = {"round", "text", "tool_call", "tool_result", "done", "error"}
+    logger.info("[SSE] event=%s", event_type if event_type in allowed else "other")
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -144,7 +118,7 @@ async def health():
 async def tools():
     """返回当前注册给模型的工具列表。"""
     result = ToolsResponse(count=len(TOOL_DEFINITIONS), tools=TOOL_DEFINITIONS)
-    logger.info("工具列表输出：count=%d，tools=%s", result.count, [t.function.get("name") for t in result.tools])
+    logger.info("工具列表输出：count=%d", result.count)
     return result
 
 
@@ -152,7 +126,7 @@ async def tools():
 async def skills():
     """返回已注册的技能列表。"""
     info = get_skills_info()
-    logger.info("技能列表输出：count=%d，skills=%s", len(SKILLS), info)
+    logger.info("技能列表输出：count=%d", len(SKILLS))
     return {"count": len(SKILLS), "skills": info}
 
 
@@ -181,7 +155,7 @@ async def upload_file(file: UploadFile = File(...)):
 
     parsed = parse_uploaded_file(stored_path)
     db.register_upload(file_id, filename, stored_path, size, file.content_type, parsed)
-    logger.info("上传文件完成：file_id=%s，filename=%s，size=%d", file_id, filename, size)
+    logger.info("上传文件完成：file_id=%s，size=%d", file_id, size)
     return {
         "file_id": file_id,
         "filename": filename,
@@ -254,7 +228,7 @@ async def delete_mcp_server(server_id: str):
 async def refresh_mcp():
     """重新连接所有 MCP Server 并注册工具。"""
     result = await get_manager().refresh_registry()
-    logger.info("MCP 刷新完成：%s", result)
+    logger.info("MCP 刷新完成")
     return result
 
 
@@ -273,7 +247,7 @@ async def test_mcp_server(server_id: str):
 async def config():
     """返回非敏感运行配置。"""
     settings = get_public_settings()
-    logger.info("配置输出：%s", settings)
+    logger.info("配置输出完成")
     return ConfigResponse(**settings)
 
 
@@ -281,7 +255,7 @@ async def config():
 async def get_settings():
     """返回前端设置面板信息。"""
     settings = get_public_settings()
-    logger.info("设置输出：%s", settings)
+    logger.info("设置输出完成")
     return settings
 
 
@@ -304,15 +278,7 @@ async def update_settings(payload: SettingsRequest):
         )
     except InvalidBaseUrl as exc:
         return _error_response(422, "invalid_base_url", str(exc))
-    logger.info(
-        "设置保存完成，输入 base_url=%s model=%s max_rounds=%s tool_timeout=%s，"
-        "输出 api_key_configured=%s",
-        payload.base_url,
-        payload.model,
-        payload.max_rounds,
-        payload.tool_timeout,
-        settings["api_key_configured"],
-    )
+    logger.info("设置保存完成：api_key_configured=%s", settings["api_key_configured"])
     return settings
 
 
@@ -330,12 +296,7 @@ async def create_session(payload: SessionCreateRequest):
     if not payload.project_id:
         raise HTTPException(status_code=400, detail="请先创建并选择项目")
     session = db.create_session(payload.title or "新会话", payload.project_id)
-    logger.info(
-        "创建会话输入：title=%s，project_id=%s，输出：session_id=%s",
-        payload.title,
-        payload.project_id,
-        session["id"],
-    )
+    logger.info("创建会话：session_id=%s", session["id"])
     return session
 
 
@@ -354,7 +315,7 @@ async def create_project(payload: ProjectCreateRequest):
     if not name:
         raise HTTPException(status_code=400, detail="项目名称不能为空")
     project = db.create_project(name)
-    logger.info("创建项目：project_id=%s，name=%s", project["id"], name)
+    logger.info("创建项目：project_id=%s", project["id"])
     return project
 
 
@@ -419,16 +380,10 @@ async def rename_session(session_id: str, payload: SessionRenameRequest):
     title = payload.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="标题不能为空")
-    old_session = db.get_session(session_id)
     session = db.rename_session(session_id, title)
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
-    logger.info(
-        "重命名会话：session_id=%s，标题 %s -> %s",
-        session_id,
-        old_session["title"] if old_session else "?",
-        title,
-    )
+    logger.info("重命名会话：session_id=%s", session_id)
     return session
 
 
@@ -439,7 +394,7 @@ async def delete_session(session_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
     db.delete_session(session_id)
-    logger.info("删除会话输出：session_id=%s，title=%s", session_id, session["title"])
+    logger.info("删除会话输出：session_id=%s", session_id)
     return {"ok": True}
 
 
@@ -482,17 +437,10 @@ async def chat(payload: ChatRequest):
     except Exception:
         _release_session(session_id)
         raise
+    logger.info("聊天请求：session_id=%s，历史消息数=%d", session_id, len(history))
     logger.info(
-        "聊天请求输入：session_id=%s，message=%s，历史消息数=%d",
-        session_id,
-        _truncate(message, 300),
-        len(history),
-    )
-    logger.info(
-        "聊天运行配置：base_url=%s，model=%s，max_rounds=%d，tool_timeout=%.1f，"
+        "聊天运行配置：max_rounds=%d，tool_timeout=%.1f，"
         "api_key_configured=%s",
-        cfg.base_url,
-        cfg.model,
         cfg.max_rounds,
         cfg.tool_timeout,
         bool(cfg.api_key),
@@ -526,9 +474,9 @@ async def chat(payload: ChatRequest):
                 _log_sse_event(event)
                 yield _sse(event)
             logger.info("SSE 响应完成，session_id=%s", session_id)
-        except Exception as exc:
-            logger.exception("处理 /api/chat 请求失败：%s", exc)
-            yield _sse({"type": "error", "message": f"请求失败: {exc}"})
+        except Exception:
+            logger.error("处理 /api/chat 请求失败")
+            yield _sse({"type": "error", "message": "请求失败"})
         finally:
             _release_session(session_id)
 
