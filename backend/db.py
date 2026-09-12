@@ -1,11 +1,13 @@
 """SQLite 数据库访问层：会话、消息与设置持久化。"""
 
 import json
+import hashlib
 import logging
 import sqlite3
 import threading
 import uuid
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.config import BASE_DIR
@@ -14,7 +16,47 @@ from backend.config import BASE_DIR
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "countboter.db"
 logger = logging.getLogger("agent.db")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+MAX_EVENT_BYTES = 64 * 1024
+MAX_RUN_EVENT_BYTES = 4 * 1024 * 1024
+TERMINAL_EVENT_RESERVE = 8 * 1024
+TERMINAL_EVENTS = frozenset({"run.completed", "run.failed", "run.cancelled"})
+
+
+class RepositoryError(ValueError):
+    code = "repository_error"
+
+
+class ResourceNotFound(RepositoryError):
+    code = "not_found"
+
+
+class IdempotencyKeyReused(RepositoryError):
+    code = "idempotency_key_reused"
+
+
+class RunAlreadyActive(RepositoryError):
+    code = "run_already_active"
+
+    def __init__(self, existing_run_id):
+        super().__init__("该 Agent 已有活动 Run")
+        self.existing_run_id = existing_run_id
+
+
+class InvalidRunTransition(RepositoryError):
+    code = "invalid_run_transition"
+
+
+class EventLimitExceeded(RepositoryError):
+    code = "event_limit_exceeded"
+
+
+def _json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _truncate(text: str, limit: int = 300):
@@ -65,6 +107,18 @@ class Database:
         rows = self._query_all(sql, params)
         return rows[0] if rows else None
 
+    @contextmanager
+    def _write(self):
+        """A single SQLite writer transaction; never nest `_execute` inside it."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                yield self._conn
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
     def _init_tables(self):
         with self._lock:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
@@ -73,6 +127,9 @@ class Database:
                 version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version == 1:
                 self._migrate_1_to_2()
+                version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == 2:
+                self._migrate_2_to_3()
                 version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
                 raise RuntimeError(f"不支持的数据库版本：{version}")
@@ -86,7 +143,7 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             # 另一个进程可能已在等待 writer lock 时完成同一迁移。
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version in (1, SCHEMA_VERSION):
+            if version in (1, 2, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 0:
@@ -312,7 +369,7 @@ class Database:
         try:
             conn.execute("BEGIN IMMEDIATE")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version == SCHEMA_VERSION:
+            if version in (2, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 1:
@@ -321,11 +378,188 @@ class Database:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(settings)")}
             if "credential_base_url" not in columns:
                 conn.execute("ALTER TABLE settings ADD COLUMN credential_base_url TEXT")
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("PRAGMA user_version = 2")
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+
+    def _migrate_2_to_3(self):
+        """在现有 Provider v2 之上增加最小 P1 持久内核。"""
+        conn = self._conn
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == SCHEMA_VERSION:
+                conn.commit()
+                return
+            if version != 2:
+                raise RuntimeError(f"不支持的数据库版本：{version}")
+            conn.execute("ALTER TABLE sessions ADD COLUMN archived_at TEXT")
+            conn.execute("""
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+                    goal TEXT NOT NULL CHECK (length(trim(goal)) BETWEEN 1 AND 32768),
+                    acceptance_json TEXT NOT NULL DEFAULT '[]',
+                    context_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open','completed','failed','cancelled')),
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    UNIQUE (id, session_id),
+                    CHECK ((status = 'open' AND finished_at IS NULL) OR
+                           (status <> 'open' AND finished_at IS NOT NULL))
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE runs (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    attempt INTEGER NOT NULL CHECK (attempt >= 1),
+                    idempotency_key TEXT NOT NULL
+                        CHECK (length(trim(idempotency_key)) BETWEEN 1 AND 200),
+                    request_hash TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN
+                        ('queued','running','waiting','paused','completed','failed','cancelled')),
+                    wait_reason TEXT,
+                    control_requested TEXT,
+                    version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+                    lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK (lease_epoch >= 0),
+                    lease_owner TEXT,
+                    lease_until TEXT,
+                    config_snapshot_json TEXT NOT NULL,
+                    tool_snapshot_json TEXT NOT NULL,
+                    context_max_sequence INTEGER NOT NULL CHECK (context_max_sequence >= 0),
+                    event_bytes_written INTEGER NOT NULL DEFAULT 0
+                        CHECK (event_bytes_written BETWEEN 0 AND 4194304),
+                    checkpoint_json TEXT,
+                    usage_json TEXT,
+                    error_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    heartbeat_at TEXT,
+                    finished_at TEXT,
+                    FOREIGN KEY (task_id, session_id)
+                        REFERENCES tasks(id, session_id) ON DELETE RESTRICT,
+                    UNIQUE (task_id, attempt),
+                    UNIQUE (session_id, idempotency_key),
+                    UNIQUE (id, task_id),
+                    CHECK (wait_reason IS NULL OR
+                           (status = 'waiting' AND wait_reason IN ('approval','input','children')) OR
+                           (status = 'paused' AND wait_reason = 'restart')),
+                    CHECK (control_requested IS NULL OR
+                           (status = 'running' AND control_requested IN ('pause','cancel'))),
+                    CHECK ((status = 'running' AND lease_owner IS NOT NULL AND
+                            lease_until IS NOT NULL AND checkpoint_json IS NOT NULL) OR
+                           (status <> 'running' AND lease_owner IS NULL AND lease_until IS NULL)),
+                    CHECK ((status IN ('completed','failed','cancelled') AND finished_at IS NOT NULL) OR
+                           (status NOT IN ('completed','failed','cancelled') AND finished_at IS NULL))
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX uq_runs_one_live_per_session ON runs(session_id)
+                WHERE status IN ('queued','running','waiting','paused')
+            """)
+            conn.execute("CREATE INDEX idx_runs_claim ON runs(created_at,id) WHERE status='queued'")
+            conn.execute("CREATE INDEX idx_runs_expired_lease ON runs(lease_until) WHERE status='running'")
+            conn.execute("CREATE INDEX idx_tasks_session_created ON tasks(session_id,created_at)")
+            conn.execute("""
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    type TEXT NOT NULL CHECK (length(type) BETWEEN 1 AND 80),
+                    dedupe_key TEXT,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (run_id, task_id) REFERENCES runs(id, task_id) ON DELETE RESTRICT
+                )
+            """)
+            conn.execute("CREATE UNIQUE INDEX uq_events_dedupe_key ON events(dedupe_key) WHERE dedupe_key IS NOT NULL")
+            conn.execute("CREATE INDEX idx_events_run_cursor ON events(run_id,id)")
+            conn.execute("""
+                CREATE TABLE approvals (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+                    tool_call_id TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('pre_execution','resolve_unknown_outcome')),
+                    action_hash TEXT NOT NULL,
+                    request_summary_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('pending','resolved','expired')),
+                    expires_at TEXT NOT NULL,
+                    decided_at TEXT,
+                    decided_by TEXT,
+                    decision_json TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (run_id,tool_call_id,kind,action_hash)
+                )
+            """)
+            conn.execute("CREATE INDEX idx_approvals_status ON approvals(status,expires_at)")
+            conn.execute("""
+                CREATE TABLE messages_v3 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    task_id TEXT,
+                    run_id TEXT,
+                    role TEXT NOT NULL CHECK (role IN ('system','user','assistant','tool')),
+                    content TEXT,
+                    tool_calls_json TEXT,
+                    tool_call_id TEXT,
+                    sequence INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                    FOREIGN KEY (task_id,session_id) REFERENCES tasks(id,session_id) ON DELETE RESTRICT,
+                    FOREIGN KEY (run_id,task_id) REFERENCES runs(id,task_id) ON DELETE RESTRICT,
+                    UNIQUE (session_id,sequence),
+                    CHECK (run_id IS NULL OR task_id IS NOT NULL),
+                    CHECK (run_id IS NOT NULL OR task_id IS NULL OR role = 'user'),
+                    CHECK (role <> 'tool' OR
+                           (tool_call_id IS NOT NULL AND length(tool_call_id) > 0))
+                )
+            """)
+            conn.execute("""
+                INSERT INTO messages_v3
+                    (id,session_id,role,content,tool_calls_json,tool_call_id,sequence,created_at)
+                SELECT id,session_id,role,content,tool_calls_json,tool_call_id,sequence,created_at
+                FROM messages
+            """)
+            conn.execute("DROP TABLE messages")
+            conn.execute("ALTER TABLE messages_v3 RENAME TO messages")
+            conn.execute("CREATE UNIQUE INDEX uq_messages_task_input ON messages(task_id) WHERE task_id IS NOT NULL AND run_id IS NULL")
+            conn.execute("CREATE INDEX idx_messages_run_id ON messages(run_id,id)")
+            conn.execute("""
+                CREATE TRIGGER trg_tasks_status_transition BEFORE UPDATE OF status ON tasks
+                WHEN OLD.status <> NEW.status AND NOT (
+                    (OLD.status = 'open' AND NEW.status IN ('completed','failed','cancelled')) OR
+                    (OLD.status IN ('failed','cancelled') AND NEW.status = 'open'))
+                BEGIN SELECT RAISE(ABORT,'invalid task status transition'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_runs_status_transition BEFORE UPDATE OF status ON runs
+                WHEN OLD.status <> NEW.status AND NOT (
+                    (OLD.status = 'queued' AND NEW.status IN ('running','cancelled')) OR
+                    (OLD.status = 'running' AND NEW.status IN ('waiting','paused','completed','failed','cancelled')) OR
+                    (OLD.status IN ('waiting','paused') AND NEW.status IN ('queued','failed','cancelled')))
+                BEGIN SELECT RAISE(ABORT,'invalid run status transition'); END
+            """)
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError(f"数据库外键检查失败：{[tuple(row) for row in violations]}")
+            if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise sqlite3.DatabaseError("数据库完整性检查失败")
+            conn.execute("PRAGMA user_version = 3")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
 
     def _verify_integrity(self):
         violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -448,6 +682,7 @@ class Database:
             """
             SELECT id, title, created_at, updated_at, project_id
             FROM sessions
+            WHERE archived_at IS NULL
             ORDER BY updated_at DESC
             """
         )
@@ -495,7 +730,17 @@ class Database:
         logger.debug("DB 更新会话时间：session_id=%s", session_id)
 
     def delete_session(self, session_id):
-        self._execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        with self._write() as conn:
+            has_task = conn.execute(
+                "SELECT 1 FROM tasks WHERE session_id=? LIMIT 1", (session_id,)
+            ).fetchone()
+            if has_task:
+                conn.execute(
+                    "UPDATE sessions SET archived_at=?, updated_at=? WHERE id=?",
+                    (_utc_now(), _utc_now(), session_id),
+                )
+            else:
+                conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
         logger.info("DB 删除会话：session_id=%s", session_id)
 
     def assign_session_to_project(self, session_id, project_id):
@@ -807,6 +1052,269 @@ class Database:
             """,
             (limit,),
         )
+
+    # P1 persistent Run kernel. agent_id is the existing sessions.id.
+    @staticmethod
+    def _insert_message_tx(conn, session_id, role, content=None, *, task_id=None,
+                           run_id=None, tool_calls=None, tool_call_id=None):
+        sequence = conn.execute(
+            "SELECT COALESCE(MAX(sequence),0)+1 FROM messages WHERE session_id=?",
+            (session_id,),
+        ).fetchone()[0]
+        now = _utc_now()
+        cursor = conn.execute("""
+            INSERT INTO messages
+                (session_id,task_id,run_id,role,content,tool_calls_json,
+                 tool_call_id,sequence,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (session_id, task_id, run_id, role, content,
+              _json(tool_calls) if tool_calls is not None else None,
+              tool_call_id, sequence, now))
+        conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (now, session_id))
+        return cursor.lastrowid
+
+    @staticmethod
+    def _task_values(goal, acceptance, context):
+        if not isinstance(goal, str) or not 1 <= len(goal.strip()) <= 32768:
+            raise ValueError("goal 必须为 1..32768 字符")
+        if acceptance is None:
+            acceptance = []
+        if context is None:
+            context = {}
+        if not isinstance(acceptance, list) or not isinstance(context, dict):
+            raise ValueError("acceptance 必须为数组，context 必须为对象")
+        return goal.strip(), _json(acceptance), _json(context)
+
+    def _insert_task_tx(self, conn, agent_id, goal, acceptance, context):
+        goal, acceptance_json, context_json = self._task_values(
+            goal, acceptance, context
+        )
+        if not conn.execute(
+            "SELECT 1 FROM sessions WHERE id=? AND archived_at IS NULL", (agent_id,)
+        ).fetchone():
+            raise ResourceNotFound("Agent 不存在")
+        task_id, now = str(uuid.uuid4()), _utc_now()
+        conn.execute("""
+            INSERT INTO tasks
+                (id,session_id,goal,acceptance_json,context_json,status,
+                 created_at,updated_at)
+            VALUES (?,?,?,?,?,'open',?,?)
+        """, (task_id, agent_id, goal, acceptance_json, context_json, now, now))
+        self._insert_message_tx(conn, agent_id, "user", goal, task_id=task_id)
+        return dict(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+
+    def create_task(self, agent_id, goal, acceptance=None, context=None):
+        with self._write() as conn:
+            return self._insert_task_tx(conn, agent_id, goal, acceptance, context)
+
+    def get_task(self, task_id):
+        return self._query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+
+    def list_tasks(self, agent_id=None, status=None, limit=50):
+        if status is not None and status not in {"open", "completed", "failed", "cancelled"}:
+            raise ValueError("无效 Task 状态")
+        if not 1 <= limit <= 100:
+            raise ValueError("limit 必须为 1..100")
+        return self._query_all("""
+            SELECT * FROM tasks
+            WHERE (? IS NULL OR session_id=?) AND (? IS NULL OR status=?)
+            ORDER BY created_at DESC,id DESC LIMIT ?
+        """, (agent_id, agent_id, status, status, limit))
+
+    def get_latest_run_id(self, task_id):
+        row = self._query_one(
+            "SELECT id FROM runs WHERE task_id=? ORDER BY attempt DESC LIMIT 1", (task_id,)
+        )
+        return row["id"] if row else None
+
+    @staticmethod
+    def _request_hash(session_id, task_id, options):
+        if not isinstance(options, dict):
+            raise ValueError("Run options 必须为对象")
+        return hashlib.sha256(_json({
+            "session_id": session_id, "task_id": task_id, "options": options
+        }).encode("utf-8")).hexdigest()
+
+    def _default_run_snapshots_tx(self, conn):
+        """Freeze safe metadata, never a Provider key or executable handler."""
+        from backend.config import load_config
+        from backend.tool_gateway import snapshot_builtin_tools
+
+        cfg = load_config()
+        settings = conn.execute("SELECT * FROM settings WHERE id=1").fetchone()
+        settings = dict(settings) if settings else {}
+        credential = settings.get("api_key_encrypted") or cfg.api_key
+        config = {
+            "v": 1,
+            "base_url": settings.get("base_url") or cfg.base_url,
+            "model": settings.get("model") or cfg.model,
+            "max_rounds": settings.get("max_rounds") or cfg.max_rounds,
+            "tool_timeout": settings.get("tool_timeout") or cfg.tool_timeout,
+            "credential_fingerprint": hashlib.sha256(credential.encode()).hexdigest()
+                if credential else None,
+        }
+        specs = snapshot_builtin_tools()
+        tools = {name: {
+            "schema": spec.schema,
+            "effects": sorted(spec.effects),
+            "path_fields": list(spec.path_fields),
+            "idempotent": spec.idempotent,
+            "approval": spec.approval,
+            "timeout_seconds": spec.timeout_seconds,
+            "origin": spec.origin,
+        } for name, spec in specs.items()}
+        return config, {"v": 1, "specs": tools, "grants": ["read_only"]}
+
+    def _insert_run_tx(self, conn, task, idempotency_key, options,
+                       config_snapshot, tool_snapshot, *, request_hash=None):
+        if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key.strip()) <= 200:
+            raise ValueError("Idempotency-Key 必须为 1..200 字符")
+        key = idempotency_key.strip()
+        fingerprint = request_hash or self._request_hash(task["session_id"], task["id"], options)
+        existing = conn.execute(
+            "SELECT * FROM runs WHERE session_id=? AND idempotency_key=?",
+            (task["session_id"], key),
+        ).fetchone()
+        if existing:
+            if existing["request_hash"] != fingerprint:
+                raise IdempotencyKeyReused("Idempotency-Key 已用于不同请求")
+            return dict(existing), False
+        active = conn.execute("""
+            SELECT id FROM runs WHERE session_id=? AND
+                status IN ('queued','running','waiting','paused') LIMIT 1
+        """, (task["session_id"],)).fetchone()
+        if active:
+            raise RunAlreadyActive(active["id"])
+        if task["status"] != "open":
+            raise InvalidRunTransition("Task 已结束；仅显式 retry 可新建 Run")
+        if config_snapshot is None or tool_snapshot is None:
+            frozen_config, frozen_tools = self._default_run_snapshots_tx(conn)
+            config_snapshot = frozen_config if config_snapshot is None else config_snapshot
+            tool_snapshot = frozen_tools if tool_snapshot is None else tool_snapshot
+        cutoff = conn.execute(
+            "SELECT COALESCE(MAX(sequence),0) FROM messages WHERE session_id=?",
+            (task["session_id"],),
+        ).fetchone()[0]
+        attempt = conn.execute(
+            "SELECT COALESCE(MAX(attempt),0)+1 FROM runs WHERE task_id=?", (task["id"],)
+        ).fetchone()[0]
+        run_id, now = str(uuid.uuid4()), _utc_now()
+        conn.execute("""
+            INSERT INTO runs
+                (id,task_id,session_id,attempt,idempotency_key,request_hash,status,
+                 config_snapshot_json,tool_snapshot_json,context_max_sequence,
+                 created_at,updated_at)
+            VALUES (?,?,?,?,?,?,'queued',?,?,?,?,?)
+        """, (run_id, task["id"], task["session_id"], attempt, key, fingerprint,
+              _json(config_snapshot), _json(tool_snapshot), cutoff, now, now))
+        self._append_event_tx(conn, run_id, "run.queued", {"attempt": attempt},
+                              dedupe_key=f"{run_id}:run.queued")
+        return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), True
+
+    def create_run(self, task_id, idempotency_key, options=None,
+                   config_snapshot=None, tool_snapshot=None):
+        with self._write() as conn:
+            task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not task:
+                raise ResourceNotFound("Task 不存在")
+            return self._insert_run_tx(conn, task, idempotency_key, options or {},
+                                       config_snapshot, tool_snapshot)
+
+    def create_legacy_chat_run(self, agent_id, goal, idempotency_key, options=None,
+                               config_snapshot=None, tool_snapshot=None):
+        options = options or {}
+        goal, _, _ = self._task_values(goal, None, None)
+        fingerprint = hashlib.sha256(_json({
+            "session_id": agent_id, "goal": goal, "options": options,
+        }).encode("utf-8")).hexdigest()
+        with self._write() as conn:
+            existing = conn.execute(
+                "SELECT * FROM runs WHERE session_id=? AND idempotency_key=?",
+                (agent_id, idempotency_key.strip()),
+            ).fetchone()
+            if existing:
+                if existing["request_hash"] != fingerprint:
+                    raise IdempotencyKeyReused("Idempotency-Key 已用于不同请求")
+                task = conn.execute("SELECT * FROM tasks WHERE id=?", (existing["task_id"],)).fetchone()
+                return dict(task), dict(existing)
+            task = self._insert_task_tx(conn, agent_id, goal, None, None)
+            run, _ = self._insert_run_tx(conn, task, idempotency_key, options,
+                                         config_snapshot, tool_snapshot,
+                                         request_hash=fingerprint)
+            return task, run
+
+    def get_run(self, run_id):
+        return self._query_one("SELECT * FROM runs WHERE id=?", (run_id,))
+
+    @staticmethod
+    def _append_event_tx(conn, run_id, event_type, payload=None, dedupe_key=None):
+        if not isinstance(event_type, str) or not 1 <= len(event_type) <= 80:
+            raise ValueError("无效 Event type")
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise ValueError("Event payload 必须为对象")
+        run = conn.execute(
+            "SELECT task_id,session_id,event_bytes_written FROM runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        if not run:
+            raise ResourceNotFound("Run 不存在")
+        if dedupe_key is not None:
+            existing = conn.execute(
+                "SELECT * FROM events WHERE dedupe_key=?", (dedupe_key,)
+            ).fetchone()
+            if existing:
+                if existing["run_id"] != run_id or existing["type"] != event_type or existing["payload_json"] != _json(payload):
+                    raise InvalidRunTransition("Event dedupe key 冲突")
+                return dict(existing)
+        now = _utc_now()
+        payload_json = _json(payload)
+        cursor = conn.execute("""
+            INSERT INTO events (task_id,run_id,type,dedupe_key,payload_json,created_at)
+            VALUES (?,?,?,?,?,?)
+        """, (run["task_id"], run_id, event_type, dedupe_key, payload_json, now))
+        envelope = {
+            "v": 1,
+            "event_id": cursor.lastrowid,
+            "task_id": run["task_id"],
+            "run_id": run_id,
+            "agent_id": run["session_id"],
+            "type": event_type,
+            "ts": now,
+            "data": payload,
+        }
+        size = len(_json(envelope).encode("utf-8"))
+        limit = MAX_RUN_EVENT_BYTES if event_type in TERMINAL_EVENTS else MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE
+        if size > MAX_EVENT_BYTES or run["event_bytes_written"] + size > limit:
+            raise EventLimitExceeded("Event 超出持久化字节额度")
+        conn.execute(
+            "UPDATE runs SET event_bytes_written=event_bytes_written+? WHERE id=?",
+            (size, run_id),
+        )
+        return dict(conn.execute("SELECT * FROM events WHERE id=?", (cursor.lastrowid,)).fetchone())
+
+    def append_event(self, run_id, event_type, payload=None, dedupe_key=None):
+        with self._write() as conn:
+            return self._append_event_tx(conn, run_id, event_type, payload, dedupe_key)
+
+    def list_events(self, run_id, after_id=0, limit=100):
+        if not isinstance(after_id, int) or after_id < 0 or not 1 <= limit <= 1000:
+            raise ValueError("无效 Event cursor/limit")
+        return self._query_all("""
+            SELECT * FROM events WHERE run_id=? AND id>?
+            ORDER BY id LIMIT ?
+        """, (run_id, after_id, limit))
+
+    def get_last_event_id(self, run_id):
+        row = self._query_one(
+            "SELECT COALESCE(MAX(id),0) AS last_event_id FROM events WHERE run_id=?",
+            (run_id,),
+        )
+        return row["last_event_id"]
+
+    def get_message(self, message_id):
+        return self._query_one("SELECT * FROM messages WHERE id=?", (message_id,))
 
 
 db = Database()

@@ -89,6 +89,23 @@ def create_v1_settings_database(path: Path):
             1, 'legacy-ciphertext', 'https://api.example/v1',
             'legacy-model', 5, 10.0, '2026-01-01 00:00:00'
         );
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, is_default INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT,
+            tool_calls_json TEXT, tool_call_id TEXT, sequence INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        INSERT INTO projects VALUES ('default', '默认项目', '2026-01-01', '2026-01-01', 1);
         PRAGMA user_version = 1;
     """)
     conn.close()
@@ -115,7 +132,7 @@ class MigrationTest(unittest.TestCase):
             create_v0_database(path)
 
             db = Database(path)
-            self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 3)
             defaults = db._query_all(
                 "SELECT id FROM projects WHERE is_default = 1"
             )
@@ -160,7 +177,7 @@ class MigrationTest(unittest.TestCase):
             try:
                 self.assertEqual(snapshot(reopened), first_snapshot)
                 self.assertEqual(
-                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 2
+                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 3
                 )
             finally:
                 reopened.close()
@@ -173,7 +190,7 @@ class MigrationTest(unittest.TestCase):
             db = Database(path)
             try:
                 self.assertEqual(
-                    db._conn.execute("PRAGMA user_version").fetchone()[0], 2
+                    db._conn.execute("PRAGMA user_version").fetchone()[0], 3
                 )
                 settings = db.get_settings()
                 self.assertEqual(settings["api_key_encrypted"], "legacy-ciphertext")
@@ -184,7 +201,7 @@ class MigrationTest(unittest.TestCase):
             reopened = Database(path)
             try:
                 self.assertEqual(
-                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 2
+                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 3
                 )
                 self.assertIsNone(reopened.get_settings()["credential_base_url"])
             finally:
