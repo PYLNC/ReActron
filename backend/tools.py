@@ -1,19 +1,11 @@
 """示例工具集合：新工具在这里实现并注册即可。"""
 
-import json
 import logging
 from datetime import datetime
 from pathlib import Path
 
 
 logger = logging.getLogger("agent.tools")
-
-
-def _truncate(text: str, limit: int = 500):
-    """截断日志文本。"""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "...(已截断)"
 
 
 def get_current_time():
@@ -44,7 +36,7 @@ def list_dir(path: str = "."):
             "type": "dir" if entry.is_dir() else "file",
         })
 
-    logger.info("调用 list_dir，path=%s，共 %d 项", target, len(entries))
+    logger.info("调用 list_dir，entries=%d", len(entries))
     return {"path": str(target), "count": len(entries), "entries": entries}
 
 
@@ -80,19 +72,3 @@ TOOL_FUNCTIONS = {
     "get_current_time": get_current_time,
     "list_dir": list_dir,
 }
-
-
-def execute_tool(name: str, arguments: dict):
-    """按名称执行工具，返回可 JSON 序列化的结果。"""
-    func = TOOL_FUNCTIONS.get(name)
-    if func is None:
-        logger.warning("尝试调用未知工具：%s", name)
-        raise ValueError(f"未知工具: {name}")
-
-    logger.info("开始执行工具，name=%s，arguments=%s", name, arguments)
-    result = func(**arguments)
-
-    # 统一转成可 JSON 序列化的对象，方便后续拼接成字符串回填给模型
-    result = json.loads(json.dumps(result, ensure_ascii=False, default=str))
-    logger.info("工具输出：name=%s，result=%s", name, _truncate(json.dumps(result, ensure_ascii=False), 500))
-    return result

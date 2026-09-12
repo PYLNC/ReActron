@@ -1,9 +1,7 @@
 """Skill 注册中心：集中管理所有技能、工具定义和系统提示。"""
 
-import json
 import logging
 
-from backend.harness import get_harness
 from backend.skills.file_skill import FILE_SKILL
 from backend.skills.excel_skill import EXCEL_SKILL
 from backend.skills.ppt_skill import PPT_SKILL
@@ -48,28 +46,12 @@ def register_mcp_tools(definitions: list, functions: dict):
     logger.info("MCP 工具注册完成：%d 个", len(definitions))
 
 
-def execute_tool(name: str, arguments: dict):
-    """按名称执行任意已注册技能或基础工具。"""
-    func = TOOL_FUNCTIONS.get(name)
-    if func is None:
-        logger.warning("尝试调用未知工具：%s", name)
-        raise ValueError(f"未知工具: {name}")
+def _reject_legacy_execution(*_args, **_kwargs):
+    raise RuntimeError("tool_gateway_required")
 
-    harness = get_harness()
-    harness.check_tool_call(name, arguments)
 
-    logger.info("开始执行工具，name=%s，arguments=%s", name, arguments)
-    try:
-        result = func(**arguments)
-    except Exception as exc:
-        harness.record_result(name, arguments, {"error": str(exc)}, False)
-        logger.warning("工具执行失败：name=%s，error=%s", name, exc)
-        raise
-
-    result = json.loads(json.dumps(result, ensure_ascii=False, default=str))
-    harness.record_result(name, arguments, result, True)
-    logger.info("工具输出：name=%s", name)
-    return result
+# 旧 Agent 导入兼容；此入口不能执行任何 handler，A 将改为网关调用。
+execute_tool = _reject_legacy_execution
 
 
 def get_skills_info() -> list:

@@ -1,6 +1,5 @@
 """安全与自检 Harness：路径策略、工具调用检查、审计和自测。"""
 
-import json
 import logging
 import os
 import re
@@ -70,8 +69,8 @@ class PathPolicy:
         path = Path(raw_path).expanduser().resolve()
 
         for part in path.parts:
-            if part in self.deny_names:
-                raise HarnessError(f"禁止访问敏感文件: {part}")
+            if part.lower() in self.deny_names:
+                raise HarnessError("禁止访问敏感文件")
 
         if not any(path == root or root in path.parents for root in self.allowed_roots):
             raise HarnessError(f"路径不在允许目录内: {path}")
@@ -85,20 +84,26 @@ class PathPolicy:
         return path
 
 
-def _find_path_argument(arguments: dict):
-    """从工具参数中提取可能涉及文件的路径。"""
-    for key in ("file_path", "path"):
-        value = arguments.get(key)
-        if value:
-            return str(value)
-    return None
+def _path_arguments(value):
+    """遍历所有嵌套路径参数，不能只检查第一个。"""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"file_path", "path"}:
+                yield item
+            else:
+                yield from _path_arguments(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _path_arguments(item)
 
 
 class Harness:
-    """工具调用安全闸门，支持 monitor 和 enforce 两种模式。"""
+    """工具调用安全闸门；默认 enforce，monitor 仅用于不执行 handler 的自检。"""
 
     def __init__(self, mode=None, policy=None, record=True):
-        self.mode = (mode or os.getenv("HARNESS_MODE", "monitor")).lower()
+        self.mode = (mode or os.getenv("HARNESS_MODE", "enforce")).lower()
+        if self.mode not in {"enforce", "monitor"}:
+            raise ValueError("未知 HARNESS_MODE")
         self.policy = policy or PathPolicy.from_env()
         self.record = record
         logger.info(
@@ -115,26 +120,25 @@ class Harness:
             db.add_audit_log(
                 action="tool_call",
                 tool_name=tool_name,
-                arguments=arguments,
-                result=result,
+                arguments={"argument_count": len(arguments) if isinstance(arguments, dict) else 0},
+                result={"ok": ok},
                 ok=ok,
             )
-        except Exception as exc:
-            logger.warning("Harness 审计写入失败：%s", exc)
+        except Exception:
+            logger.warning("Harness 审计写入失败")
 
     def check_tool_call(self, name: str, arguments: dict):
-        """执行工具前检查路径参数，monitor 模式放行，enforce 模式拦截。"""
-        raw_path = _find_path_argument(arguments)
-        if not raw_path:
-            return
-        try:
-            self.policy.resolve(raw_path, operation=name)
-        except HarnessError as exc:
-            logger.warning("Harness 拒绝工具调用：name=%s，error=%s", name, exc)
-            self._record(name, arguments, {"error": str(exc)}, False)
-            if self.mode == "enforce":
-                raise
-            logger.warning("当前为 monitor 模式，已放行该调用")
+        """执行前递归检查所有路径；自检 monitor 不应连接 handler。"""
+        for raw_path in _path_arguments(arguments):
+            try:
+                if not isinstance(raw_path, str) or not raw_path:
+                    raise HarnessError("无效路径")
+                self.policy.resolve(raw_path, operation=name)
+            except HarnessError:
+                logger.warning("Harness 拒绝工具调用：name=%s", name)
+                self._record(name, arguments, {"code": "path_not_granted"}, False)
+                if self.mode == "enforce":
+                    raise
 
     def record_result(self, name: str, arguments: dict, result, ok: bool):
         """记录一次工具执行的审计结果。"""
