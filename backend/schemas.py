@@ -2,7 +2,8 @@
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from typing import Annotated
 
 
 class ChatMessage(BaseModel):
@@ -26,6 +27,53 @@ class BootstrapRequest(BaseModel):
     """一次性本地认证凭据；不会保存于浏览器存储。"""
 
     secret: str = Field(min_length=1)
+
+
+NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class TaskCreateRequest(BaseModel):
+    """新控制面只接受 agent_id，不接受旧 session_id。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: NonEmptyText
+    goal: NonEmptyText
+    acceptance: List[str] = Field(default_factory=list)
+    context: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RunCreateRequest(BaseModel):
+    """Wave 3 的 Run 启动不开放客户端选项。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TaskResponse(BaseModel):
+    task_id: str
+    agent_id: str
+    goal: str
+    acceptance: List[str]
+    context: Dict[str, Any]
+    status: str
+    latest_run_id: Optional[str]
+    created_at: str
+    updated_at: str
+    finished_at: Optional[str]
+
+
+class RunResponse(BaseModel):
+    run_id: str
+    task_id: str
+    agent_id: str
+    attempt: int
+    status: str
+    wait_reason: Optional[str]
+    created_at: str
+    started_at: Optional[str]
+    finished_at: Optional[str]
+    last_event_id: int
+    allowed_actions: List[str]
 
 
 class SettingsRequest(BaseModel):

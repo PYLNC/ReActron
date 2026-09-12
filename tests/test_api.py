@@ -345,6 +345,31 @@ class AuthWiringTest(unittest.TestCase):
         self.assertNotIn(("POST", "/api/auth/bootstrap"), seen)
 
 
+class Wave3SchemaTest(unittest.TestCase):
+    def test_task_accepts_only_agent_id_and_nonempty_goal(self):
+        from pydantic import ValidationError
+
+        from backend.schemas import TaskCreateRequest
+
+        payload = TaskCreateRequest(agent_id=" agent-1 ", goal=" goal ")
+        self.assertEqual((payload.agent_id, payload.goal), ("agent-1", "goal"))
+        self.assertEqual(payload.acceptance, [])
+        self.assertEqual(payload.context, {})
+        with self.assertRaises(ValidationError):
+            TaskCreateRequest(agent_id="agent-1", session_id="agent-1", goal="goal")
+        with self.assertRaises(ValidationError):
+            TaskCreateRequest(agent_id="agent-1", goal="  ")
+
+    def test_run_body_rejects_client_options_and_identity(self):
+        from pydantic import ValidationError
+
+        from backend.schemas import RunCreateRequest
+
+        self.assertEqual(RunCreateRequest().model_dump(), {})
+        with self.assertRaises(ValidationError):
+            RunCreateRequest(agent_id="agent-1")
+
+
 class UploadCleanupTest(unittest.TestCase):
     def _rejected(self, filename, content, expected_status, expected_code, parser=None):
         from backend import api
