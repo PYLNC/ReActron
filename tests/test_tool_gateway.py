@@ -20,6 +20,7 @@ from starlette.requests import Request
 from backend import auth, file_parser, harness
 from backend.mcp.manager import MCPManager, MCPNotApproved, MCPServerConfig, config_hash, schema_hash
 from backend.tool_gateway import (
+    MAX_RAW_BYTES,
     RunContext,
     ToolBudget,
     ToolSpec,
@@ -43,6 +44,35 @@ def _spec(handler, *, effects=frozenset({"read_only"}), paths=(), approval="neve
 
 
 class GatewayTest(unittest.IsolatedAsyncioTestCase):
+    async def test_plain_text_raw_utf8_boundary(self):
+        exact_multibyte = "界" * ((MAX_RAW_BYTES - 1) // 3) + "x"
+        self.assertEqual(len(exact_multibyte.encode("utf-8")), MAX_RAW_BYTES)
+        for text, expected in (
+            ("x" * MAX_RAW_BYTES, "ok"),
+            ("x" * (MAX_RAW_BYTES + 1), "limit_exceeded"),
+            (exact_multibyte, "ok"),
+            (exact_multibyte + "y", "limit_exceeded"),
+        ):
+            with self.subTest(raw_bytes=len(text.encode("utf-8"))):
+                context = RunContext(
+                    "run", tool_specs={"demo": _spec(lambda: text)},
+                    grants=frozenset({"read_only"}),
+                )
+                outcome = await execute_tool(context, "demo", "{}")
+                self.assertEqual(outcome.status if expected == "ok" else outcome.error_code, expected)
+
+    async def test_structured_raw_json_boundary(self):
+        overhead = len(json.dumps({"text": ""}, ensure_ascii=False).encode("utf-8"))
+        for length, expected in ((MAX_RAW_BYTES - overhead, "ok"),
+                                 (MAX_RAW_BYTES - overhead + 1, "limit_exceeded")):
+            with self.subTest(raw_bytes=overhead + length):
+                context = RunContext(
+                    "run", tool_specs={"demo": _spec(lambda: {"text": "x" * length})},
+                    grants=frozenset({"read_only"}),
+                )
+                outcome = await execute_tool(context, "demo", "{}")
+                self.assertEqual(outcome.status if expected == "ok" else outcome.error_code, expected)
+
     async def test_new_definition_is_not_implicitly_authorized(self):
         from backend import skills
 

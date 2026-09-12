@@ -270,14 +270,14 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
             result = await asyncio.wait_for(spec.handler(**arguments), timeout=spec.timeout_seconds)
         else:
             result = await asyncio.wait_for(asyncio.to_thread(spec.handler, **arguments), timeout=spec.timeout_seconds)
-        raw_result = json.dumps(result, ensure_ascii=False, default=str, allow_nan=False)
+        raw_result = result if isinstance(result, str) else json.dumps(
+            result, ensure_ascii=False, default=str, allow_nan=False
+        )
         raw_bytes = len(raw_result.encode("utf-8"))
         if raw_bytes > MAX_RAW_BYTES:
             return _outcome(run_context, "error", effect, "limit_exceeded")
-        safe_result = _redact(json.loads(raw_result), run_context.secrets)
+        safe_result = _redact(result if isinstance(result, str) else json.loads(raw_result), run_context.secrets)
         model_result = json.dumps(safe_result, ensure_ascii=False, allow_nan=False)
-        if len(model_result.encode("utf-8")) > MAX_RAW_BYTES:
-            return _outcome(run_context, "error", effect, "limit_exceeded")
         logger.info("tool completed run=%s call=%s name=%s hash=%s bytes=%d ms=%d",
                     run_context.run_id, run_context.call_id, tool_name, action_hash,
                     raw_bytes, int((time.monotonic()-started)*1000))
