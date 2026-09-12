@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from backend.agent import Agent
@@ -18,6 +18,7 @@ from backend.harness import get_harness, run_self_tests
 from backend.mcp.manager import get_manager
 from backend.schemas import (
     ChatRequest,
+    BootstrapRequest,
     ConfigResponse,
     HealthResponse,
     MCPServerCreateRequest,
@@ -48,7 +49,24 @@ from backend.skills import (
 
 
 logger = logging.getLogger("agent.api")
-router = APIRouter(prefix="/api")
+
+
+def _require_local_session(request: Request):
+    """将 API 认证委托给唯一的宿主认证模块。"""
+    from backend.auth import require_host_session
+
+    return require_host_session(request)
+
+
+def _make_chat_context(session_id: str):
+    """仅由服务端冻结内建工具与最小安全 grant。"""
+    from backend.tool_gateway import make_builtin_run_context
+
+    return make_builtin_run_context(run_id=session_id)
+
+
+router = APIRouter(prefix="/api", dependencies=[Depends(_require_local_session)])
+public_router = APIRouter(prefix="/api")
 
 UPLOAD_DIR = DATA_DIR / "uploads"
 ALLOWED_UPLOAD_EXTENSIONS = {".xlsx", ".pptx", ".csv", ".txt", ".md", ".json", ".log"}
@@ -102,7 +120,7 @@ def _log_sse_event(event: dict):
     logger.info("[SSE] event=%s", event_type if event_type in allowed else "other")
 
 
-@router.get("/health", response_model=HealthResponse)
+@public_router.get("/health", response_model=HealthResponse)
 async def health():
     """健康检查。"""
     result = HealthResponse(
@@ -112,6 +130,15 @@ async def health():
     )
     logger.info("健康检查输出：%s", result.model_dump())
     return result
+
+
+@public_router.post("/auth/bootstrap")
+async def bootstrap_auth(payload: BootstrapRequest, request: Request, response: Response):
+    """一次性 secret 换取同源宿主 cookie，不要求已有 cookie。"""
+    from backend.auth import bootstrap
+
+    bootstrap(request, response, payload.secret)
+    return {"ok": True}
 
 
 @router.get("/tools", response_model=ToolsResponse)
@@ -149,12 +176,12 @@ async def upload_file(file: UploadFile = File(...)):
                 if size > MAX_UPLOAD_SIZE:
                     raise HTTPException(status_code=400, detail="文件超过大小限制")
                 handle.write(chunk)
+        parsed = await asyncio.to_thread(parse_uploaded_file, stored_path)
+        db.register_upload(file_id, filename, stored_path, size, file.content_type, parsed)
     except Exception:
         stored_path.unlink(missing_ok=True)
         raise
 
-    parsed = parse_uploaded_file(stored_path)
-    db.register_upload(file_id, filename, stored_path, size, file.content_type, parsed)
     logger.info("上传文件完成：file_id=%s，size=%d", file_id, size)
     return {
         "file_id": file_id,
@@ -428,6 +455,7 @@ async def chat(payload: ChatRequest):
 
     try:
         # reserve 必须先于消息写入，拒绝请求不能留下孤立 user message。
+        run_context = _make_chat_context(session_id)
         db.add_message(session_id, "user", message)
         session = db.get_session(session_id)
         if session and session["title"] in ("新会话", ""):
@@ -469,6 +497,7 @@ async def chat(payload: ChatRequest):
                 tool_timeout=cfg.tool_timeout,
                 on_message=persist_message,
                 system_prompt=build_system_prompt(),
+                run_context=run_context,
             )
             async for event in agent.run(history):
                 _log_sse_event(event)

@@ -77,6 +77,7 @@ async def lifespan(application: FastAPI):
     from backend.db import DB_PATH, db
 
     if not _api_router_loaded:
+        application.include_router(api_module.public_router)
         application.include_router(api_module.router)
         _api_router_loaded = True
 
@@ -90,6 +91,10 @@ async def lifespan(application: FastAPI):
             logger.info("MCP 启动刷新完成")
         except Exception:
             logger.warning("MCP 启动刷新失败")
+        from backend.auth import issue_bootstrap_secret
+
+        secret = issue_bootstrap_secret()
+        print(f"[ReActron] One-time local bootstrap secret: {secret}", file=sys.stderr, flush=True)
         yield
     finally:
         db.close()

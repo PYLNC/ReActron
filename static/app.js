@@ -64,6 +64,30 @@ function errorMessage(data, fallback) {
 }
 
 
+async function bootstrapIfNeeded() {
+  const check = await fetch("/api/config");
+  if (check.ok) return true;
+  if (check.status !== 401) {
+    statusText.textContent = "连接失败";
+    return false;
+  }
+
+  const secret = window.prompt("输入服务终端显示的一次性本地认证码");
+  if (!secret) {
+    statusText.textContent = "需要本地认证";
+    return false;
+  }
+  const response = await fetch("/api/auth/bootstrap", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ secret }),
+  });
+  statusText.textContent = response.ok ? "就绪" : "认证失败，请刷新重试";
+  return response.ok;
+}
+
+
 function setPanelState(name, open) {
   appEl.classList.toggle(name + "-collapsed", !open);
   const button = name === "sessions" ? toggleSessionsBtn : toggleInfoBtn;
@@ -1131,5 +1155,9 @@ document.querySelectorAll(".info-section-toggle").forEach((button) => {
 setPanelState("sessions", localStorage.getItem("countboter_panel_sessions") !== "0");
 setPanelState("info", localStorage.getItem("countboter_panel_info") !== "0");
 
-loadRuntimeInfo();
-loadSessions();
+bootstrapIfNeeded().then((ready) => {
+  if (ready) {
+    loadRuntimeInfo();
+    loadSessions();
+  }
+}).catch(() => { statusText.textContent = "连接失败"; });

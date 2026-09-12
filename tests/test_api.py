@@ -1,6 +1,7 @@
 """P0 API lifecycle, compatibility gate, and launcher contracts."""
 
 import asyncio
+import io
 import json
 import os
 import shutil
@@ -11,8 +12,9 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -142,9 +144,14 @@ class AppLifespanTest(unittest.TestCase):
             patch.object(db_module, "db", fake_db),
             patch("backend.security.validate_secret_key") as validate_secret_key,
             patch("backend.mcp.manager.get_manager", return_value=fake_manager),
+            patch.dict(sys.modules, {"backend.auth": SimpleNamespace(
+                issue_bootstrap_secret=lambda: "test-secret",
+                require_host_session=lambda request: None,
+            )}),
             TestClient(app_module.app) as client,
         ):
             health = client.get("/api/health")
+            static = client.get("/static/app.js")
             missing_route = client.get("/api/does-not-exist")
             marker = "validation-secret-marker"
             with self.assertLogs("agent.app", level="WARNING") as logs:
@@ -152,6 +159,7 @@ class AppLifespanTest(unittest.TestCase):
 
         self.assertEqual(health.status_code, 200)
         self.assertEqual(health.json()["status"], "ok")
+        self.assertEqual(static.status_code, 200)
         self.assertEqual(missing_route.status_code, 404)
         self.assertEqual(missing_route.json()["code"], "not_found")
         self.assertEqual(
@@ -275,6 +283,117 @@ class ErrorContractTest(unittest.TestCase):
         self.assertNotIn(marker, "\n".join(logs.output))
 
 
+class AuthWiringTest(unittest.TestCase):
+    def test_bootstrap_is_public_and_other_routes_delegate_auth(self):
+        from fastapi import FastAPI
+
+        from backend import api
+        from backend.app import http_error_handler
+
+        seen = []
+
+        def require_host_session(request):
+            seen.append((request.method, request.url.path))
+            if request.cookies.get("test_host_session") != "valid":
+                raise HTTPException(status_code=401, detail="unauthenticated")
+            if request.method == "POST" and request.headers.get("origin") != "http://127.0.0.1:8001":
+                raise HTTPException(status_code=403, detail="forbidden")
+
+        def bootstrap(request, response, secret):
+            seen.append(("bootstrap", request.headers.get("host"), request.headers.get("origin")))
+            if secret != "one-time-secret":
+                raise HTTPException(status_code=401, detail="unauthenticated")
+            response.set_cookie("test_host_session", "valid")
+
+        application = FastAPI()
+        application.include_router(api.public_router)
+        application.include_router(api.router)
+        application.add_exception_handler(StarletteHTTPException, http_error_handler)
+        fake_auth = SimpleNamespace(
+            bootstrap=bootstrap,
+            require_host_session=require_host_session,
+        )
+        with patch.dict(sys.modules, {"backend.auth": fake_auth}), patch.object(
+            api, "db", SimpleNamespace(get_session=lambda session_id: None)
+        ):
+            with TestClient(application, base_url="http://127.0.0.1:8001") as client:
+                self.assertEqual(client.get("/api/health").status_code, 200)
+                denied = client.get("/api/tools")
+                authenticated = client.post(
+                    "/api/auth/bootstrap",
+                    headers={"Origin": "http://127.0.0.1:8001"},
+                    json={"secret": "one-time-secret"},
+                )
+                allowed = client.get("/api/tools")
+                missing = client.get("/api/sessions/no-such-session")
+                forbidden = client.post(
+                    "/api/harness/self-test",
+                    headers={"Origin": "http://other.invalid"},
+                )
+
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(denied.json()["code"], "unauthenticated")
+        self.assertEqual(authenticated.status_code, 200)
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["code"], "not_found")
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(forbidden.json()["code"], "forbidden")
+        self.assertIn(("bootstrap", "127.0.0.1:8001", "http://127.0.0.1:8001"), seen)
+        self.assertNotIn(("GET", "/api/health"), seen)
+        self.assertNotIn(("POST", "/api/auth/bootstrap"), seen)
+
+
+class UploadCleanupTest(unittest.TestCase):
+    def test_parser_failure_removes_uploaded_file(self):
+        from backend import api
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            upload_dir = Path(temp_dir) / "uploads"
+            file = UploadFile(file=io.BytesIO(b"input"), filename="note.txt")
+            database = Mock()
+            with (
+                patch.object(api, "UPLOAD_DIR", upload_dir),
+                patch.object(api, "parse_uploaded_file", side_effect=ValueError("bad")),
+                patch.object(api, "db", database),
+            ):
+                with self.assertRaises(ValueError):
+                    asyncio.run(api.upload_file(file))
+            self.assertEqual(list(upload_dir.iterdir()), [])
+            database.register_upload.assert_not_called()
+
+    def test_database_failure_removes_uploaded_file(self):
+        from backend import api
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            upload_dir = Path(temp_dir) / "uploads"
+            file = UploadFile(file=io.BytesIO(b"input"), filename="note.txt")
+            database = Mock()
+            database.register_upload.side_effect = RuntimeError("db unavailable")
+            with (
+                patch.object(api, "UPLOAD_DIR", upload_dir),
+                patch.object(api, "parse_uploaded_file", return_value={"text": "input"}),
+                patch.object(api, "db", database),
+            ):
+                with self.assertRaises(RuntimeError):
+                    asyncio.run(api.upload_file(file))
+            self.assertEqual(list(upload_dir.iterdir()), [])
+            database.register_upload.assert_called_once()
+
+
+class ChatContextWiringTest(unittest.TestCase):
+    def test_context_factory_receives_server_session_id_only(self):
+        from backend import api
+
+        make_context = Mock(return_value=object())
+        with patch.dict(sys.modules, {"backend.tool_gateway": SimpleNamespace(
+            make_builtin_run_context=make_context,
+        )}):
+            context = api._make_chat_context("session-1")
+        self.assertIs(context, make_context.return_value)
+        make_context.assert_called_once_with(run_id="session-1")
+
+
 class ChatGateTest(unittest.TestCase):
     def setUp(self):
         from backend import api
@@ -312,6 +431,7 @@ class ChatGateTest(unittest.TestCase):
         with (
             patch.object(self.api, "db", self.db),
             patch.object(self.api, "Agent", _BlockingAgent),
+            patch.object(self.api, "_make_chat_context", return_value=object()),
             patch.object(self.api, "get_runtime_config", return_value=self.config),
             patch.object(self.api, "build_system_prompt", return_value=""),
         ):
@@ -352,6 +472,7 @@ class ChatGateTest(unittest.TestCase):
     def test_generator_failure_releases_gate(self):
         with (
             patch.object(self.api, "db", self.db),
+            patch.object(self.api, "_make_chat_context", return_value=object()),
             patch.object(self.api, "get_runtime_config", return_value=self.config),
             patch.object(self.api, "build_system_prompt", return_value=""),
         ):
@@ -400,6 +521,7 @@ class ConflictResponseTest(unittest.TestCase):
                 before = database.get_settings()
                 application = FastAPI()
                 application.include_router(api.router)
+                application.dependency_overrides[api._require_local_session] = lambda: None
                 config = AppConfig("", "https://api.example/v1", "model", 5, 10.0)
                 with (
                     patch.object(services, "db", database),

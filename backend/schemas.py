@@ -22,6 +22,12 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, description="用户发送的消息")
 
 
+class BootstrapRequest(BaseModel):
+    """一次性本地认证凭据；不会保存于浏览器存储。"""
+
+    secret: str = Field(min_length=1)
+
+
 class SettingsRequest(BaseModel):
     """PUT /api/settings 请求体。"""
 
