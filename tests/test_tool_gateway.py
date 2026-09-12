@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -24,6 +26,7 @@ from backend.tool_gateway import (
     execute_tool,
     make_builtin_run_context,
     make_run_context,
+    snapshot_builtin_tools,
 )
 
 
@@ -40,6 +43,33 @@ def _spec(handler, *, effects=frozenset({"read_only"}), paths=(), approval="neve
 
 
 class GatewayTest(unittest.IsolatedAsyncioTestCase):
+    async def test_new_definition_is_not_implicitly_authorized(self):
+        from backend import skills
+
+        fake = {"type": "function", "function": {
+            "name": "new_no_path_tool",
+            "parameters": {"type": "object", "properties": {}},
+        }}
+        with (
+            patch.object(skills, "TOOL_DEFINITIONS", [*skills.TOOL_DEFINITIONS, fake]),
+            patch.dict(skills.TOOL_FUNCTIONS, {"new_no_path_tool": lambda: self.fail("handler reached")}),
+        ):
+            self.assertNotIn("new_no_path_tool", snapshot_builtin_tools())
+            outcome = await execute_tool(make_builtin_run_context("run"), "new_no_path_tool", "{}")
+        self.assertEqual(outcome.error_code, "tool_not_granted")
+
+    async def test_raw_limit_is_checked_before_secret_redaction(self):
+        marker = "SECRET-MARKER-987"
+        context = RunContext(
+            "run",
+            tool_specs={"demo": _spec(lambda: {"secret": marker * 20_000})},
+            grants=frozenset({"read_only"}),
+            secrets=(marker,),
+        )
+        outcome = await execute_tool(context, "demo", "{}")
+        self.assertEqual(outcome.error_code, "limit_exceeded")
+        self.assertNotIn(marker, outcome.model_text)
+
     async def test_legacy_skill_executor_cannot_reach_handler(self):
         from backend import skills, tools
 
@@ -236,6 +266,24 @@ def _request(method="POST", origin="http://127.0.0.1:8000", cookie=""):
 
 
 class AuthTest(unittest.TestCase):
+    def test_concurrent_bootstrap_consumes_secret_once(self):
+        secret = auth.issue_bootstrap_secret()
+        barrier = threading.Barrier(8)
+
+        def attempt(_index):
+            response = Response()
+            barrier.wait(timeout=5)
+            try:
+                auth.bootstrap(_request(), response, secret)
+            except HTTPException as exc:
+                return exc.status_code
+            return 200
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            statuses = list(executor.map(attempt, range(8)))
+        self.assertEqual(statuses.count(200), 1)
+        self.assertEqual(statuses.count(401), 7)
+
     def test_bootstrap_consumes_secret_and_sets_host_only_cookie(self):
         secret = auth.issue_bootstrap_secret()
         response = Response()

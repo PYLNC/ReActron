@@ -23,6 +23,17 @@ MAX_ARGUMENT_BYTES = 64 * 1024
 MAX_RAW_BYTES = 256 * 1024
 MAX_MODEL_CHARS = 8_000
 _SECRET_FIELDS = frozenset({"authorization", "cookie", "api_key", "token", "secret", "password"})
+_BUILTIN_POLICY = {
+    "get_current_time": ("read_only", (), "never"),
+    "list_dir": ("filesystem.read", ("/path",), "never"),
+    "excel_list_sheets": ("filesystem.read", ("/file_path",), "never"),
+    "excel_read_sheet": ("filesystem.read", ("/file_path",), "never"),
+    "excel_write_cell": ("filesystem.write", ("/file_path",), "always"),
+    "excel_create_file": ("filesystem.write", ("/file_path",), "always"),
+    "ppt_list_slides": ("filesystem.read", ("/file_path",), "never"),
+    "ppt_read_text": ("filesystem.read", ("/file_path",), "never"),
+    "ppt_create_file": ("filesystem.write", ("/file_path",), "always"),
+}
 
 
 @dataclass(frozen=True)
@@ -107,29 +118,24 @@ def _strict_schema(schema: dict) -> dict:
 
 
 def snapshot_builtin_tools() -> Mapping[str, ToolSpec]:
-    """从现有工具目录冻结规格；不授予任何 Run 权限。"""
+    """仅从明确审核过的内建工具名单冻结规格；不授予 Run 权限。"""
     from backend.skills import TOOL_DEFINITIONS, TOOL_FUNCTIONS
 
     specs = {}
     for definition in TOOL_DEFINITIONS:
         function = definition["function"]
         name = function["name"]
-        if name not in TOOL_FUNCTIONS or name.startswith("mcp_"):
+        if name not in _BUILTIN_POLICY or name not in TOOL_FUNCTIONS:
             continue
-        # 上传读取尚无 owner-scoped handler，不纳入可授权快照。
-        if name == "read_uploaded_file":
-            continue
-        path_field = "path" if name == "list_dir" else "file_path"
-        paths = (f"/{path_field}",) if name == "list_dir" or name.startswith(("excel_", "ppt_")) else ()
-        effectful = name in {"excel_write_cell", "excel_create_file", "ppt_create_file"}
+        effect, paths, approval = _BUILTIN_POLICY[name]
         specs[name] = ToolSpec(
             name=name,
             schema=_strict_schema(function["parameters"]),
             handler=TOOL_FUNCTIONS[name],
-            effects=frozenset({"filesystem.write" if effectful else "filesystem.read"}) if paths else frozenset({"read_only"}),
+            effects=frozenset({effect}),
             path_fields=paths,
-            idempotent=not effectful,
-            approval="always" if effectful else "never",
+            idempotent=approval == "never",
+            approval=approval,
             timeout_seconds=30.0,
         )
     return MappingProxyType(specs)
@@ -264,14 +270,18 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
             result = await asyncio.wait_for(spec.handler(**arguments), timeout=spec.timeout_seconds)
         else:
             result = await asyncio.wait_for(asyncio.to_thread(spec.handler, **arguments), timeout=spec.timeout_seconds)
-        safe_result = _redact(result, run_context.secrets)
-        raw_result = json.dumps(safe_result, ensure_ascii=False, default=str, allow_nan=False)
-        if len(raw_result.encode("utf-8")) > MAX_RAW_BYTES:
+        raw_result = json.dumps(result, ensure_ascii=False, default=str, allow_nan=False)
+        raw_bytes = len(raw_result.encode("utf-8"))
+        if raw_bytes > MAX_RAW_BYTES:
+            return _outcome(run_context, "error", effect, "limit_exceeded")
+        safe_result = _redact(json.loads(raw_result), run_context.secrets)
+        model_result = json.dumps(safe_result, ensure_ascii=False, allow_nan=False)
+        if len(model_result.encode("utf-8")) > MAX_RAW_BYTES:
             return _outcome(run_context, "error", effect, "limit_exceeded")
         logger.info("tool completed run=%s call=%s name=%s hash=%s bytes=%d ms=%d",
                     run_context.run_id, run_context.call_id, tool_name, action_hash,
-                    len(raw_result.encode("utf-8")), int((time.monotonic()-started)*1000))
-        return _outcome(run_context, "ok", effect, text=raw_result)
+                    raw_bytes, int((time.monotonic()-started)*1000))
+        return _outcome(run_context, "ok", effect, text=model_result)
     except asyncio.TimeoutError:
         unknown = effect == "effectful"
         return _outcome(run_context, "outcome_unknown" if unknown else "timeout", effect,

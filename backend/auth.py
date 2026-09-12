@@ -3,6 +3,7 @@
 import hmac
 import ipaddress
 import secrets
+import threading
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -13,6 +14,7 @@ COOKIE_NAME = "reactron_host_session"
 _bootstrap_secret: str | None = None
 _session_token: str | None = None
 _session_origin: str | None = None
+_auth_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -23,10 +25,11 @@ class Principal:
 def issue_bootstrap_secret() -> str:
     """启动时生成一次性 secret；调用者仅在本地终端展示。"""
     global _bootstrap_secret, _session_token, _session_origin
-    _bootstrap_secret = secrets.token_urlsafe(32)
-    _session_token = None
-    _session_origin = None
-    return _bootstrap_secret
+    with _auth_lock:
+        _bootstrap_secret = secrets.token_urlsafe(32)
+        _session_token = None
+        _session_origin = None
+        return _bootstrap_secret
 
 
 def _request_origin(request: Request, *, require_origin: bool) -> str:
@@ -51,19 +54,20 @@ def bootstrap(request: Request, response: Response, secret: str) -> None:
     """一次性兑换本地主机 cookie；无有效 secret 时不触及 session。"""
     global _bootstrap_secret, _session_token, _session_origin
     origin = _request_origin(request, require_origin=True)
-    if not _bootstrap_secret or not hmac.compare_digest(secret, _bootstrap_secret):
-        raise HTTPException(401, "unauthenticated")
-    _bootstrap_secret = None
-    _session_token = secrets.token_urlsafe(32)
-    _session_origin = origin
-    response.set_cookie(
-        COOKIE_NAME,
-        _session_token,
-        path="/",
-        httponly=True,
-        samesite="strict",
-        secure=request.url.scheme == "https",
-    )
+    with _auth_lock:
+        if not _bootstrap_secret or not hmac.compare_digest(secret, _bootstrap_secret):
+            raise HTTPException(401, "unauthenticated")
+        _bootstrap_secret = None
+        _session_token = secrets.token_urlsafe(32)
+        _session_origin = origin
+        response.set_cookie(
+            COOKIE_NAME,
+            _session_token,
+            path="/",
+            httponly=True,
+            samesite="strict",
+            secure=request.url.scheme == "https",
+        )
 
 
 def require_host_session(request: Request) -> Principal:
@@ -73,8 +77,9 @@ def require_host_session(request: Request) -> Principal:
         require_origin=request.method.upper() not in {"GET", "HEAD", "OPTIONS"},
     )
     token = request.cookies.get(COOKIE_NAME, "")
-    if not _session_token or not token or not hmac.compare_digest(token, _session_token):
-        raise HTTPException(401, "unauthenticated")
-    if origin != _session_origin:
-        raise HTTPException(403, "forbidden")
+    with _auth_lock:
+        if not _session_token or not token or not hmac.compare_digest(token, _session_token):
+            raise HTTPException(401, "unauthenticated")
+        if origin != _session_origin:
+            raise HTTPException(403, "forbidden")
     return Principal()
