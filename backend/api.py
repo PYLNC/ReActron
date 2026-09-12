@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from backend.agent import Agent
@@ -17,6 +17,7 @@ from backend.file_parser import parse_uploaded_file
 from backend.harness import get_harness, run_self_tests
 from backend.mcp.manager import get_manager
 from backend.schemas import (
+    AgentListResponse,
     ChatRequest,
     BootstrapRequest,
     ConfigResponse,
@@ -24,6 +25,8 @@ from backend.schemas import (
     MCPServerCreateRequest,
     ProjectCreateRequest,
     ProjectRenameRequest,
+    RunCreateRequest,
+    RunResponse,
     SessionCreateRequest,
     SessionListResponse,
     SessionProjectRequest,
@@ -31,6 +34,9 @@ from backend.schemas import (
     SessionSummary,
     SettingsRequest,
     SettingsResponse,
+    TaskCreateRequest,
+    TaskListResponse,
+    TaskResponse,
     ToolsResponse,
 )
 from backend.services import (
@@ -102,6 +108,54 @@ def _error_response(status_code: int, code: str, message: str, details=None):
     )
 
 
+def _repository_error(exc: Exception):
+    """仅映射仓库冻结的公开错误码；未知错误交给全局 500。"""
+    code = getattr(exc, "code", None)
+    if code == "not_found":
+        return _error_response(404, "not_found", "资源不存在")
+    if code == "idempotency_key_reused":
+        return _error_response(409, code, "幂等键已用于不同请求")
+    if code == "run_already_active":
+        run_id = getattr(exc, "existing_run_id", None)
+        return _error_response(409, code, "该 Agent 已有活动 Run", {"run_id": run_id} if run_id else {})
+    if code == "invalid_run_transition":
+        return _error_response(409, code, "当前 Run 状态不允许此操作")
+    if isinstance(exc, ValueError):
+        return _error_response(422, "invalid_request", "请求参数无效")
+    raise exc
+
+
+def _task_response(row: dict) -> dict:
+    return {
+        "task_id": row["id"],
+        "agent_id": row["session_id"],
+        "goal": row["goal"],
+        "acceptance": json.loads(row["acceptance_json"]),
+        "context": json.loads(row["context_json"]),
+        "status": row["status"],
+        "latest_run_id": db.get_latest_run_id(row["id"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "finished_at": row["finished_at"],
+    }
+
+
+def _run_response(row: dict) -> dict:
+    return {
+        "run_id": row["id"],
+        "task_id": row["task_id"],
+        "agent_id": row["session_id"],
+        "attempt": row["attempt"],
+        "status": row["status"],
+        "wait_reason": row["wait_reason"],
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "last_event_id": db.get_last_event_id(row["id"]),
+        "allowed_actions": [],  # Wave 4 才开放 control/Runner。
+    }
+
+
 def _sse(event: dict) -> str:
     """把事件包装成 SSE data 行。"""
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -155,6 +209,83 @@ async def skills():
     info = get_skills_info()
     logger.info("技能列表输出：count=%d", len(SKILLS))
     return {"count": len(SKILLS), "skills": info}
+
+
+@router.post("/tasks", status_code=201, response_model=TaskResponse)
+async def create_task(payload: TaskCreateRequest):
+    try:
+        row = await asyncio.to_thread(
+            db.create_task, payload.agent_id, payload.goal, payload.acceptance, payload.context
+        )
+    except Exception as exc:
+        return _repository_error(exc)
+    return await asyncio.to_thread(_task_response, row)
+
+
+@router.get("/tasks", response_model=TaskListResponse)
+async def list_tasks(
+    request: Request,
+    agent_id: str | None = None,
+    status: str | None = Query(None, pattern="^(open|completed|failed|cancelled)$"),
+    limit: int = Query(50, ge=1, le=100),
+):
+    if "session_id" in request.query_params:
+        return _error_response(422, "invalid_request", "请使用 agent_id")
+    try:
+        rows = await asyncio.to_thread(db.list_tasks, agent_id, status, limit)
+    except Exception as exc:
+        return _repository_error(exc)
+    return {"tasks": await asyncio.to_thread(lambda: [_task_response(row) for row in rows])}
+
+
+@router.get("/tasks/{task_id}", response_model=TaskResponse)
+async def get_task(task_id: str):
+    row = await asyncio.to_thread(db.get_task, task_id)
+    if not row:
+        return _error_response(404, "not_found", "资源不存在")
+    return await asyncio.to_thread(_task_response, row)
+
+
+@router.post("/tasks/{task_id}/runs", status_code=202, response_model=RunResponse)
+async def create_run(
+    task_id: str,
+    response: Response,
+    payload: RunCreateRequest = Body(default=RunCreateRequest()),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
+    key = (idempotency_key or "").strip()
+    if not key:
+        return _error_response(400, "idempotency_key_required", "缺少 Idempotency-Key")
+    try:
+        row, _created = await asyncio.to_thread(db.create_run, task_id, key)
+    except Exception as exc:
+        return _repository_error(exc)
+    snapshot = await asyncio.to_thread(_run_response, row)
+    response.headers["Location"] = f"/api/runs/{row['id']}"
+    return snapshot
+
+
+@router.get("/runs/{run_id}", response_model=RunResponse)
+async def get_run(run_id: str):
+    row = await asyncio.to_thread(db.get_run, run_id)
+    if not row:
+        return _error_response(404, "not_found", "资源不存在")
+    return await asyncio.to_thread(_run_response, row)
+
+
+@router.get("/agents", response_model=AgentListResponse)
+async def list_agents():
+    sessions = await asyncio.to_thread(db.list_sessions)
+    return {"agents": [
+        {
+            "agent_id": row["id"],
+            "title": row["title"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "project_id": row["project_id"],
+        }
+        for row in sessions
+    ]}
 
 
 @router.post("/upload")

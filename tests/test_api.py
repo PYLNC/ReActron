@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from fastapi import HTTPException, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -368,6 +369,143 @@ class Wave3SchemaTest(unittest.TestCase):
         self.assertEqual(RunCreateRequest().model_dump(), {})
         with self.assertRaises(ValidationError):
             RunCreateRequest(agent_id="agent-1")
+
+
+class Wave3RouteTest(unittest.TestCase):
+    def setUp(self):
+        from fastapi import FastAPI
+
+        from backend import api
+        from backend.app import http_error_handler, validation_error_handler
+
+        self.api = api
+        self.database = Mock()
+        self.task = {
+            "id": "task-1", "session_id": "agent-1", "goal": "goal",
+            "acceptance_json": "[]", "context_json": "{}", "status": "open",
+            "created_at": "2026-09-13T00:00:00Z", "updated_at": "2026-09-13T00:00:00Z",
+            "finished_at": None,
+        }
+        self.run = {
+            "id": "run-1", "task_id": "task-1", "session_id": "agent-1",
+            "attempt": 1, "status": "queued", "wait_reason": None,
+            "created_at": "2026-09-13T00:01:00Z", "started_at": None,
+            "finished_at": None, "idempotency_key": "private-key", "lease_owner": "private",
+        }
+        self.database.create_task.return_value = self.task
+        self.database.get_task.return_value = self.task
+        self.database.list_tasks.return_value = [self.task]
+        self.database.get_latest_run_id.return_value = None
+        self.database.create_run.return_value = (self.run, True)
+        self.database.get_run.return_value = self.run
+        self.database.get_last_event_id.return_value = 1
+        self.database.list_sessions.return_value = [{
+            "id": "agent-1", "title": "Agent", "project_id": "project-1",
+            "created_at": "2026-09-13T00:00:00Z", "updated_at": "2026-09-13T00:00:00Z",
+        }]
+        application = FastAPI()
+        application.include_router(api.router)
+        application.dependency_overrides[api._require_local_session] = lambda: None
+        application.add_exception_handler(StarletteHTTPException, http_error_handler)
+        application.add_exception_handler(RequestValidationError, validation_error_handler)
+        self.client = TestClient(application)
+
+    def test_task_create_get_list_and_agent_alias(self):
+        with patch.object(self.api, "db", self.database):
+            created = self.client.post("/api/tasks", json={"agent_id": "agent-1", "goal": "goal"})
+            fetched = self.client.get("/api/tasks/task-1")
+            listed = self.client.get("/api/tasks?agent_id=agent-1&status=open&limit=10")
+            agents = self.client.get("/api/agents")
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.json()["task_id"], "task-1")
+        self.assertEqual(created.json()["agent_id"], "agent-1")
+        self.assertNotIn("session_id", created.text)
+        self.assertEqual(fetched.status_code, 200)
+        self.assertEqual(listed.json()["tasks"][0]["task_id"], "task-1")
+        self.database.list_tasks.assert_called_once_with("agent-1", "open", 10)
+        self.assertEqual(agents.json()["agents"][0]["agent_id"], "agent-1")
+        self.assertNotIn("session_id", agents.text)
+
+    def test_run_created_and_replayed_with_location(self):
+        with patch.object(self.api, "db", self.database):
+            first = self.client.post(
+                "/api/tasks/task-1/runs", headers={"Idempotency-Key": "key-1"}
+            )
+            self.database.create_run.return_value = (self.run, False)
+            replay = self.client.post(
+                "/api/tasks/task-1/runs", headers={"Idempotency-Key": "key-1"}, json={}
+            )
+            fetched = self.client.get("/api/runs/run-1")
+        for response in (first, replay):
+            self.assertEqual(response.status_code, 202)
+            self.assertEqual(response.headers["location"], "/api/runs/run-1")
+            self.assertEqual(response.json()["run_id"], "run-1")
+            self.assertEqual(response.json()["last_event_id"], 1)
+            self.assertEqual(response.json()["allowed_actions"], [])
+            self.assertEqual(response.json()["status"], "queued")
+            self.assertNotIn("idempotency_key", response.text)
+            self.assertNotIn("lease_owner", response.text)
+        self.assertEqual(fetched.status_code, 200)
+        self.assertEqual(self.database.create_run.call_count, 2)
+        self.database.create_run.assert_called_with("task-1", "key-1")
+
+    def test_missing_key_extra_identity_invalid_limit_and_missing_resources(self):
+        with patch.object(self.api, "db", self.database):
+            missing_key = self.client.post("/api/tasks/task-1/runs", json={})
+            extra_run = self.client.post(
+                "/api/tasks/task-1/runs", headers={"Idempotency-Key": "key-1"},
+                json={"session_id": "agent-1"},
+            )
+            extra = self.client.post("/api/tasks", json={
+                "agent_id": "agent-1", "session_id": "agent-1", "goal": "goal",
+            })
+            invalid_limit = self.client.get("/api/tasks?limit=101")
+            dual_query = self.client.get("/api/tasks?agent_id=agent-1&session_id=agent-1")
+            self.database.get_task.return_value = None
+            self.database.get_run.return_value = None
+            missing_task = self.client.get("/api/tasks/unknown")
+            missing_run = self.client.get("/api/runs/unknown")
+        self.assertEqual((missing_key.status_code, missing_key.json()["code"]),
+                         (400, "idempotency_key_required"))
+        for response in (extra, extra_run, invalid_limit, dual_query):
+            self.assertEqual(response.status_code, 422)
+            self.assertEqual(set(response.json()), {"code", "message", "details", "trace_id"})
+        for response in (missing_task, missing_run):
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.json()["code"], "not_found")
+
+    def test_repository_conflicts_map_to_stable_409(self):
+        class RepoError(ValueError):
+            def __init__(self, code):
+                self.code = code
+                self.existing_run_id = "run-1"
+
+        with patch.object(self.api, "db", self.database):
+            outcomes = []
+            for code in ("idempotency_key_reused", "run_already_active"):
+                self.database.create_run.side_effect = RepoError(code)
+                outcomes.append(self.client.post(
+                    "/api/tasks/task-1/runs", headers={"Idempotency-Key": "key-2"}, json={}
+                ))
+        self.assertEqual([response.status_code for response in outcomes], [409, 409])
+        self.assertEqual([response.json()["code"] for response in outcomes],
+                         ["idempotency_key_reused", "run_already_active"])
+        self.assertEqual(outcomes[1].json()["details"], {"run_id": "run-1"})
+        self.assertTrue(all(set(response.json()) == {"code", "message", "details", "trace_id"}
+                            for response in outcomes))
+
+    def test_repository_hidden_resource_maps_to_404(self):
+        class MissingResource(ValueError):
+            code = "not_found"
+
+        self.database.create_task.side_effect = MissingResource()
+        with patch.object(self.api, "db", self.database):
+            response = self.client.post(
+                "/api/tasks", json={"agent_id": "other-owner", "goal": "goal"}
+            )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["code"], "not_found")
+        self.assertEqual(set(response.json()), {"code", "message", "details", "trace_id"})
 
 
 class UploadCleanupTest(unittest.TestCase):

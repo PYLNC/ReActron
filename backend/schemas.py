@@ -62,6 +62,10 @@ class TaskResponse(BaseModel):
     finished_at: Optional[str]
 
 
+class TaskListResponse(BaseModel):
+    tasks: List[TaskResponse]
+
+
 class RunResponse(BaseModel):
     run_id: str
     task_id: str
@@ -74,6 +78,18 @@ class RunResponse(BaseModel):
     finished_at: Optional[str]
     last_event_id: int
     allowed_actions: List[str]
+
+
+class AgentSummary(BaseModel):
+    agent_id: str
+    title: str
+    created_at: str
+    updated_at: str
+    project_id: Optional[str]
+
+
+class AgentListResponse(BaseModel):
+    agents: List[AgentSummary]
 
 
 class SettingsRequest(BaseModel):
