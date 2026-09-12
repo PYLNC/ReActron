@@ -44,6 +44,113 @@ def _spec(handler, *, effects=frozenset({"read_only"}), paths=(), approval="neve
 
 
 class GatewayTest(unittest.IsolatedAsyncioTestCase):
+    async def test_effectful_thread_timeout_is_unknown_and_never_retried(self):
+        release = threading.Event()
+        started = threading.Event()
+        invoked = 0
+
+        def handler():
+            nonlocal invoked
+            invoked += 1
+            started.set()
+            release.wait(timeout=1)
+            return {"secret": "UNKNOWN-RESULT-MARKER"}
+
+        spec = replace(_spec(handler, effects=frozenset({"filesystem.write"})),
+                       idempotent=False, timeout_seconds=0.01)
+        context = RunContext("run", call_id="call", tool_specs={"demo": spec},
+                             grants=frozenset({"filesystem.write"}))
+        rejected = await execute_tool(replace(context, grants=frozenset()), "demo", "{}")
+        self.assertEqual(rejected.error_code, "tool_not_granted")
+        self.assertEqual(invoked, 0)
+        try:
+            pending = asyncio.create_task(execute_tool(context, "demo", "{}"))
+            self.assertTrue(await asyncio.to_thread(started.wait, 1))
+            outcome = await pending
+            self.assertEqual((outcome.status, outcome.effect, outcome.quiesced),
+                             ("outcome_unknown", "effectful", False))
+            self.assertEqual(outcome.error_code, "timeout_unknown_effect")
+            self.assertEqual(invoked, 1)
+            self.assertIsNone(outcome.result_ref)
+            self.assertNotIn("UNKNOWN-RESULT-MARKER", outcome.model_text)
+        finally:
+            release.set()
+        await asyncio.sleep(0.02)
+        self.assertEqual(invoked, 1)
+
+    async def test_read_only_async_timeout_is_confirmed_quiesced(self):
+        cancelled = asyncio.Event()
+
+        async def handler():
+            try:
+                await asyncio.sleep(1)
+            finally:
+                cancelled.set()
+
+        spec = replace(_spec(handler), timeout_seconds=0.01)
+        context = RunContext("run", tool_specs={"demo": spec}, grants=frozenset({"read_only"}))
+        outcome = await execute_tool(context, "demo", "{}")
+        self.assertEqual((outcome.status, outcome.effect, outcome.quiesced),
+                         ("timeout", "read_only", True))
+        self.assertTrue(cancelled.is_set())
+
+    async def test_effectful_async_timeout_remains_unknown(self):
+        invoked = 0
+
+        async def handler():
+            nonlocal invoked
+            invoked += 1
+            await asyncio.sleep(1)
+
+        spec = replace(_spec(handler, effects=frozenset({"filesystem.write"})),
+                       idempotent=False, timeout_seconds=0.01)
+        context = RunContext("run", tool_specs={"demo": spec}, grants=frozenset({"filesystem.write"}))
+        outcome = await execute_tool(context, "demo", "{}")
+        self.assertEqual((outcome.status, outcome.effect, outcome.quiesced),
+                         ("outcome_unknown", "effectful", False))
+        self.assertEqual(invoked, 1)
+
+    async def test_idempotent_async_timeout_is_confirmed_quiesced(self):
+        async def handler():
+            await asyncio.sleep(1)
+
+        spec = replace(_spec(handler, effects=frozenset({"filesystem.write"})),
+                       timeout_seconds=0.01)
+        context = RunContext("run", tool_specs={"demo": spec}, grants=frozenset({"filesystem.write"}))
+        outcome = await execute_tool(context, "demo", "{}")
+        self.assertEqual((outcome.status, outcome.effect, outcome.quiesced),
+                         ("timeout", "idempotent", True))
+
+    async def test_idempotent_thread_timeout_is_not_claimed_quiesced(self):
+        release = threading.Event()
+        started = threading.Event()
+
+        def handler():
+            started.set()
+            release.wait(timeout=1)
+
+        spec = replace(_spec(handler, effects=frozenset({"filesystem.write"})), timeout_seconds=0.01)
+        context = RunContext("run", tool_specs={"demo": spec}, grants=frozenset({"filesystem.write"}))
+        try:
+            pending = asyncio.create_task(execute_tool(context, "demo", "{}"))
+            self.assertTrue(await asyncio.to_thread(started.wait, 1))
+            outcome = await pending
+            self.assertEqual((outcome.status, outcome.effect, outcome.quiesced),
+                             ("timeout", "idempotent", False))
+        finally:
+            release.set()
+
+    async def test_result_ref_is_unavailable_for_any_owner(self):
+        spec = _spec(lambda: "a" * 9000)
+        for actor, run in (("owner-a", "run-a"), ("owner-b", "run-b")):
+            with self.subTest(actor=actor):
+                context = RunContext(run, actor_id=actor, tool_specs={"demo": spec},
+                                     grants=frozenset({"read_only"}))
+                outcome = await execute_tool(context, "demo", "{}")
+                self.assertEqual(outcome.status, "ok")
+                self.assertLessEqual(len(outcome.model_text), 8000)
+                self.assertIsNone(outcome.result_ref)
+
     async def test_plain_text_raw_utf8_boundary(self):
         exact_multibyte = "界" * ((MAX_RAW_BYTES - 1) // 3) + "x"
         self.assertEqual(len(exact_multibyte.encode("utf-8")), MAX_RAW_BYTES)

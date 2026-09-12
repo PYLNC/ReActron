@@ -265,9 +265,11 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
     if spec.approval != "never":
         return _outcome(run_context, "error", effect, "approval_unavailable")
 
+    async_task = None
     try:
         if inspect.iscoroutinefunction(spec.handler):
-            result = await asyncio.wait_for(spec.handler(**arguments), timeout=spec.timeout_seconds)
+            async_task = asyncio.create_task(spec.handler(**arguments))
+            result = await asyncio.wait_for(async_task, timeout=spec.timeout_seconds)
         else:
             result = await asyncio.wait_for(asyncio.to_thread(spec.handler, **arguments), timeout=spec.timeout_seconds)
         raw_result = result if isinstance(result, str) else json.dumps(
@@ -283,9 +285,11 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
                     raw_bytes, int((time.monotonic()-started)*1000))
         return _outcome(run_context, "ok", effect, text=model_result)
     except asyncio.TimeoutError:
+        # Coroutine cancellation cannot prove an external side effect did not occur.
         unknown = effect == "effectful"
         return _outcome(run_context, "outcome_unknown" if unknown else "timeout", effect,
-                        "timeout_unknown_effect" if unknown else "tool_timeout", quiesced=False)
+                        "timeout_unknown_effect" if unknown else "tool_timeout",
+                        quiesced=bool(async_task and async_task.done()) and not unknown)
     except Exception:
         logger.warning("tool failed run=%s call=%s name=%s hash=%s code=tool_failed",
                        run_context.run_id, run_context.call_id, tool_name, action_hash)
