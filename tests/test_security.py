@@ -1,5 +1,6 @@
 """Fernet 与 Provider credential origin 的阻断测试。"""
 
+import hashlib
 import os
 import stat
 import subprocess
@@ -246,6 +247,71 @@ class RuntimeCredentialBindingTest(unittest.TestCase):
 
         decrypt.assert_called_once_with("ciphertext")
         self.assertEqual(result.api_key, "database-key")
+
+
+class FrozenProviderTest(unittest.TestCase):
+    config = AppConfig(
+        api_key="LIVE-PROVIDER-KEY-MARKER",
+        base_url="https://api.example/v1",
+        model="model",
+        max_rounds=5,
+        tool_timeout=10.0,
+    )
+
+    def _snapshot(self, source):
+        return {"v": 1, "base_url": self.config.base_url, "model": self.config.model,
+                "credential_fingerprint": hashlib.sha256(source.encode()).hexdigest()}
+
+    def test_environment_snapshot_requires_current_url_model_and_key(self):
+        snapshot = self._snapshot(self.config.api_key)
+        with patch.object(security, "load_config", return_value=self.config):
+            self.assertTrue(security.verify_frozen_provider(
+                snapshot, settings=None, runtime_config=self.config))
+            for changed in (
+                AppConfig(self.config.api_key, "https://other.example/v1", "model", 5, 10.0),
+                AppConfig(self.config.api_key, "https://api.example/v2", "model", 5, 10.0),
+                AppConfig(self.config.api_key, self.config.base_url, "other-model", 5, 10.0),
+                AppConfig("other-key", self.config.base_url, "model", 5, 10.0),
+            ):
+                with self.subTest(changed=changed):
+                    self.assertFalse(security.verify_frozen_provider(
+                        snapshot, settings=None, runtime_config=changed))
+
+    def test_bound_database_key_must_match_current_plaintext_and_origin(self):
+        settings = {"api_key_encrypted": "encrypted-key", "base_url": "https://api.example/v1",
+                    "credential_base_url": "https://API.example:443/old-path"}
+        runtime = AppConfig("database-key", self.config.base_url, "model", 5, 10.0)
+        snapshot = self._snapshot("encrypted-key")
+        with (patch.object(security, "load_config", return_value=self.config),
+              patch.object(security, "decrypt_text", return_value="database-key")):
+            self.assertTrue(security.verify_frozen_provider(
+                snapshot, settings=settings, runtime_config=runtime))
+            self.assertFalse(security.verify_frozen_provider(
+                snapshot, settings={**settings, "credential_base_url": "https://evil.example"},
+                runtime_config=runtime))
+            self.assertFalse(security.verify_frozen_provider(
+                snapshot, settings={**settings, "api_key_encrypted": "changed-ciphertext"},
+                runtime_config=runtime))
+            self.assertFalse(security.verify_frozen_provider(
+                snapshot, settings=settings,
+                runtime_config=AppConfig("other-key", self.config.base_url, "model", 5, 10.0)))
+            self.assertFalse(security.verify_frozen_provider(
+                snapshot, settings={**settings, "credential_base_url": None},
+                runtime_config=runtime))
+
+    def test_invalid_snapshot_or_decrypt_failure_fails_without_marker_log(self):
+        snapshot = self._snapshot("encrypted-key")
+        settings = {"api_key_encrypted": "encrypted-key", "base_url": self.config.base_url,
+                    "credential_base_url": self.config.base_url}
+        runtime = AppConfig("database-key", self.config.base_url, "model", 5, 10.0)
+        with (patch.object(security, "load_config", return_value=self.config),
+              patch.object(security, "decrypt_text", side_effect=ValueError("SECRET-ERROR-MARKER")),
+              self.assertNoLogs("agent.security", level="INFO")):
+            self.assertFalse(security.verify_frozen_provider(
+                snapshot, settings=settings, runtime_config=runtime))
+            self.assertFalse(security.verify_frozen_provider(
+                {**snapshot, "credential_fingerprint": "wrong"},
+                settings=settings, runtime_config=runtime))
 
 
 class SettingsUpdateTest(unittest.TestCase):

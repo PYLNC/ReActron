@@ -1,5 +1,7 @@
 """API Key 加密与解密：使用 Fernet 对称加密。"""
 
+import hashlib
+import hmac
 import logging
 import os
 import sys
@@ -9,7 +11,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from backend.config import BASE_DIR
+from backend.config import BASE_DIR, AppConfig, load_config
 
 
 SECRET_FILE = BASE_DIR / ".secret_key"
@@ -109,3 +111,49 @@ def decrypt_text(token: str) -> str:
         return plain_text.decode("utf-8")
     except InvalidToken as exc:
         raise ValueError("API Key 解密失败，可能加密密钥已变化") from exc
+
+
+def verify_frozen_provider(snapshot: dict, *, settings: dict | None,
+                           runtime_config: AppConfig) -> bool:
+    """每次模型 I/O 前核对 Run 冻结配置与当前可信凭据，不返回密钥。"""
+    from backend.services import credential_origin, normalize_base_url
+
+    try:
+        if not isinstance(snapshot, dict) or type(snapshot.get("v")) is not int or snapshot["v"] != 1:
+            return False
+        settings = settings or {}
+        environment = load_config()
+        frozen_url = normalize_base_url(snapshot["base_url"])
+        current_url = normalize_base_url(runtime_config.base_url)
+        selected_url = normalize_base_url(settings.get("base_url") or environment.base_url)
+        if frozen_url != current_url or current_url != selected_url:
+            return False
+        if snapshot.get("model") != runtime_config.model or runtime_config.model != (
+            settings.get("model") or environment.model
+        ):
+            return False
+        current_origin = credential_origin(current_url)
+        if snapshot.get("credential_origin") not in (None, list(current_origin), current_origin):
+            return False
+        key = runtime_config.api_key
+        if not isinstance(key, str) or not key:
+            return False
+        encrypted = settings.get("api_key_encrypted")
+        if encrypted:
+            bound_url = settings.get("credential_base_url")
+            if not bound_url or credential_origin(bound_url) != current_origin:
+                return False
+            if not hmac.compare_digest(decrypt_text(encrypted), key):
+                return False
+            fingerprint_source = encrypted
+        else:
+            if credential_origin(environment.base_url) != current_origin:
+                return False
+            if not hmac.compare_digest(environment.api_key, key):
+                return False
+            fingerprint_source = key
+        expected = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+        fingerprint = snapshot.get("credential_fingerprint")
+        return isinstance(fingerprint, str) and hmac.compare_digest(fingerprint, expected)
+    except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, UnicodeError):
+        return False
