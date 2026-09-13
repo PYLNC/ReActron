@@ -573,8 +573,9 @@ async def chat(payload: ChatRequest):
 
     session_id = (payload.session_id or "").strip() or None
     if session_id:
-        if not db.get_session(session_id):
-            raise HTTPException(status_code=404, detail="会话不存在")
+        session = db.get_session(session_id)
+        if not session or session.get("archived_at"):
+            return _error_response(404, "not_found", "资源不存在")
     else:
         if not payload.project_id:
             return _error_response(400, "invalid_request", "请先创建并选择项目")
@@ -601,8 +602,10 @@ async def chat(payload: ChatRequest):
             db.rename_session(session_id, _make_session_title(message))
         history = db.get_messages(session_id)
         cfg = get_runtime_config()
-    except Exception:
+    except Exception as exc:
         _release_session(session_id)
+        if getattr(exc, "code", None) == "not_found":
+            return _error_response(404, "not_found", "资源不存在")
         raise
     logger.info("聊天请求：session_id=%s，历史消息数=%d", session_id, len(history))
     logger.info(

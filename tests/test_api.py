@@ -24,19 +24,29 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 ROOT = Path(__file__).resolve().parent.parent
 
 
+class _ArchivedResource(ValueError):
+    code = "not_found"
+
+
 class _FakeChatDatabase:
     def __init__(self):
         self.messages = []
         self.get_messages_calls = 0
+        self.archived_at = None
+        self.archive_on_write = False
         self._lock = threading.Lock()
 
     def get_session(self, session_id):
         if session_id != "session-1":
             return None
-        return {"id": session_id, "title": "existing"}
+        return {"id": session_id, "title": "existing", "archived_at": self.archived_at}
 
     def add_message(self, session_id, role, content, *unused):
         with self._lock:
+            if self.archive_on_write:
+                self.archived_at = "2026-09-13T00:00:00Z"
+            if self.archived_at:
+                raise _ArchivedResource()
             self.messages.append((session_id, role, content))
 
     def get_messages(self, session_id):
@@ -128,7 +138,11 @@ class AppLifespanTest(unittest.TestCase):
         from backend import db as db_module
 
         class FakeDatabase:
+            initialized = False
             closed = False
+
+            def initialize(self):
+                self.initialized = True
 
             def close(self):
                 self.closed = True
@@ -137,8 +151,12 @@ class AppLifespanTest(unittest.TestCase):
             refreshed = False
 
             async def refresh_registry(self):
+                self.assert_database_ready()
                 self.refreshed = True
                 return {"server_count": 0, "tool_count": 0, "errors": []}
+
+            def assert_database_ready(self):
+                assert fake_db.initialized
 
         fake_db = FakeDatabase()
         fake_manager = FakeManager()
@@ -177,6 +195,7 @@ class AppLifespanTest(unittest.TestCase):
         self.assertNotIn(marker, "\n".join(logs.output))
         validate_secret_key.assert_called_once_with()
         self.assertTrue(fake_manager.refreshed)
+        self.assertTrue(fake_db.initialized)
         self.assertTrue(fake_db.closed)
 
     def test_invalid_secret_fails_before_database_or_mcp_import(self):
@@ -679,6 +698,39 @@ class ChatGateTest(unittest.TestCase):
     def tearDown(self):
         with self.api._active_session_lock:
             self.api._active_session_ids.clear()
+
+    def test_archived_session_returns_404_without_message(self):
+        self.db.archived_at = "2026-09-13T00:00:00Z"
+        with (
+            patch.object(self.api, "db", self.db),
+            patch.object(self.api, "_make_chat_context") as make_context,
+        ):
+            response = asyncio.run(self.api.chat(
+                self.api.ChatRequest(session_id="session-1", message="blocked")
+            ))
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(json.loads(response.body)["code"], "not_found")
+        self.assertEqual(set(json.loads(response.body)),
+                         {"code", "message", "details", "trace_id"})
+        self.assertEqual(self.db.messages, [])
+        self.assertEqual(self.db.get_messages_calls, 0)
+        make_context.assert_not_called()
+
+    def test_archive_race_is_404_and_releases_gate(self):
+        self.db.archive_on_write = True
+        with (
+            patch.object(self.api, "db", self.db),
+            patch.object(self.api, "_make_chat_context", return_value=object()),
+        ):
+            response = asyncio.run(self.api.chat(
+                self.api.ChatRequest(session_id="session-1", message="blocked")
+            ))
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(json.loads(response.body)["code"], "not_found")
+        self.assertEqual(self.db.messages, [])
+        self.assertEqual(self.db.get_messages_calls, 0)
+        with self.api._active_session_lock:
+            self.assertNotIn("session-1", self.api._active_session_ids)
 
     def test_concurrent_request_is_rejected_before_message_write(self):
         _BlockingAgent.started = threading.Event()

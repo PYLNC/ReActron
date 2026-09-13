@@ -76,6 +76,8 @@ async def lifespan(application: FastAPI):
     from backend import api as api_module
     from backend.db import DB_PATH, db
 
+    db.initialize()
+
     if not _api_router_loaded:
         application.include_router(api_module.public_router)
         application.include_router(api_module.router)
