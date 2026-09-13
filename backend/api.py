@@ -99,8 +99,6 @@ def _repository_error(exc: Exception):
         return _error_response(409, code, "该 Agent 已有活动 Run", {"run_id": run_id} if run_id else {})
     if code == "invalid_run_transition":
         return _error_response(409, code, "当前 Run 状态不允许此操作")
-    if code == "runner_unavailable":
-        return _error_response(503, code, "Runner 暂不可用")
     if isinstance(exc, ValueError):
         return _error_response(422, "invalid_request", "请求参数无效")
     raise exc

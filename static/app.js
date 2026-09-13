@@ -13,6 +13,13 @@ const toolList = document.getElementById("toolList");
 const modelLabel = document.getElementById("modelLabel");
 const maxRoundsValue = document.getElementById("maxRoundsValue");
 const sessionList = document.getElementById("sessionList");
+const taskList = document.getElementById("taskList");
+const runBar = document.getElementById("runBar");
+const runStatus = document.getElementById("runStatus");
+const runActions = document.getElementById("runActions");
+const runSnapshot = document.getElementById("runSnapshot");
+const approvalList = document.getElementById("approvalList");
+const eventList = document.getElementById("eventList");
 const newSessionBtn = document.getElementById("newSessionBtn");
 const newProjectBtn = document.getElementById("newProjectBtn");
 const projectAssignSelect = document.getElementById("projectAssignSelect");
@@ -46,9 +53,17 @@ const ACTIVE_SESSION_KEY = "countboter_active_session";
 let sessions = [];
 let projects = [];
 let activeSessionId = null;
+let activeTaskId = null;
+let activeRunId = null;
+let eventSource = null;
+let lastEventIdByRun = {};
+let assistantDraft = "";
+let assistantMessage = null;
+let runAllowedActions = [];
+let restoredAssistantTexts = new Set();
+let restoreThroughEventId = 0;
 let currentSessionHasMessages = false;
 let streaming = false;
-let controller = null;
 let typingEl = null;
 let activeToolCard = null;
 
@@ -127,7 +142,8 @@ function setStatus(mode) {
 
 
 function setSendButton() {
-  sendBtn.textContent = streaming ? "停止" : "发送";
+  sendBtn.textContent = streaming ? (runAllowedActions.includes("cancel") ? "取消 Run" : "运行中") : "发送";
+  sendBtn.disabled = streaming && !runAllowedActions.includes("cancel");
 }
 
 
@@ -596,8 +612,10 @@ function renderSessions() {
       const li = document.createElement("li");
       li.className = "session-item" + (session.id === activeSessionId ? " active" : "");
 
-      const title = document.createElement("span");
+      const title = document.createElement("button");
+      title.type = "button";
       title.className = "session-title";
+      if (session.id === activeSessionId) title.setAttribute("aria-current", "true");
       title.textContent = session.title || "新会话";
       title.title = session.title || "新会话";
       title.addEventListener("click", () => openSession(session.id));
@@ -661,7 +679,12 @@ async function refreshSessions() {
 
 
 async function openSession(sessionId) {
-  if (streaming && controller) controller.abort();
+  closeRunSubscription();
+  activeRunId = null;
+  activeTaskId = null;
+  streaming = false;
+  runAllowedActions = [];
+  setSendButton();
   try {
     const response = await fetch("/api/sessions/" + sessionId);
     if (!response.ok) return;
@@ -669,6 +692,10 @@ async function openSession(sessionId) {
     activeSessionId = sessionId;
     localStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
     clearChat();
+    runBar.hidden = true;
+    runSnapshot.textContent = "尚未选择 Run";
+    eventList.replaceChildren();
+    restoredAssistantTexts = new Set();
     currentSessionHasMessages = (data.messages || []).some(
       (message) =>
         (message.role === "user" && message.content) ||
@@ -682,9 +709,12 @@ async function openSession(sessionId) {
         appendBubble("user", message.content);
       } else if (message.role === "assistant" && message.content) {
         appendBubble("assistant", message.content);
+        restoredAssistantTexts.add(message.content);
       }
     }
     renderSessions();
+    await loadTasks(sessionId, true);
+    await loadApprovals();
   } catch (err) {
     log("打开会话失败: " + err.message);
   }
@@ -692,7 +722,6 @@ async function openSession(sessionId) {
 
 
 async function createNewSession() {
-  if (streaming && controller) controller.abort();
   if (activeSessionId && !currentSessionHasMessages) {
     appendNote("当前会话为空，继续使用当前会话");
     return;
@@ -702,6 +731,11 @@ async function createNewSession() {
     appendNote("请先创建项目");
     return;
   }
+  closeRunSubscription();
+  activeRunId = null;
+  streaming = false;
+  runAllowedActions = [];
+  setSendButton();
   try {
     const response = await fetch("/api/sessions", {
       method: "POST",
@@ -716,6 +750,11 @@ async function createNewSession() {
     currentSessionHasMessages = false;
     projectAssignSelect.value = session.project_id || "";
     clearChat();
+    taskList.replaceChildren();
+    eventList.replaceChildren();
+    runBar.hidden = true;
+    runSnapshot.textContent = "尚未选择 Run";
+    await loadApprovals();
     renderSessions();
   } catch (err) {
     log("创建会话失败: " + err.message);
@@ -745,10 +784,20 @@ async function deleteSession(sessionId) {
     if (!response.ok) return;
     sessions = sessions.filter((session) => session.id !== sessionId);
     if (activeSessionId === sessionId) {
+      closeRunSubscription();
       activeSessionId = null;
+      activeRunId = null;
+      activeTaskId = null;
+      streaming = false;
+      runAllowedActions = [];
+      setSendButton();
       currentSessionHasMessages = false;
       localStorage.removeItem(ACTIVE_SESSION_KEY);
       clearChat();
+      taskList.replaceChildren();
+      eventList.replaceChildren();
+      approvalList.replaceChildren();
+      runBar.hidden = true;
     }
     renderSessions();
   } catch (err) {
@@ -988,118 +1037,289 @@ async function uploadFile(event) {
 }
 
 
+async function apiJson(url, options) {
+  const response = await fetch(url, options);
+  const data = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(errorMessage(data, "HTTP " + response.status));
+  return data;
+}
+
+
+function closeRunSubscription() {
+  if (eventSource) eventSource.close();
+  eventSource = null;
+}
+
+
+function renderRun(run) {
+  runBar.hidden = false;
+  runStatus.textContent = "Run " + run.status + (run.wait_reason ? " · " + run.wait_reason : "");
+  runSnapshot.textContent = run.run_id + " · Task " + run.task_id + " · attempt " + run.attempt;
+  runAllowedActions = run.allowed_actions || [];
+  streaming = !["completed", "failed", "cancelled"].includes(run.status);
+  setStatus(streaming ? "thinking" : "ready");
+  setSendButton();
+  runActions.replaceChildren();
+  for (const action of runAllowedActions) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = { pause: "暂停", resume: "恢复", cancel: "取消" }[action] || action;
+    button.addEventListener("click", () => controlRun(action));
+    runActions.appendChild(button);
+  }
+}
+
+
+async function loadRunSnapshot(runId) {
+  const run = await apiJson("/api/runs/" + encodeURIComponent(runId));
+  if (activeRunId === runId) renderRun(run);
+  return run;
+}
+
+
+async function loadTasks(agentId, restore = false) {
+  if (!agentId) return;
+  const data = await apiJson("/api/tasks?agent_id=" + encodeURIComponent(agentId) + "&limit=50");
+  if (agentId !== activeSessionId) return;
+  taskList.replaceChildren();
+  for (const task of data.tasks || []) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = task.goal + " · " + task.status;
+    button.addEventListener("click", () => {
+      activeTaskId = task.task_id;
+      if (task.latest_run_id) openRun(task.latest_run_id, true);
+      else runSnapshot.textContent = "Task " + task.task_id + " 尚未启动 Run";
+    });
+    item.appendChild(button);
+    if (!task.latest_run_id && task.status === "open") {
+      const start = document.createElement("button");
+      start.type = "button";
+      start.textContent = "启动";
+      start.addEventListener("click", () => startRun(task.task_id));
+      item.appendChild(start);
+    }
+    taskList.appendChild(item);
+  }
+  if (restore && data.tasks && data.tasks[0] && data.tasks[0].latest_run_id) {
+    activeTaskId = data.tasks[0].task_id;
+    await openRun(data.tasks[0].latest_run_id, true);
+  }
+}
+
+
+async function loadApprovals() {
+  approvalList.replaceChildren();
+  if (!activeSessionId) return;
+  const agentId = activeSessionId;
+  try {
+    const data = await apiJson("/api/approvals?agent_id=" + encodeURIComponent(agentId));
+    if (agentId !== activeSessionId) return;
+    for (const approval of data.approvals || []) {
+      const item = document.createElement("li");
+      const summary = approval.request_summary || {};
+      const label = document.createElement("span");
+      label.textContent = (summary.tool || summary.name || approval.kind) + " · " + approval.kind;
+      item.appendChild(label);
+      const decisions = approval.kind === "resolve_unknown_outcome"
+        ? ["occurred", "not_occurred", "explicit_retry", "cancel"] : ["approve", "deny"];
+      for (const decision of decisions) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = decision;
+        button.addEventListener("click", async () => {
+          button.disabled = true;
+          try {
+            await apiJson("/api/approvals/" + encodeURIComponent(approval.approval_id) + "/decision", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ decision }),
+            });
+            appendNote("决议已记录；Run 仍需等待运行器确认，不会自动重试未知副作用。");
+            await loadApprovals();
+            if (activeRunId) await loadRunSnapshot(activeRunId);
+          } catch (err) {
+            appendNote("审批失败: " + err.message);
+            button.disabled = false;
+          }
+        });
+        item.appendChild(button);
+      }
+      approvalList.appendChild(item);
+    }
+  } catch (err) {
+    appendNote("读取审批失败: " + err.message);
+  }
+}
+
+
+async function controlRun(action) {
+  if (!activeRunId) return;
+  try {
+    const run = await apiJson("/api/runs/" + encodeURIComponent(activeRunId) + "/control", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    });
+    renderRun(run);
+    appendNote("已提交 " + action + " 请求，等待 Run Event 确认。");
+  } catch (err) {
+    appendNote("控制失败: " + err.message);
+  }
+}
+
+
+async function startRun(taskId) {
+  try {
+    const run = await apiJson("/api/tasks/" + encodeURIComponent(taskId) + "/runs", {
+      method: "POST", headers: { "Content-Type": "application/json",
+        "Idempotency-Key": crypto.randomUUID() }, body: "{}",
+    });
+    activeTaskId = taskId;
+    await loadTasks(activeSessionId);
+    await openRun(run.run_id);
+  } catch (err) {
+    appendNote("启动 Run 失败: " + err.message);
+    hideTyping();
+    streaming = false;
+    runAllowedActions = [];
+    setStatus("ready");
+    setSendButton();
+  }
+}
+
+
+async function repairMessage(event) {
+  const data = event.data || {};
+  const message = await apiJson("/api/messages/" + encodeURIComponent(data.message_id));
+  const content = message.content || "";
+  if (Number.isInteger(data.length) && Array.from(content).length !== data.length) {
+    throw new Error("消息长度校验失败");
+  }
+  if (data.hash) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(content));
+    const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    if (hash !== data.hash) throw new Error("消息哈希校验失败");
+  }
+  if (event.run_id !== activeRunId) return;
+  if (message.role !== "assistant") return;
+  if (event.event_id <= restoreThroughEventId && restoredAssistantTexts.has(content)) {
+    assistantDraft = "";
+    assistantMessage = null;
+    return;
+  }
+  if (!assistantMessage) assistantMessage = appendBubble("assistant", "");
+  assistantMessage.bubble.innerHTML = renderMarkdown(content);
+  assistantMessage = null;
+  assistantDraft = "";
+  hideTyping();
+}
+
+
+async function handleRunEvent(event) {
+  const runId = event.run_id;
+  if (runId !== activeRunId || !Number.isSafeInteger(event.event_id) ||
+      event.event_id <= (lastEventIdByRun[runId] || 0)) return;
+  const data = event.data || {};
+  if (event.type === "model.output.delta") {
+    if (!assistantMessage) assistantMessage = appendBubble("assistant", "");
+    assistantDraft += data.text || data.content || "";
+    assistantMessage.bubble.innerHTML = renderMarkdown(assistantDraft);
+    hideTyping();
+  } else if (event.type === "message.completed") {
+    await repairMessage(event);
+  } else if (event.type === "tool.requested") {
+    activeToolCard = addToolCard(data.name || "工具", "");
+  } else if (event.type === "tool.completed" || event.type === "tool.failed") {
+    setToolCard(activeToolCard, event.type === "tool.completed", data.result_summary || "");
+    activeToolCard = null;
+  }
+  if (runId !== activeRunId) return;
+  const item = document.createElement("li");
+  item.textContent = "#" + event.event_id + " · " + event.type;
+  item.title = event.ts || "";
+  eventList.appendChild(item);
+  lastEventIdByRun[runId] = event.event_id;
+  if (event.type.startsWith("run.")) await loadRunSnapshot(runId);
+  if (event.type.startsWith("approval.")) await loadApprovals();
+  if (["run.completed", "run.failed", "run.cancelled"].includes(event.type)) {
+    closeRunSubscription();
+    hideTyping();
+    await loadTasks(activeSessionId);
+    await refreshSessions();
+  }
+}
+
+
+function subscribeRun(runId) {
+  closeRunSubscription();
+  const cursor = lastEventIdByRun[runId] || 0;
+  const source = new EventSource("/api/runs/" + encodeURIComponent(runId) + "/events?after_id=" + cursor);
+  eventSource = source;
+  let queue = Promise.resolve();
+  const types = ["run.queued", "run.started", "run.paused", "run.resumed", "run.completed",
+    "run.failed", "run.cancelled", "model.started", "model.output.delta", "message.completed",
+    "tool.requested", "tool.started", "tool.completed", "tool.failed",
+    "approval.requested", "approval.resolved", "tool.outcome_unknown"];
+  for (const type of types) source.addEventListener(type, (message) => {
+    queue = queue.then(async () => {
+      const event = JSON.parse(message.data);
+      if (String(event.event_id) !== message.lastEventId || event.type !== type) {
+        throw new Error("Event envelope 不一致");
+      }
+      await handleRunEvent(event);
+    }).catch((err) => {
+      appendNote("Event 修复失败: " + err.message);
+      closeRunSubscription();
+    });
+  });
+  source.onerror = () => {
+    if (eventSource === source) statusText.textContent = "事件连接重试中";
+  };
+}
+
+
+async function openRun(runId, restore = false) {
+  closeRunSubscription();
+  activeRunId = runId;
+  lastEventIdByRun[runId] = 0;
+  eventList.replaceChildren();
+  assistantDraft = "";
+  assistantMessage = null;
+  const run = await loadRunSnapshot(runId);
+  if (activeRunId !== runId) return;
+  restoreThroughEventId = restore ? run.last_event_id : 0;
+  if (!restore) restoredAssistantTexts = new Set();
+  subscribeRun(runId);
+}
+
+
 async function sendMessage() {
   const text = input.value.trim();
   if (!text || streaming) return;
-
-  input.value = "";
-  autoResize();
-  appendBubble("user", text);
-  currentSessionHasMessages = true;
-  log("发送用户消息: " + text);
-
   streaming = true;
-  controller = new AbortController();
+  runAllowedActions = [];
   setStatus("thinking");
   setSendButton();
   showTyping();
-
-  let assistantText = "";
-  let assistantMessage = null;
-  let failed = false;
-
   try {
     const sessionId = await ensureSession(text);
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId, message: text }),
-      signal: controller.signal,
+    const task = await apiJson("/api/tasks", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_id: sessionId, goal: text }),
     });
-    log("SSE 连接已建立，HTTP 状态: " + response.status);
-
-    if (!response.ok) {
-      const data = await response.json().catch(() => null);
-      throw new Error(errorMessage(data, "HTTP " + response.status));
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      // SSE 事件以空行分隔，这里逐个取出 data: 行
-      let separator = buffer.indexOf("\n\n");
-      while (separator !== -1) {
-        const rawEvent = buffer.slice(0, separator);
-        buffer = buffer.slice(separator + 2);
-
-        const dataLine = rawEvent.split("\n").find((line) => line.startsWith("data:"));
-        if (dataLine) {
-          const event = JSON.parse(dataLine.slice(5).trim());
-          switch (event.type) {
-            case "round":
-              hideTyping();
-              log("第 " + event.round + " 轮");
-              appendNote("第 " + event.round + " 轮");
-              break;
-            case "text":
-              hideTyping();
-              if (!assistantMessage) {
-                assistantMessage = appendBubble("assistant", "");
-              }
-              assistantText += event.content;
-              assistantMessage.bubble.innerHTML = renderMarkdown(assistantText);
-              break;
-            case "tool_call":
-              hideTyping();
-              log("工具调用: " + event.name + " " + event.arguments);
-              activeToolCard = addToolCard(event.name, event.arguments);
-              setSidebarToolState(event.name, "运行中");
-              break;
-            case "tool_result":
-              log("工具结果: " + event.name + " ok=" + event.ok);
-              setToolCard(activeToolCard, event.ok, event.message);
-              activeToolCard = null;
-              setSidebarToolState(event.name, event.ok ? "完成" : "失败");
-              break;
-            case "done":
-              hideTyping();
-              log("本轮完成: " + event.rounds + " 轮，耗时 " + event.total_ms + " ms");
-              appendNote("完成（第 " + event.rounds + " 轮，耗时 " + event.total_ms + " ms）");
-              break;
-            case "error":
-              failed = true;
-              hideTyping();
-              log("后端返回错误: " + event.message);
-              appendNote("错误: " + event.message);
-              break;
-          }
-        }
-
-        separator = buffer.indexOf("\n\n");
-      }
-    }
+    input.value = "";
+    autoResize();
+    appendBubble("user", text);
+    currentSessionHasMessages = true;
+    activeTaskId = task.task_id;
+    await startRun(task.task_id);
   } catch (err) {
-    failed = true;
     hideTyping();
-    if (err.name === "AbortError") {
-      log("用户停止生成");
-      appendNote("已停止");
-    } else {
-      log("请求异常: " + err.message);
-      appendNote("错误: " + err.message);
-    }
-  } finally {
     streaming = false;
-    controller = null;
+    runAllowedActions = [];
     setStatus("ready");
     setSendButton();
-    if (!failed && activeSessionId) refreshSessions();
+    appendNote("创建任务失败: " + err.message);
   }
 }
 
@@ -1107,7 +1327,7 @@ async function sendMessage() {
 form.addEventListener("submit", (event) => {
   event.preventDefault();
   if (streaming) {
-    if (controller) controller.abort();
+    if (runAllowedActions.includes("cancel")) controlRun("cancel");
     return;
   }
   sendMessage();

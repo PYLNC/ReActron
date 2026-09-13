@@ -348,7 +348,7 @@ class Wave3RouteTest(unittest.TestCase):
     def setUp(self):
         from fastapi import FastAPI
 
-        from backend import api
+        from backend import api, runtime
         from backend.app import http_error_handler, validation_error_handler
 
         self.api = api
@@ -356,6 +356,10 @@ class Wave3RouteTest(unittest.TestCase):
         runner_patch = patch.object(api, "_runner", return_value=self.runner)
         runner_patch.start()
         self.addCleanup(runner_patch.stop)
+        actions_patch = patch.object(runtime, "allowed_actions", side_effect=lambda row:
+                                     ["cancel"] if row["status"] == "queued" else [])
+        actions_patch.start()
+        self.addCleanup(actions_patch.stop)
         self.database = Mock()
         self.task = {
             "id": "task-1", "session_id": "agent-1", "goal": "goal",
@@ -418,7 +422,7 @@ class Wave3RouteTest(unittest.TestCase):
             self.assertEqual(response.headers["location"], "/api/runs/run-1")
             self.assertEqual(response.json()["run_id"], "run-1")
             self.assertEqual(response.json()["last_event_id"], 1)
-            self.assertEqual(response.json()["allowed_actions"], [])
+            self.assertEqual(response.json()["allowed_actions"], ["cancel"])
             self.assertEqual(response.json()["status"], "queued")
             self.assertNotIn("idempotency_key", response.text)
             self.assertNotIn("lease_owner", response.text)
@@ -757,6 +761,12 @@ class RunStreamTest(unittest.TestCase):
         self.db.create_legacy_chat_run.assert_not_called()
 
     def test_control_delegates_and_conflict_is_four_fields(self):
+        self.run["status"] = "queued"
+        self.runner.control_result = dict(self.run, status="cancelled")
+        cancelled = self.client.post("/api/runs/run-1/control", json={"action": "cancel"})
+        self.assertEqual(cancelled.status_code, 202)
+        self.assertEqual(cancelled.json()["status"], "cancelled")
+
         self.runner.control_result = dict(self.run, status="paused")
         accepted = self.client.post("/api/runs/run-1/control", json={"action": "pause"})
         self.assertEqual(accepted.status_code, 202)
@@ -807,6 +817,54 @@ class RunStreamTest(unittest.TestCase):
                                    json={"decision": "occurred"})
         self.assertEqual(hidden.json(), {"approvals": []})
         self.assertEqual((blocked.status_code, blocked.json()["code"]), (404, "not_found"))
+
+
+class UiProtocolTest(unittest.TestCase):
+    def test_event_reducer_deduplicates_persisted_id(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is unavailable")
+        script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+const crypto = require('crypto');
+const nodes = new Map();
+function node() {
+  return {
+    children: [], style: {}, classList: { add() {}, remove() {}, toggle() {} },
+    addEventListener() {}, appendChild(child) { this.children.push(child); return child; },
+    replaceChildren() { this.children = []; }, querySelectorAll() { return []; },
+  };
+}
+const context = {
+  document: { getElementById(id) { if (!nodes.has(id)) nodes.set(id, node()); return nodes.get(id); },
+              createElement: node, querySelectorAll() { return []; } },
+  window: {}, localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  fetch: async (url) => url === '/api/messages/7'
+    ? { ok: true, json: async () => ({ role: 'assistant', content: 'done' }) }
+    : { ok: false, status: 500 },
+  crypto: crypto.webcrypto, TextEncoder, console: { log() {} }, setTimeout() {},
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+vm.runInContext('activeRunId = "run-1"; lastEventIdByRun["run-1"] = 0;', context);
+(async () => {
+  const event = { event_id: 4, run_id: 'run-1', type: 'model.started', data: {}, ts: '' };
+  await vm.runInContext('handleRunEvent', context)(event);
+  await vm.runInContext('handleRunEvent', context)(event);
+  assert.strictEqual(nodes.get('eventList').children.length, 1);
+  const completed = { event_id: 5, run_id: 'run-1', type: 'message.completed', ts: '',
+    data: { message_id: 7, length: 4,
+      hash: crypto.createHash('sha256').update('done').digest('hex') } };
+  await vm.runInContext('handleRunEvent', context)(completed);
+  assert(nodes.get('chat').children[0].children[1].children[0].innerHTML.includes('done'));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+        result = subprocess.run(
+            ["node", "-e", script, str(ROOT / "static" / "app.js")],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class ConflictResponseTest(unittest.TestCase):
