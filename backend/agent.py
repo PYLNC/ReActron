@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import replace
@@ -248,3 +249,61 @@ class Agent:
             "message": f"已达到最大轮数 {self.max_rounds}",
             "total_ms": total_ms,
         }
+
+
+class AgentStep:
+    """One model invocation; the Runner owns all persistence and tool execution."""
+
+    def __init__(self, api_key, base_url, model):
+        self.client = _get_shared_client(api_key, base_url)
+        self.model = model
+
+    async def __call__(self, messages, *, run_id, round_index, tool_names=(), on_delta=None):
+        definitions = [item for item in TOOL_DEFINITIONS
+                       if item["function"]["name"] in tool_names]
+        kwargs = {"model": self.model, "messages": messages, "stream": True}
+        if definitions:
+            kwargs["tools"] = definitions
+        stream = await self.client.chat.completions.create(**kwargs)
+        content_parts, tool_calls = [], {}
+        total_chars = 0
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if not delta:
+                continue
+            if delta.content:
+                total_chars += len(delta.content)
+                if total_chars > 64_000:
+                    raise ValueError("模型单步输出超过 64k 字符")
+                content_parts.append(delta.content)
+                if on_delta is not None:
+                    await on_delta(delta.content)
+            for item in delta.tool_calls or ():
+                if not isinstance(item.index, int) or item.index < 0 or item.index >= 32:
+                    raise ValueError("无效工具调用序号")
+                call = tool_calls.setdefault(item.index, {
+                    "id": "", "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                })
+                if item.id:
+                    call["id"] = item.id
+                if item.function:
+                    for field in ("name", "arguments"):
+                        fragment = getattr(item.function, field, None)
+                        if fragment:
+                            total_chars += len(fragment)
+                            if total_chars > 64_000:
+                                raise ValueError("模型单步输出超过 64k 字符")
+                            call["function"][field] += fragment
+        ordered = [tool_calls[index] for index in sorted(tool_calls)]
+        ids = set()
+        for index, call in enumerate(ordered, 1):
+            call["id"] = call["id"] or f"call_{run_id}_{round_index}_{index}"
+            if (not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", call["id"]) or
+                    call["id"] in ids or not re.fullmatch(
+                        r"[A-Za-z0-9_-]{1,80}", call["function"]["name"])):
+                raise ValueError("重复或无效的 tool_call_id/name")
+            ids.add(call["id"])
+        return {"content": "".join(content_parts) or None, "tool_calls": ordered}

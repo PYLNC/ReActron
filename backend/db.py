@@ -1414,7 +1414,7 @@ class Database:
     def transition_run(self, run_id, expected_version, status, event_type,
                        payload=None, *, checkpoint=None, message=None,
                        lease_owner=None, lease_epoch=None, wait_reason=None,
-                       error=None):
+                       error=None, clear_deltas=False):
         """One CAS commit for status, checkpoint, message, and semantic events."""
         if status in {"completed", "failed", "cancelled"} and event_type != f"run.{status}":
             raise InvalidRunTransition("终态 Event type 不匹配")
@@ -1438,13 +1438,15 @@ class Database:
             now = _utc_now()
             terminal = status in {"completed", "failed", "cancelled"}
             updated = conn.execute("""
-                UPDATE runs SET status=?,wait_reason=?,control_requested=NULL,
+                UPDATE runs SET status=?,wait_reason=?,
+                    control_requested=CASE WHEN ?='running' THEN control_requested ELSE NULL END,
                     version=version+1,lease_owner=?,lease_until=?,
                     checkpoint_json=COALESCE(?,checkpoint_json),
                     error_json=COALESCE(?,error_json),updated_at=?,
                     finished_at=CASE WHEN ? THEN ? ELSE finished_at END
                 WHERE id=? AND version=?
-            """, (status, wait_reason, run["lease_owner"] if status == "running" else None,
+            """, (status, wait_reason, status,
+                  run["lease_owner"] if status == "running" else None,
                   run["lease_until"] if status == "running" else None,
                   _json(checkpoint) if checkpoint is not None else None,
                   _json(error) if error is not None else None,
@@ -1461,6 +1463,10 @@ class Database:
                     tool_calls=message.get("tool_calls"),
                     tool_call_id=message.get("tool_call_id"),
                 )
+                if checkpoint is not None and "assistant_message_id" in checkpoint and checkpoint["assistant_message_id"] is None:
+                    checkpoint = {**checkpoint, "assistant_message_id": message_id}
+                    conn.execute("UPDATE runs SET checkpoint_json=? WHERE id=?",
+                                 (_json(checkpoint), run_id))
                 content = message.get("content") or ""
                 self._append_event_tx(conn, run_id, "message.completed", {
                     "message_id": message_id,
@@ -1470,12 +1476,50 @@ class Database:
                     terminal_reserve=terminal)
             self._append_event_tx(conn, run_id, event_type, payload,
                                   f"{run_id}:{event_type}" if terminal else None)
+            if clear_deltas:
+                if message is None or message.get("role") != "assistant":
+                    raise InvalidRunTransition("只有完整 assistant 消息可压缩 delta")
+                conn.execute("DELETE FROM events WHERE run_id=? AND type='model.output.delta'",
+                             (run_id,))
             if terminal:
                 conn.execute("""
                     UPDATE tasks SET status=?,finished_at=?,updated_at=?
                     WHERE id=? AND status='open'
                 """, (status, now, now, run["task_id"]))
             return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), message_id
+
+    def start_tool_call(self, run_id, expected_version, lease_owner, lease_epoch,
+                        call_id, name, effect, action_hash, min_result_bytes=4096):
+        """Durable pre-invocation marker; budget the uncertain result before side effects."""
+        if not 0 <= min_result_bytes <= MAX_EVENT_BYTES or not call_id or not name:
+            raise ValueError("无效工具启动参数")
+        with self._write() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise ResourceNotFound("Run 不存在")
+            if (run["status"] != "running" or run["version"] != expected_version or
+                    run["lease_owner"] != lease_owner or run["lease_epoch"] != lease_epoch or
+                    run["lease_until"] <= _utc_now() or run["control_requested"]):
+                raise InvalidRunTransition("Run lease/version/control 已变化")
+            started = conn.execute("""
+                SELECT id FROM events WHERE run_id=? AND type='tool.started'
+                    AND json_extract(payload_json,'$.call_id')=?
+                ORDER BY id DESC LIMIT 1
+            """, (run_id, call_id)).fetchone()
+            if started:
+                raise InvalidRunTransition("tool_call_id 已启动；必须先核实结果")
+            self._append_event_tx(conn, run_id, "tool.started", {
+                "call_id": call_id, "name": name, "effect": effect,
+                "action_hash": action_hash,
+            }, f"{run_id}:{call_id}:tool.started")
+            used = conn.execute("SELECT event_bytes_written FROM runs WHERE id=?",
+                                (run_id,)).fetchone()[0]
+            if used + min_result_bytes > MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE:
+                raise EventLimitExceeded("工具结果 Event 空间不足，拒绝调用")
+            now = _utc_now()
+            conn.execute("UPDATE runs SET version=version+1,updated_at=? WHERE id=?",
+                         (now, run_id))
+            return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
 
     def recover_expired_leases(self, now=None):
         """Startup scan pauses, never re-executes an uncertain tool."""

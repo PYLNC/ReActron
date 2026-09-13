@@ -19,6 +19,8 @@ from backend.db import (
     MAX_EVENT_BYTES, MAX_RUN_EVENT_BYTES, TERMINAL_EVENT_RESERVE, _json,
 )
 from backend.context import ContextTooLarge, build_context
+from backend.runtime import TaskRunner
+from backend.tool_gateway import make_run_context
 
 
 class RunRepositoryTest(unittest.TestCase):
@@ -478,6 +480,64 @@ class RunRepositoryTest(unittest.TestCase):
         self.assertFalse(created)  # Idempotent historical read is not a new write.
         self.assertEqual(old["id"], run["id"])
         self.assertEqual(self.db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+
+class RunnerCoreTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Database(Path(self.tmp.name) / "runner.db")
+        self.addCleanup(self.db.close)
+        self.agent_id = self.db.create_session()["id"]
+        self.task = self.db.create_task(self.agent_id, "answer")
+        self.run, _ = self.db.create_run(
+            self.task["id"], "run-1",
+            config_snapshot={"model": "fake", "max_rounds": 2}, tool_snapshot={})
+
+    async def test_one_model_invocation_commits_message_and_terminal_event(self):
+        calls = []
+
+        def factory(key, url, model):
+            calls.append((key, url, model))
+
+            async def step(messages, **kwargs):
+                self.assertEqual(sum(m["role"] == "user" for m in messages), 1)
+                await kwargs["on_delta"]("partial")
+                return {"content": "answer", "tool_calls": []}
+            return step
+
+        runner = TaskRunner(
+            self.db, model_factory=factory,
+            provider_config=lambda _: SimpleNamespace(api_key="fake-key", base_url="https://fake"),
+            tool_context_factory=lambda run: make_run_context(run["id"], run["task_id"]))
+        self.assertTrue(await runner.run_once())
+        self.assertFalse(await runner.run_once())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.db.get_run(self.run["id"])["status"], "completed")
+        events = self.db.list_events(self.run["id"])
+        self.assertEqual([e["type"] for e in events],
+                         ["run.queued", "run.started", "message.completed", "run.completed"])
+        self.assertEqual(self.db._query_one("SELECT content FROM messages WHERE run_id=?",
+                                             (self.run["id"],))["content"], "answer")
+        self.assertGreater(self.db.get_run(self.run["id"])["event_bytes_written"], 0)
+
+    async def test_provider_denial_never_constructs_model_client(self):
+        calls = []
+
+        def factory(*args):
+            calls.append(args)
+            raise AssertionError("client constructed")
+
+        def deny(_):
+            raise ValueError("provider_snapshot_mismatch")
+
+        runner = TaskRunner(self.db, model_factory=factory, provider_config=deny,
+                            tool_context_factory=lambda run: make_run_context(run["id"]))
+        await runner.run_once()
+        self.assertEqual(calls, [])
+        run = self.db.get_run(self.run["id"])
+        self.assertEqual((run["status"], json.loads(run["error_json"])["code"]),
+                         ("failed", "provider_snapshot_mismatch"))
 
 
 if __name__ == "__main__":
