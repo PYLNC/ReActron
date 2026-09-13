@@ -1,5 +1,6 @@
 """P1 repository invariants; no model, MCP, or network calls."""
 
+import asyncio
 import json
 import hashlib
 import sqlite3
@@ -9,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -20,7 +22,7 @@ from backend.db import (
 )
 from backend.context import ContextTooLarge, build_context
 from backend.runtime import TaskRunner
-from backend.tool_gateway import make_run_context
+from backend.tool_gateway import ToolOutcome, ToolSpec, make_run_context
 
 
 class RunRepositoryTest(unittest.TestCase):
@@ -167,6 +169,48 @@ class RunRepositoryTest(unittest.TestCase):
                 self.db.append_event(run["id"], "model.output.delta", {"text": "x"})
             self.db.transition_run(run["id"], 0, "cancelled", "run.cancelled", {})
             self.assertGreater(self.db.get_run(run["id"])["event_bytes_written"], before_delete)
+
+    def test_tool_preflight_exact_boundary_and_unknown_waiting(self):
+        cap = MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE
+        timestamp = "2026-09-13T00:00:00.000Z"
+        payload = {"call_id": "call_boundary", "name": "danger",
+                   "effect": "effectful", "action_hash": "a" * 64}
+        for offset in (0, 1):
+            agent_id = self.db.create_session()["id"]
+            task = self.db.create_task(agent_id, "boundary")
+            run, _ = self.db.create_run(task["id"], f"boundary-{offset}",
+                                        config_snapshot={}, tool_snapshot={})
+            active = self.db.claim_next_run(f"worker-{offset}")
+            event_size = self._next_event_size(active, "tool.started", payload, timestamp)
+            self.db._execute("UPDATE runs SET event_bytes_written=? WHERE id=?",
+                             (cap - 4096 - event_size + offset, run["id"]))
+            with patch("backend.db._utc_now", return_value=timestamp):
+                if offset:
+                    with self.assertRaises(EventLimitExceeded):
+                        self.db.start_tool_call(run["id"], active["version"],
+                                                f"worker-{offset}", active["lease_epoch"],
+                                                "call_boundary", "danger", "effectful", "a" * 64)
+                    self.assertFalse(any(e["type"] == "tool.started" for e in
+                                         self.db.list_events(run["id"])))
+                    self.db.transition_run(run["id"], active["version"], "failed",
+                                           "run.failed", {"code": "event_limit_exceeded"},
+                                           lease_owner=f"worker-{offset}",
+                                           lease_epoch=active["lease_epoch"])
+                    self.assertEqual(self.db.get_run(run["id"])["status"], "failed")
+                else:
+                    started = self.db.start_tool_call(
+                        run["id"], active["version"], f"worker-{offset}",
+                        active["lease_epoch"], "call_boundary", "danger",
+                        "effectful", "a" * 64)
+                    outcome = ToolOutcome("call_boundary", "outcome_unknown", "effectful",
+                                          False, "未确认", None, "timeout_unknown_effect")
+                    waiting, approval = self.db.record_unknown_outcome(
+                        run["id"], started["version"], f"worker-{offset}",
+                        started["lease_epoch"], outcome, "danger", "a" * 64,
+                        "9999-01-01T00:00:00.000Z")
+                    self.assertEqual((waiting["status"], approval["status"]),
+                                     ("waiting", "pending"))
+                    self.assertLessEqual(waiting["event_bytes_written"], cap)
 
     def test_claim_cas_lease_and_recovery_are_single_writer(self):
         run, _ = self._run()
@@ -331,7 +375,7 @@ class RunRepositoryTest(unittest.TestCase):
     def test_recovery_event_obeys_nonterminal_cap_and_rolls_back_status(self):
         cap = MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE
         timestamp = "2026-09-13T00:00:00.000Z"
-        for offset, expected_status in ((0, "paused"), (1, "running")):
+        for offset, expected_status in ((0, "paused"), (1, "failed")):
             agent_id = self.db.create_session()["id"]
             task = self.db.create_task(agent_id, "recover")
             run, _ = self.db.create_run(task["id"], f"recovery-{offset}",
@@ -344,16 +388,16 @@ class RunRepositoryTest(unittest.TestCase):
             self.db._execute("UPDATE runs SET event_bytes_written=? WHERE id=?",
                              (before, run["id"]))
             with patch("backend.db._utc_now", return_value=timestamp):
-                if offset:
-                    with self.assertRaises(EventLimitExceeded):
-                        self.db.recover_expired_leases("9999-01-01T00:00:00.000Z")
-                else:
-                    self.assertEqual(self.db.recover_expired_leases(
-                        "9999-01-01T00:00:00.000Z"), [run["id"]])
+                self.assertEqual(self.db.recover_expired_leases(
+                    "9999-01-01T00:00:00.000Z"), [run["id"]])
             state = self.db.get_run(run["id"])
             self.assertEqual(state["status"], expected_status)
-            self.assertEqual(state["event_bytes_written"], cap if not offset else before)
-            self.assertEqual(len(self.db.list_events(run["id"])), 2 if offset else 3)
+            if offset:
+                self.assertGreater(state["event_bytes_written"], before)
+                self.assertLessEqual(state["event_bytes_written"], MAX_RUN_EVENT_BYTES)
+            else:
+                self.assertEqual(state["event_bytes_written"], cap)
+            self.assertEqual(len(self.db.list_events(run["id"])), 3)
 
     def test_approval_kind_decisions_and_idempotency(self):
         run, _ = self._run()
@@ -538,6 +582,337 @@ class RunnerCoreTest(unittest.IsolatedAsyncioTestCase):
         run = self.db.get_run(self.run["id"])
         self.assertEqual((run["status"], json.loads(run["error_json"])["code"]),
                          ("failed", "provider_snapshot_mismatch"))
+
+    async def test_default_provider_gate_uses_frozen_row_before_client(self):
+        created = []
+
+        def factory(*args):
+            created.append(args)
+            raise AssertionError("model client must not be constructed")
+
+        runner = TaskRunner(self.db, model_factory=factory,
+                            tool_context_factory=lambda run: make_run_context(run["id"]))
+        live = SimpleNamespace(api_key="changed-key", base_url="https://changed",
+                               model="changed-model")
+        with patch("backend.security.verify_frozen_provider", create=True,
+                   return_value=False) as verify, patch(
+                       "backend.services.get_runtime_config", return_value=live):
+            await runner.run_once()
+        self.assertEqual(created, [])
+        self.assertEqual(verify.call_args.args[0],
+                         json.loads(self.run["config_snapshot_json"]))
+        self.assertEqual(verify.call_args.kwargs["runtime_config"], live)
+        self.assertEqual(verify.call_args.kwargs["settings"], self.db.get_settings())
+        self.assertEqual(self.db.get_run(self.run["id"])["status"], "failed")
+
+    async def test_model_exception_or_timeout_clears_delta_without_refunding_bytes(self):
+        for index, failure in enumerate((RuntimeError("model broke"),
+                                         asyncio.TimeoutError("model timeout"))):
+            if index:
+                task = self.db.create_task(self.agent_id, "second")
+                run, _ = self.db.create_run(task["id"], "run-2",
+                                            config_snapshot={"model": "fake", "max_rounds": 2},
+                                            tool_snapshot={})
+            else:
+                run = self.run
+            during = []
+
+            def factory(*_):
+                async def step(_messages, **kwargs):
+                    await kwargs["on_delta"]("unfinished")
+                    during.append(self.db.get_run(run["id"])["event_bytes_written"])
+                    raise failure
+                return step
+
+            runner = TaskRunner(self.db, model_factory=factory,
+                                provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+                                tool_context_factory=lambda row: make_run_context(row["id"]))
+            await runner.run_once()
+            final = self.db.get_run(run["id"])
+            self.assertEqual(final["status"], "failed")
+            self.assertGreater(final["event_bytes_written"], during[0])
+            events = self.db.list_events(run["id"])
+            self.assertFalse(any(event["type"] == "model.output.delta" for event in events))
+            self.assertEqual(sum(event["type"] == "run.failed" for event in events), 1)
+            self.assertFalse(self.db._query_all("SELECT * FROM messages WHERE run_id=?",
+                                                (run["id"],)))
+
+    async def test_pause_resume_same_run_and_attempt_at_model_boundary(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        def factory(*_):
+            async def step(messages, **kwargs):
+                calls.append(messages)
+                if len(calls) == 1:
+                    await kwargs["on_delta"]("unfinished")
+                    entered.set()
+                    await release.wait()
+                return {"content": "done", "tool_calls": []}
+            return step
+
+        runner = TaskRunner(self.db, model_factory=factory,
+                            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+                            tool_context_factory=lambda run: make_run_context(run["id"]))
+        work = asyncio.create_task(runner.run_once())
+        await asyncio.wait_for(entered.wait(), 2)
+        requested = await runner.control(self.run["id"], "pause")
+        self.assertEqual(requested["control_requested"], "pause")
+        release.set()
+        await work
+        paused = self.db.get_run(self.run["id"])
+        self.assertEqual((paused["status"], paused["attempt"]), ("paused", 1))
+        self.assertFalse(any(event["type"] == "model.output.delta" for event in
+                             self.db.list_events(self.run["id"])))
+        resumed = await runner.control(self.run["id"], "resume")
+        self.assertEqual((resumed["status"], resumed["id"], resumed["attempt"]),
+                         ("queued", self.run["id"], 1))
+        await runner.run_once()
+        self.assertEqual(self.db.get_run(self.run["id"])["status"], "completed")
+        self.assertEqual(len(calls), 2)
+
+    async def test_unknown_outcome_and_resolved_retry_never_reinvoke(self):
+        calls = []
+        tool_call = {"id": "call_safe_1", "type": "function",
+                     "function": {"name": "danger", "arguments": "{}"}}
+        spec = ToolSpec(name="danger", schema={"type": "object"},
+                        handler=lambda: None, effects=frozenset({"filesystem.write"}))
+
+        def factory(*_):
+            async def step(*_args, **_kwargs):
+                return {"content": None, "tool_calls": [tool_call]}
+            return step
+
+        async def executor(ctx, name, args):
+            calls.append((ctx.call_id, name, args))
+            return ToolOutcome(ctx.call_id, "outcome_unknown", "effectful", False,
+                               "未确认", None, "timeout_unknown_effect")
+
+        runner = TaskRunner(self.db, model_factory=factory, tool_executor=executor,
+                            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+                            tool_context_factory=lambda run: replace(
+                                make_run_context(run["id"]), tool_specs={"danger": spec}))
+        await runner.run_once()
+        waiting = self.db.get_run(self.run["id"])
+        self.assertEqual((waiting["status"], waiting["wait_reason"]), ("waiting", "approval"))
+        approvals = self.db.list_approvals(self.run["id"])
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(len(calls), 1)
+        self.db.decide_approval(approvals[0]["id"], "explicit_retry")
+        await runner.approval_decided(approvals[0]["id"])
+        self.assertFalse(await runner.run_once())
+        self.assertEqual((self.db.get_run(self.run["id"])["status"], len(calls)),
+                         ("waiting", 1))
+
+    async def test_cancel_waits_for_inflight_tool_outcome_then_stops(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = []
+        tool_call = {"id": "call_cancel_1", "type": "function",
+                     "function": {"name": "clock", "arguments": "{}"}}
+
+        def factory(*_):
+            async def step(*_args, **_kwargs):
+                return {"content": None, "tool_calls": [tool_call]}
+            return step
+
+        async def executor(ctx, _name, _args):
+            calls.append(ctx.call_id)
+            entered.set()
+            await release.wait()
+            return ToolOutcome(ctx.call_id, "ok", "read_only", True,
+                               "safe", None, None)
+
+        runner = TaskRunner(self.db, model_factory=factory, tool_executor=executor,
+                            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+                            tool_context_factory=lambda run: make_run_context(run["id"]))
+        work = asyncio.create_task(runner.run_once())
+        await asyncio.wait_for(entered.wait(), 2)
+        request = await runner.control(self.run["id"], "cancel")
+        self.assertEqual((request["status"], request["control_requested"]),
+                         ("running", "cancel"))
+        release.set()
+        await work
+        final = self.db.get_run(self.run["id"])
+        self.assertEqual(final["status"], "cancelled")
+        self.assertEqual(calls, ["call_cancel_1"])
+        self.assertEqual(len([event for event in self.db.list_events(final["id"])
+                              if event["type"] == "run.cancelled"]), 1)
+
+    async def test_effectful_executor_exception_becomes_unknown_not_failed(self):
+        call = {"id": "call_raise_1", "type": "function",
+                "function": {"name": "danger", "arguments": "{}"}}
+        spec = ToolSpec(name="danger", schema={"type": "object"},
+                        handler=lambda: None, effects=frozenset({"filesystem.write"}))
+        invoked = []
+
+        def factory(*_):
+            async def step(*_args, **_kwargs):
+                return {"content": None, "tool_calls": [call]}
+            return step
+
+        async def executor(*_):
+            invoked.append(1)
+            raise RuntimeError("possibly after side effect")
+
+        runner = TaskRunner(self.db, model_factory=factory, tool_executor=executor,
+                            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+                            tool_context_factory=lambda run: replace(
+                                make_run_context(run["id"]), tool_specs={"danger": spec}))
+        await runner.run_once()
+        self.assertEqual(invoked, [1])
+        self.assertEqual(self.db.get_run(self.run["id"])["status"], "waiting")
+        self.assertEqual(self.db.list_approvals(self.run["id"])[0]["kind"],
+                         "resolve_unknown_outcome")
+
+    async def test_unrecordable_effectful_exception_never_false_fails_or_reinvokes(self):
+        call = {"id": "call_hold_1", "type": "function",
+                "function": {"name": "danger", "arguments": "{}"}}
+        spec = ToolSpec(name="danger", schema={"type": "object"},
+                        handler=lambda: None, effects=frozenset({"filesystem.write"}))
+        invoked = []
+
+        def factory(*_):
+            async def step(*_args, **_kwargs):
+                return {"content": None, "tool_calls": [call]}
+            return step
+
+        async def executor(*_):
+            invoked.append(1)
+            raise RuntimeError("possibly after side effect")
+
+        runner = TaskRunner(self.db, model_factory=factory, tool_executor=executor,
+                            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+                            tool_context_factory=lambda run: replace(
+                                make_run_context(run["id"]), tool_specs={"danger": spec}))
+        with patch.object(self.db, "record_unknown_outcome",
+                          side_effect=EventLimitExceeded("injected persistence failure")):
+            await runner.run_once()
+        self.assertEqual(invoked, [1])
+        self.assertEqual(self.db.get_run(self.run["id"])["status"], "running")
+        self.assertFalse(self.db.list_approvals(self.run["id"]))
+        self.db._execute("UPDATE runs SET lease_until='2000-01-01T00:00:00.000Z',"
+                         "event_bytes_written=? WHERE id=?",
+                         (MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE, self.run["id"]))
+        self.assertEqual(self.db.recover_expired_leases(), [])
+        self.assertEqual(self.db.get_run(self.run["id"])["status"], "running")
+        self.assertFalse(await runner.run_once())
+        self.assertEqual(invoked, [1])
+
+    async def test_preinvocation_event_budget_blocks_tool_and_keeps_terminal_reserve(self):
+        calls = []
+        tool_call = {"id": "call_safe_2", "type": "function",
+                     "function": {"name": "danger", "arguments": "{}"}}
+
+        def factory(*_):
+            async def step(*_args, **_kwargs):
+                return {"content": None, "tool_calls": [tool_call]}
+            return step
+
+        async def executor(*_):
+            calls.append(1)
+            raise AssertionError("tool must not execute")
+
+        runner = TaskRunner(self.db, model_factory=factory, tool_executor=executor,
+                            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+                            tool_context_factory=lambda run: make_run_context(run["id"]))
+        active = self.db.claim_next_run(runner._owner, lease_seconds=120)
+        self.db._execute("UPDATE runs SET event_bytes_written=? WHERE id=?",
+                         (MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE - 4300,
+                          self.run["id"]))
+        await runner._process(active)
+        final = self.db.get_run(self.run["id"])
+        self.assertEqual((final["status"], json.loads(final["error_json"])["code"]),
+                         ("failed", "event_limit_exceeded"))
+        self.assertEqual(calls, [])
+        self.assertFalse(any(e["type"] == "tool.started" for e in
+                             self.db.list_events(self.run["id"])))
+        self.assertGreater(final["event_bytes_written"],
+                           MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE - 4300)
+
+    async def test_disconnected_waiter_does_not_cancel_run(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        def factory(*_):
+            async def step(*_args, **_kwargs):
+                entered.set()
+                await release.wait()
+                return {"content": "done", "tool_calls": []}
+            return step
+
+        runner = TaskRunner(self.db, model_factory=factory,
+                            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+                            tool_context_factory=lambda run: make_run_context(run["id"]))
+        worker = asyncio.create_task(runner.run_once())
+        await asyncio.wait_for(entered.wait(), 2)
+        after_id = self.db.get_last_event_id(self.run["id"])
+        waiter = asyncio.create_task(runner.wait_for_change(self.run["id"], after_id, 5))
+        waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+        release.set()
+        await worker
+        self.assertEqual(self.db.get_run(self.run["id"])["status"], "completed")
+
+    async def test_restart_after_tool_started_requires_unknown_approval_not_reinvoke(self):
+        call = {"id": "call_restart_1", "type": "function",
+                "function": {"name": "danger", "arguments": "{}"}}
+        active = self.db.claim_next_run("old-worker", lease_seconds=120)
+        checkpoint = {"v": 1, "phase": "tool_pending", "round": 1,
+                      "assistant_message_id": None, "next_tool_index": 0}
+        active, message_id = self.db.transition_run(
+            active["id"], active["version"], "running", "model.completed",
+            {"round": 1, "tool_count": 1}, checkpoint=checkpoint,
+            message={"role": "assistant", "content": None, "tool_calls": [call]},
+            lease_owner="old-worker", lease_epoch=active["lease_epoch"])
+        self.assertEqual(json.loads(active["checkpoint_json"])["assistant_message_id"], message_id)
+        active = self.db.start_tool_call(active["id"], active["version"],
+                                         "old-worker", active["lease_epoch"],
+                                         "call_restart_1", "danger", "effectful", "a" * 64)
+        self.db._execute("UPDATE runs SET lease_until='2000-01-01T00:00:00.000Z' WHERE id=?",
+                         (active["id"],))
+        self.assertEqual(self.db.recover_expired_leases(), [active["id"]])
+        self.db.request_control(active["id"], "resume")
+        spec = ToolSpec(name="danger", schema={"type": "object"},
+                        handler=lambda: None, effects=frozenset({"filesystem.write"}))
+        invoked = []
+
+        async def executor(*_):
+            invoked.append(1)
+            raise AssertionError("recovered effectful call must not execute")
+
+        runner = TaskRunner(self.db, tool_executor=executor,
+                            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+                            tool_context_factory=lambda run: replace(
+                                make_run_context(run["id"]), tool_specs={"danger": spec}))
+        await runner.run_once()
+        self.assertEqual(invoked, [])
+        waiting = self.db.get_run(active["id"])
+        self.assertEqual((waiting["status"], waiting["attempt"]), ("waiting", 1))
+        self.assertEqual(len(self.db.list_approvals(active["id"])), 1)
+        self.assertEqual(self.db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    async def test_recovery_at_nonterminal_cap_uses_only_terminal_reserve(self):
+        active = self.db.claim_next_run("old-worker")
+        self.db._execute("UPDATE runs SET lease_until='2000-01-01T00:00:00.000Z',"
+                         "event_bytes_written=? WHERE id=?",
+                         (MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE, active["id"]))
+        self.assertEqual(self.db.recover_expired_leases(), [active["id"]])
+        final = self.db.get_run(active["id"])
+        self.assertEqual((final["status"], self.db.get_task(self.task["id"])["status"]),
+                         ("failed", "failed"))
+        self.assertGreater(final["event_bytes_written"],
+                           MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE)
+        self.assertLessEqual(final["event_bytes_written"], MAX_RUN_EVENT_BYTES)
+        self.assertEqual(self.db.list_events(active["id"])[-1]["type"], "run.failed")
+
+    async def test_claim_at_nonterminal_cap_fails_without_model_invocation(self):
+        self.db._execute("UPDATE runs SET event_bytes_written=? WHERE id=?",
+                         (MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE, self.run["id"]))
+        self.assertIsNone(self.db.claim_next_run("worker"))
+        final = self.db.get_run(self.run["id"])
+        self.assertEqual(final["status"], "failed")
+        self.assertEqual(json.loads(final["error_json"])["code"], "event_limit_exceeded")
+        self.assertEqual(self.db.list_events(final["id"])[-1]["type"], "run.failed")
 
 
 if __name__ == "__main__":

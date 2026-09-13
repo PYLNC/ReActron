@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from backend import agent as agent_module
-from backend.agent import Agent
+from backend.agent import Agent, AgentStep
 
 
 class FakeCompletions:
@@ -234,6 +234,29 @@ class ProviderRedirectTest(unittest.TestCase):
             http_client=fake_http_client,
         )
         self.assertIs(result, fake_openai_client)
+
+
+class AgentStepTest(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_call_id_is_deterministic_and_tool_list_is_filtered(self):
+        client = fake_client(((None, "get_current_time"),), content="hi")
+        emitted = []
+        async def on_delta(text):
+            emitted.append(text)
+        with patch("backend.agent._get_shared_client", return_value=client):
+            step = AgentStep("key", "https://example.test", "model")
+        result = await step([], run_id="run_1", round_index=2,
+                            tool_names=("get_current_time",), on_delta=on_delta)
+        self.assertEqual(result["tool_calls"][0]["id"], "call_run_1_2_1")
+        self.assertEqual(result["content"], "hi")
+        self.assertEqual(emitted, ["hi"])
+
+    async def test_marker_like_call_id_is_rejected_before_return(self):
+        client = fake_client((("secret marker", "get_current_time"),))
+        with patch("backend.agent._get_shared_client", return_value=client):
+            step = AgentStep("key", "https://example.test", "model")
+        with self.assertRaisesRegex(ValueError, "tool_call_id"):
+            await step([], run_id="run_1", round_index=1,
+                       tool_names=("get_current_time",))
 
 
 if __name__ == "__main__":

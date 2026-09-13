@@ -3,6 +3,7 @@
 import json
 import hashlib
 import logging
+import re
 import sqlite3
 import threading
 import uuid
@@ -1355,6 +1356,13 @@ class Database:
         )
         return row["last_event_id"]
 
+    def get_tool_start(self, run_id, call_id):
+        return self._query_one("""
+            SELECT * FROM events WHERE run_id=? AND type='tool.started'
+                AND json_extract(payload_json,'$.call_id')=?
+            ORDER BY id DESC LIMIT 1
+        """, (run_id, call_id))
+
     def get_message(self, message_id):
         return self._query_one("SELECT * FROM messages WHERE id=?", (message_id,))
 
@@ -1381,6 +1389,7 @@ class Database:
             checkpoint = candidate["checkpoint_json"] or _json({
                 "v": 1, "phase": "model_pending", "round": 1
             })
+            conn.execute("SAVEPOINT claim_one")
             updated = conn.execute("""
                 UPDATE runs SET status='running', version=version+1,
                     lease_epoch=lease_epoch+1, lease_owner=?, lease_until=?,
@@ -1390,10 +1399,40 @@ class Database:
             """, (lease_owner, deadline, checkpoint, now, now, now,
                   candidate["id"], candidate["version"]))
             if updated.rowcount != 1:
+                conn.execute("ROLLBACK TO claim_one")
+                conn.execute("RELEASE claim_one")
                 return None
-            self._append_event_tx(conn, candidate["id"], "run.started",
-                                  {"lease_epoch": candidate["lease_epoch"] + 1},
-                                  f"{candidate['id']}:run.started:{candidate['lease_epoch'] + 1}")
+            try:
+                self._append_event_tx(conn, candidate["id"], "run.started",
+                                      {"lease_epoch": candidate["lease_epoch"] + 1},
+                                      f"{candidate['id']}:run.started:{candidate['lease_epoch'] + 1}")
+            except EventLimitExceeded:
+                conn.execute("ROLLBACK TO claim_one")
+                conn.execute("RELEASE claim_one")
+                conn.execute("""
+                    UPDATE runs SET status='running',version=version+1,
+                        lease_epoch=lease_epoch+1,lease_owner=?,lease_until=?,
+                        checkpoint_json=?,started_at=COALESCE(started_at,?),
+                        heartbeat_at=?,updated_at=?
+                    WHERE id=? AND status='queued' AND version=?
+                """, (lease_owner, deadline, checkpoint, now, now, now,
+                      candidate["id"], candidate["version"]))
+                conn.execute("""
+                    UPDATE runs SET status='failed',version=version+1,
+                        lease_owner=NULL,lease_until=NULL,error_json=?,
+                        finished_at=?,updated_at=?
+                    WHERE id=? AND status='running'
+                """, (_json({"code": "event_limit_exceeded"}), now, now,
+                      candidate["id"]))
+                self._append_event_tx(conn, candidate["id"], "run.failed",
+                                      {"code": "event_limit_exceeded"},
+                                      f"{candidate['id']}:run.failed")
+                conn.execute("""
+                    UPDATE tasks SET status='failed',finished_at=?,updated_at=?
+                    WHERE id=? AND status='open'
+                """, (now, now, candidate["task_id"]))
+                return None
+            conn.execute("RELEASE claim_one")
             return dict(conn.execute("SELECT * FROM runs WHERE id=?", (candidate["id"],)).fetchone())
 
     def heartbeat_run(self, run_id, lease_owner, lease_epoch, expected_version,
@@ -1477,8 +1516,9 @@ class Database:
             self._append_event_tx(conn, run_id, event_type, payload,
                                   f"{run_id}:{event_type}" if terminal else None)
             if clear_deltas:
-                if message is None or message.get("role") != "assistant":
-                    raise InvalidRunTransition("只有完整 assistant 消息可压缩 delta")
+                if ((message is None or message.get("role") != "assistant") and
+                        status not in {"paused", "cancelled", "failed"}):
+                    raise InvalidRunTransition("只能在完整消息或步骤终止时压缩 delta")
                 conn.execute("DELETE FROM events WHERE run_id=? AND type='model.output.delta'",
                              (run_id,))
             if terminal:
@@ -1491,7 +1531,14 @@ class Database:
     def start_tool_call(self, run_id, expected_version, lease_owner, lease_epoch,
                         call_id, name, effect, action_hash, min_result_bytes=4096):
         """Durable pre-invocation marker; budget the uncertain result before side effects."""
-        if not 0 <= min_result_bytes <= MAX_EVENT_BYTES or not call_id or not name:
+        if (not 4096 <= min_result_bytes <= MAX_EVENT_BYTES or
+                not isinstance(call_id, str) or
+                not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", call_id) or
+                not isinstance(name, str) or
+                not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", name) or
+                effect not in {"read_only", "effectful"} or
+                not isinstance(action_hash, str) or
+                not re.fullmatch(r"[0-9a-f]{64}", action_hash)):
             raise ValueError("无效工具启动参数")
         with self._write() as conn:
             run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
@@ -1527,21 +1574,60 @@ class Database:
         recovered = []
         with self._write() as conn:
             rows = conn.execute("""
-                SELECT id,version,lease_epoch FROM runs
+                SELECT id,task_id,version,lease_epoch FROM runs
                 WHERE status='running' AND lease_until<=?
                 ORDER BY lease_until,id
             """, (now,)).fetchall()
             for row in rows:
-                updated = conn.execute("""
-                    UPDATE runs SET status='paused',wait_reason='restart',
-                        control_requested=NULL,lease_owner=NULL,lease_until=NULL,
-                        version=version+1,lease_epoch=lease_epoch+1,updated_at=?
-                    WHERE id=? AND status='running' AND version=?
-                """, (now, row["id"], row["version"]))
-                if updated.rowcount != 1:
-                    continue
-                self._append_event_tx(conn, row["id"], "run.paused", {"reason": "restart"},
-                                      f"{row['id']}:run.paused:{row['lease_epoch'] + 1}")
+                conn.execute("SAVEPOINT recovery_one")
+                try:
+                    updated = conn.execute("""
+                        UPDATE runs SET status='paused',wait_reason='restart',
+                            control_requested=NULL,lease_owner=NULL,lease_until=NULL,
+                            version=version+1,lease_epoch=lease_epoch+1,updated_at=?
+                        WHERE id=? AND status='running' AND version=?
+                    """, (now, row["id"], row["version"]))
+                    if updated.rowcount != 1:
+                        conn.execute("RELEASE recovery_one")
+                        continue
+                    self._append_event_tx(conn, row["id"], "run.paused", {"reason": "restart"},
+                                          f"{row['id']}:run.paused:{row['lease_epoch'] + 1}")
+                except EventLimitExceeded:
+                    # A nonterminal pause cannot borrow the 8 KiB terminal reserve.
+                    conn.execute("ROLLBACK TO recovery_one")
+                    conn.execute("RELEASE recovery_one")
+                    unresolved = conn.execute("""
+                        SELECT 1 FROM events AS started
+                        WHERE started.run_id=? AND started.type='tool.started'
+                            AND json_extract(started.payload_json,'$.effect')='effectful'
+                            AND NOT EXISTS (
+                                SELECT 1 FROM messages AS result
+                                WHERE result.run_id=started.run_id AND result.role='tool'
+                                    AND result.tool_call_id=
+                                        json_extract(started.payload_json,'$.call_id'))
+                        LIMIT 1
+                    """, (row["id"],)).fetchone()
+                    if unresolved:
+                        # An exhausted nonterminal quota cannot justify false failure.
+                        # The expired lease remains, and no worker can reclaim it blindly.
+                        continue
+                    conn.execute("""
+                        UPDATE runs SET status='failed',wait_reason=NULL,
+                            control_requested=NULL,lease_owner=NULL,lease_until=NULL,
+                            version=version+1,lease_epoch=lease_epoch+1,
+                            error_json=?,finished_at=?,updated_at=?
+                        WHERE id=? AND status='running' AND version=?
+                    """, (_json({"code": "event_limit_exceeded"}), now, now,
+                          row["id"], row["version"]))
+                    self._append_event_tx(conn, row["id"], "run.failed",
+                                          {"code": "event_limit_exceeded"},
+                                          f"{row['id']}:run.failed")
+                    conn.execute("""
+                        UPDATE tasks SET status='failed',finished_at=?,updated_at=?
+                        WHERE id=? AND status='open'
+                    """, (now, now, row["task_id"]))
+                else:
+                    conn.execute("RELEASE recovery_one")
                 recovered.append(row["id"])
         return recovered
 
@@ -1676,15 +1762,47 @@ class Database:
                 conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone())
 
     def request_control(self, run_id, action, expected_version=None):
-        """Wave 3 can only cancel a queued Run; active control needs Wave 4 Runner."""
-        run = self.get_run(run_id)
-        if not run:
-            raise ResourceNotFound("Run 不存在")
-        if action != "cancel" or run["status"] != "queued":
-            raise InvalidRunTransition("该控制动作需要 Wave 4 Runner")
-        version = run["version"] if expected_version is None else expected_version
-        return self.transition_run(run_id, version, "cancelled", "run.cancelled",
-                                   {"reason": "user_request"})[0]
+        """Persist intent under CAS; the worker honors active controls at a safe point."""
+        if action not in {"pause", "resume", "cancel"}:
+            raise ValueError("无效 Run 控制动作")
+        with self._write() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise ResourceNotFound("Run 不存在")
+            if expected_version is not None and run["version"] != expected_version:
+                raise InvalidRunTransition("Run version 已变化")
+            old = run["status"]
+            if old == "running" and action in {"pause", "cancel"}:
+                if run["control_requested"]:
+                    raise InvalidRunTransition("Run 已有控制请求")
+                conn.execute("""
+                    UPDATE runs SET control_requested=?,version=version+1,updated_at=?
+                    WHERE id=? AND status='running' AND version=?
+                """, (action, _utc_now(), run_id, run["version"]))
+                self._append_event_tx(conn, run_id, "run.control_requested",
+                                      {"action": action})
+            elif old == "paused" and action == "resume":
+                conn.execute("""
+                    UPDATE runs SET status='queued',wait_reason=NULL,version=version+1,
+                        updated_at=? WHERE id=? AND status='paused' AND version=?
+                """, (_utc_now(), run_id, run["version"]))
+                self._append_event_tx(conn, run_id, "run.resumed", {})
+            elif old in {"queued", "paused"} and action == "cancel":
+                now = _utc_now()
+                conn.execute("""
+                    UPDATE runs SET status='cancelled',wait_reason=NULL,version=version+1,
+                        updated_at=?,finished_at=?
+                    WHERE id=? AND status=? AND version=?
+                """, (now, now, run_id, old, run["version"]))
+                self._append_event_tx(conn, run_id, "run.cancelled",
+                                      {"reason": "user_request"})
+                conn.execute("""
+                    UPDATE tasks SET status='cancelled',finished_at=?,updated_at=?
+                    WHERE id=? AND status='open'
+                """, (now, now, run["task_id"]))
+            else:
+                raise InvalidRunTransition("Run 状态不允许此控制动作")
+            return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
 
 
 class _LazyDatabase:

@@ -22,6 +22,8 @@ class RunnerUnavailable(RuntimeError):
 
 
 def allowed_actions(run):
+    if run and run["status"] == "running" and run.get("control_requested"):
+        return []
     return {"queued": ["cancel"], "running": ["pause", "cancel"],
             "paused": ["resume", "cancel"]}.get(run["status"], []) if run else []
 
@@ -75,6 +77,7 @@ class TaskRunner:
     async def _loop(self):
         while not self._closing:
             try:
+                self.database.recover_expired_leases()
                 if await self.run_once():
                     continue
             except Exception:
@@ -96,7 +99,46 @@ class TaskRunner:
         self.database.transition_run(
             run["id"], run["version"], "failed", "run.failed",
             {"code": code}, error={"code": code}, lease_owner=self._owner,
-            lease_epoch=run["lease_epoch"])
+            lease_epoch=run["lease_epoch"], clear_deltas=True)
+
+    def _apply_control(self, run):
+        action = run["control_requested"]
+        if not action:
+            return False
+        self.database.transition_run(
+            run["id"], run["version"], "paused" if action == "pause" else "cancelled",
+            "run.paused" if action == "pause" else "run.cancelled",
+            {"reason": "user_request"}, lease_owner=self._owner,
+            lease_epoch=run["lease_epoch"], clear_deltas=True)
+        return True
+
+    def _unresolved_effectful(self, run):
+        try:
+            checkpoint = json.loads(run["checkpoint_json"])
+            if checkpoint.get("phase") != "tool_pending":
+                return None
+            assistant = self.database.get_message(checkpoint["assistant_message_id"])
+            call = json.loads(assistant["tool_calls_json"])[checkpoint["next_tool_index"]]
+            started = self.database.get_tool_start(run["id"], call["id"])
+            if not started:
+                return None
+            data = json.loads(started["payload_json"])
+            if data["effect"] != "effectful":
+                return None
+            completed = self.database._query_one("""
+                SELECT 1 FROM messages WHERE run_id=? AND role='tool' AND tool_call_id=?
+            """, (run["id"], call["id"]))
+            return None if completed else data
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+
+    def _hold_unknown(self, run, started):
+        outcome = ToolOutcome(started["call_id"], "outcome_unknown", "effectful",
+                              False, "工具结果未确认", None, "unconfirmed_effect")
+        expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        self.database.record_unknown_outcome(
+            run["id"], run["version"], self._owner, run["lease_epoch"],
+            outcome, started["name"], started["action_hash"], expires)
 
     async def _process(self, run):
         run_id = run["id"]
@@ -104,19 +146,25 @@ class TaskRunner:
             snapshot = json.loads(run["config_snapshot_json"])
             max_rounds = max(1, min(20, int(snapshot["max_rounds"])))
             context = self.tool_context_factory(run)
+            started = self.database._query_all(
+                "SELECT payload_json FROM events WHERE run_id=? AND type='tool.started'",
+                (run_id,))
+            context.budget.tool_calls = len(started)
+            context.budget.mcp_calls = sum(
+                json.loads(row["payload_json"])["name"] in context.mcp_tools
+                for row in started)
             while run["status"] == "running":
                 run = self.database.get_run(run_id)
                 if run["status"] != "running":
                     return
-                if run["control_requested"]:
-                    action = run["control_requested"]
-                    self.database.transition_run(
-                        run_id, run["version"], "paused" if action == "pause" else "cancelled",
-                        "run.paused" if action == "pause" else "run.cancelled",
-                        {"reason": "user_request"}, lease_owner=self._owner,
-                        lease_epoch=run["lease_epoch"])
+                if self._apply_control(run):
                     return
                 checkpoint = json.loads(run["checkpoint_json"])
+                if (checkpoint.get("v") != 1 or checkpoint.get("phase") not in
+                        {"model_pending", "tool_pending"} or
+                        not isinstance(checkpoint.get("round"), int) or
+                        checkpoint["round"] < 1):
+                    raise ValueError("invalid_checkpoint")
                 if checkpoint["phase"] == "tool_pending":
                     run = await self._tool_step(run, checkpoint, context)
                     continue
@@ -136,7 +184,13 @@ class TaskRunner:
 
                 result = await asyncio.wait_for(model(
                     messages, run_id=run_id, round_index=round_index,
-                    tool_names=tuple(context.tool_specs), on_delta=on_delta), timeout=90)
+                    tool_names=tuple(name for name, spec in context.tool_specs.items()
+                                     if spec.effects <= context.grants and
+                                     spec.approval == "never"),
+                    on_delta=on_delta), timeout=90)
+                run = self.database.get_run(run_id)
+                if run["status"] != "running" or self._apply_control(run):
+                    return
                 calls = result.get("tool_calls") or []
                 content = result.get("content")
                 if len(_json({"content": content, "tool_calls": calls})) > 64_000:
@@ -161,11 +215,26 @@ class TaskRunner:
                         clear_deltas=True)
                     return
         except InvalidRunTransition:
+            latest = self.database.get_run(run_id)
+            if (latest and latest["status"] == "running" and
+                    latest["lease_owner"] == self._owner and latest["control_requested"]):
+                try:
+                    self._apply_control(latest)
+                except InvalidRunTransition:
+                    pass
             logger.info("Run CAS changed; stopping local worker: %s", run_id)
         except Exception as exc:
             logger.warning("Run failed: %s: %s", run_id, type(exc).__name__)
             latest = self.database.get_run(run_id)
             if latest and latest["status"] == "running":
+                uncertain = self._unresolved_effectful(latest)
+                if uncertain:
+                    try:
+                        self._hold_unknown(latest, uncertain)
+                    except Exception:
+                        # Preserve expired lease for recovery; never mislabel a side effect.
+                        logger.exception("Cannot persist unknown outcome; Run held: %s", run_id)
+                    return
                 code = ("event_limit_exceeded" if isinstance(exc, EventLimitExceeded)
                         else str(exc) if str(exc) in {"provider_snapshot_mismatch",
                                                       "model_step_output_exceeded"}
@@ -193,12 +262,17 @@ class TaskRunner:
         arguments = call["function"]["arguments"]
         action_hash = hashlib.sha256(_json({
             "call_id": call_id, "name": name, "arguments": arguments}).encode()).hexdigest()
-        started = [event for event in self.database.list_events(run["id"], limit=1000)
-                   if event["type"] == "tool.started" and
-                   json.loads(event["payload_json"]).get("call_id") == call_id]
+        duplicate_result = self.database._query_one("""
+            SELECT id FROM messages WHERE run_id=? AND role='tool' AND tool_call_id=?
+            LIMIT 1
+        """, (run["id"], call_id))
+        if duplicate_result:
+            await self._fail(run, "duplicate_tool_call_id")
+            return self.database.get_run(run["id"])
+        started = self.database.get_tool_start(run["id"], call_id)
         if started:
             # Crash after the invocation marker: no approval decision is a replay grant.
-            effect = json.loads(started[-1]["payload_json"])["effect"]
+            effect = json.loads(started["payload_json"])["effect"]
             if effect == "effectful":
                 outcome = ToolOutcome(call_id, "outcome_unknown", effect, False,
                                       "工具结果未确认", None, "restart_unknown")
@@ -211,12 +285,17 @@ class TaskRunner:
             return self.database.get_run(run["id"])
         spec = context.tool_specs.get(name)
         effect = "effectful" if spec and spec.effects - {"read_only", "filesystem.read"} else "read_only"
+        cfg = self.provider_config(run)
+        context = replace(context, secrets=(cfg.api_key,))
         run = self.database.start_tool_call(
             run["id"], run["version"], self._owner, run["lease_epoch"],
             call_id, name, effect, action_hash)
         outcome = await self.tool_executor(replace(context, call_id=call_id), name, arguments)
         if outcome.call_id != call_id:
             raise ValueError("ToolOutcome call_id mismatch")
+        run = self.database.get_run(run["id"])
+        if run["status"] != "running":
+            return run
         if (outcome.status == "outcome_unknown" or
                 (outcome.status == "timeout" and outcome.effect == "effectful"
                  and not outcome.quiesced)):
@@ -237,7 +316,9 @@ class TaskRunner:
         return run
 
     async def control(self, run_id, action, expected_version=None):
-        return self.database.request_control(run_id, action, expected_version)
+        run = self.database.request_control(run_id, action, expected_version)
+        self.wake()
+        return run
 
     async def approval_decided(self, approval_id):
         approval = self.database.get_approval(approval_id)
