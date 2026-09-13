@@ -559,7 +559,10 @@ async def delete_session(session_id: str):
     session = db.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
-    db.delete_session(session_id)
+    try:
+        db.delete_session(session_id)
+    except Exception as exc:
+        return _repository_error(exc)
     logger.info("删除会话输出：session_id=%s", session_id)
     return {"ok": True}
 

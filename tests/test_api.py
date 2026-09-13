@@ -526,6 +526,36 @@ class Wave3RouteTest(unittest.TestCase):
         self.assertEqual(response.json()["code"], "not_found")
         self.assertEqual(set(response.json()), {"code", "message", "details", "trace_id"})
 
+    def test_delete_session_with_active_run_is_409_without_data_loss(self):
+        class ActiveRun(ValueError):
+            code = "run_already_active"
+            existing_run_id = "run-1"
+
+        session = dict(self.database.list_sessions.return_value[0])
+        run = dict(self.run)
+        self.database.get_session.side_effect = lambda _id: session or None
+
+        def delete(_id):
+            if run["status"] == "queued":
+                raise ActiveRun()
+            session.clear()
+
+        self.database.delete_session.side_effect = delete
+        with patch.object(self.api, "db", self.database):
+            conflict = self.client.delete("/api/sessions/agent-1")
+            self.assertEqual(session["id"], "agent-1")
+            self.assertEqual(run["status"], "queued")
+            run["status"] = "completed"
+            deleted = self.client.delete("/api/sessions/agent-1")
+
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.json()["code"], "run_already_active")
+        self.assertEqual(conflict.json()["details"], {"run_id": "run-1"})
+        self.assertEqual(set(conflict.json()), {"code", "message", "details", "trace_id"})
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(deleted.json(), {"ok": True})
+        self.assertFalse(session)
+
 
 class UploadCleanupTest(unittest.TestCase):
     def _rejected(self, filename, content, expected_status, expected_code, parser=None):
