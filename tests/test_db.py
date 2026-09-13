@@ -1,9 +1,12 @@
 """P0 SQLite 迁移与并发一致性测试。"""
 
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -126,6 +129,15 @@ def snapshot(db: Database):
 
 
 class MigrationTest(unittest.TestCase):
+    def test_import_does_not_initialize_production_database(self):
+        result = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import backend.db as module; assert module.db._instance is None"],
+            cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_real_v0_migrates_once_and_repairs_existing_data(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "legacy.db"
@@ -172,6 +184,14 @@ class MigrationTest(unittest.TestCase):
                 )
 
             first_snapshot = snapshot(db)
+            backups = list(path.parent.glob("legacy.db.pre-v3-*.bak"))
+            self.assertEqual(len(backups), 1)
+            with closing(sqlite3.connect(backups[0])) as backup:
+                self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 0)
+                self.assertEqual(
+                    backup.execute("SELECT sequence FROM messages WHERE id=1").fetchone()[0],
+                    7,
+                )
             db.close()
             reopened = Database(path)
             try:
@@ -179,8 +199,32 @@ class MigrationTest(unittest.TestCase):
                 self.assertEqual(
                     reopened._conn.execute("PRAGMA user_version").fetchone()[0], 3
                 )
+                self.assertEqual(len(list(path.parent.glob("legacy.db.pre-v3-*.bak"))), 1)
             finally:
                 reopened.close()
+
+    def test_existing_v2_migrates_to_v3_without_changing_provider_binding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "v2.db"
+            create_v1_settings_database(path)
+            with closing(sqlite3.connect(path)) as conn:
+                conn.execute("ALTER TABLE settings ADD COLUMN credential_base_url TEXT")
+                conn.execute("UPDATE settings SET credential_base_url=base_url")
+                conn.execute("PRAGMA user_version=2")
+                conn.commit()
+            db = Database(path)
+            try:
+                self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(db.get_settings()["credential_base_url"],
+                                 "https://api.example/v1")
+                self.assertEqual(db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+                self.assertEqual(db._conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                backups = list(path.parent.glob("v2.db.pre-v3-*.bak"))
+                self.assertEqual(len(backups), 1)
+                with closing(sqlite3.connect(backups[0])) as backup:
+                    self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 2)
+            finally:
+                db.close()
 
     def test_v1_settings_key_migrates_to_nullable_unbound_origin(self):
         with tempfile.TemporaryDirectory() as tmp:

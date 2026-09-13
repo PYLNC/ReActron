@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from backend.config import BASE_DIR
@@ -59,13 +59,6 @@ def _utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _truncate(text: str, limit: int = 300):
-    """截断日志文本。"""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "...(已截断)"
-
-
 class Database:
     """基于标准库 sqlite3 的轻量数据访问对象。"""
 
@@ -73,6 +66,7 @@ class Database:
         self.db_path = Path(db_path) if db_path else DB_PATH
         self._lock = threading.Lock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._existing_file = self.db_path.exists()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         try:
             self._conn.row_factory = sqlite3.Row
@@ -87,7 +81,7 @@ class Database:
         logger.info("SQLite 数据库已打开：%s", self.db_path)
 
     def _execute(self, sql, params=()):
-        logger.debug("SQL 执行：%s | params=%s", sql, _truncate(str(params), 300))
+        logger.debug("SQL 执行：%s", sql)
         with self._lock:
             try:
                 cursor = self._conn.execute(sql, params)
@@ -98,7 +92,7 @@ class Database:
                 raise
 
     def _query_all(self, sql, params=()):
-        logger.debug("SQL 查询：%s | params=%s", sql, _truncate(str(params), 300))
+        logger.debug("SQL 查询：%s", sql)
         with self._lock:
             cursor = self._conn.execute(sql, params)
             return [dict(row) for row in cursor.fetchall()]
@@ -122,6 +116,15 @@ class Database:
     def _init_tables(self):
         with self._lock:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version < SCHEMA_VERSION and self._existing_file:
+                backup_path = self.db_path.with_name(
+                    f"{self.db_path.name}.pre-v3-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}.bak"
+                )
+                backup = sqlite3.connect(str(backup_path))
+                try:
+                    self._conn.backup(backup)
+                finally:
+                    backup.close()
             if version == 0:
                 self._migrate_0_to_1()
                 version = self._conn.execute("PRAGMA user_version").fetchone()[0]
@@ -692,7 +695,7 @@ class Database:
     def get_session(self, session_id):
         return self._query_one(
             """
-            SELECT id, title, created_at, updated_at, project_id
+            SELECT id, title, created_at, updated_at, project_id, archived_at
             FROM sessions
             WHERE id = ?
             """,
@@ -731,6 +734,12 @@ class Database:
 
     def delete_session(self, session_id):
         with self._write() as conn:
+            active = conn.execute("""
+                SELECT id FROM runs WHERE session_id=?
+                    AND status IN ('queued','running','waiting','paused') LIMIT 1
+            """, (session_id,)).fetchone()
+            if active:
+                raise RunAlreadyActive(active["id"])
             has_task = conn.execute(
                 "SELECT 1 FROM tasks WHERE session_id=? LIMIT 1", (session_id,)
             ).fetchone()
@@ -966,6 +975,11 @@ class Database:
                     """,
                     (session_id,),
                 ).fetchone()[0]
+                session = self._conn.execute(
+                    "SELECT archived_at FROM sessions WHERE id=?", (session_id,)
+                ).fetchone()
+                if not session or session["archived_at"] is not None:
+                    raise ResourceNotFound("Agent 不存在或已归档")
                 self._conn.execute(
                     """
                     INSERT INTO messages
@@ -991,14 +1005,11 @@ class Database:
             except Exception:
                 self._conn.rollback()
                 raise
-        logger.info(
-            "DB 写入消息：session_id=%s，sequence=%d，role=%s，content=%s，"
-            "tool_calls=%s，tool_call_id=%s",
+        logger.debug(
+            "DB 写入消息：session_id=%s，sequence=%d，role=%s，tool_call_id=%s",
             session_id,
             next_sequence,
             role,
-            _truncate(content or "", 300),
-            _truncate(tool_calls_json or "", 300),
             tool_call_id,
         )
 
@@ -1057,6 +1068,11 @@ class Database:
     @staticmethod
     def _insert_message_tx(conn, session_id, role, content=None, *, task_id=None,
                            run_id=None, tool_calls=None, tool_call_id=None):
+        session = conn.execute(
+            "SELECT archived_at FROM sessions WHERE id=?", (session_id,)
+        ).fetchone()
+        if not session or session["archived_at"] is not None:
+            raise ResourceNotFound("Agent 不存在或已归档")
         sequence = conn.execute(
             "SELECT COALESCE(MAX(sequence),0)+1 FROM messages WHERE session_id=?",
             (session_id,),
@@ -1179,14 +1195,27 @@ class Database:
             if existing["request_hash"] != fingerprint:
                 raise IdempotencyKeyReused("Idempotency-Key 已用于不同请求")
             return dict(existing), False
+        session = conn.execute(
+            "SELECT archived_at FROM sessions WHERE id=?", (task["session_id"],)
+        ).fetchone()
+        if not session or session["archived_at"] is not None:
+            raise ResourceNotFound("Agent 不存在或已归档")
         active = conn.execute("""
             SELECT id FROM runs WHERE session_id=? AND
                 status IN ('queued','running','waiting','paused') LIMIT 1
         """, (task["session_id"],)).fetchone()
         if active:
             raise RunAlreadyActive(active["id"])
+        retry = isinstance(options, dict) and options.get("retry") is True
+        if task["status"] == "open" and retry:
+            raise InvalidRunTransition("open Task 不需要 retry")
         if task["status"] != "open":
-            raise InvalidRunTransition("Task 已结束；仅显式 retry 可新建 Run")
+            if task["status"] not in {"failed", "cancelled"} or not retry:
+                raise InvalidRunTransition("Task 已结束；仅 failed/cancelled 可显式 retry")
+            conn.execute("""
+                UPDATE tasks SET status='open',finished_at=NULL,result_json=NULL,
+                    updated_at=? WHERE id=?
+            """, (_utc_now(), task["id"]))
         if config_snapshot is None or tool_snapshot is None:
             frozen_config, frozen_tools = self._default_run_snapshots_tx(conn)
             config_snapshot = frozen_config if config_snapshot is None else config_snapshot
@@ -1217,12 +1246,17 @@ class Database:
             task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 raise ResourceNotFound("Task 不存在")
-            return self._insert_run_tx(conn, task, idempotency_key, options or {},
+            return self._insert_run_tx(conn, task, idempotency_key,
+                                       {} if options is None else options,
                                        config_snapshot, tool_snapshot)
 
     def create_legacy_chat_run(self, agent_id, goal, idempotency_key, options=None,
                                config_snapshot=None, tool_snapshot=None):
-        options = options or {}
+        options = {} if options is None else options
+        if not isinstance(options, dict):
+            raise ValueError("Run options 必须为对象")
+        if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key.strip()) <= 200:
+            raise ValueError("Idempotency-Key 必须为 1..200 字符")
         goal, _, _ = self._task_values(goal, None, None)
         fingerprint = hashlib.sha256(_json({
             "session_id": agent_id, "goal": goal, "options": options,
@@ -1247,7 +1281,8 @@ class Database:
         return self._query_one("SELECT * FROM runs WHERE id=?", (run_id,))
 
     @staticmethod
-    def _append_event_tx(conn, run_id, event_type, payload=None, dedupe_key=None):
+    def _append_event_tx(conn, run_id, event_type, payload=None, dedupe_key=None,
+                         *, terminal_reserve=False):
         if not isinstance(event_type, str) or not 1 <= len(event_type) <= 80:
             raise ValueError("无效 Event type")
         if payload is None:
@@ -1255,11 +1290,13 @@ class Database:
         if not isinstance(payload, dict):
             raise ValueError("Event payload 必须为对象")
         run = conn.execute(
-            "SELECT task_id,session_id,event_bytes_written FROM runs WHERE id=?",
+            "SELECT task_id,session_id,status,event_bytes_written FROM runs WHERE id=?",
             (run_id,),
         ).fetchone()
         if not run:
             raise ResourceNotFound("Run 不存在")
+        if event_type in TERMINAL_EVENTS and run["status"] != event_type.removeprefix("run."):
+            raise InvalidRunTransition("终态 Event 必须与 Run 状态同事务提交")
         if dedupe_key is not None:
             existing = conn.execute(
                 "SELECT * FROM events WHERE dedupe_key=?", (dedupe_key,)
@@ -1285,7 +1322,8 @@ class Database:
             "data": payload,
         }
         size = len(_json(envelope).encode("utf-8"))
-        limit = MAX_RUN_EVENT_BYTES if event_type in TERMINAL_EVENTS else MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE
+        limit = (MAX_RUN_EVENT_BYTES if event_type in TERMINAL_EVENTS or terminal_reserve
+                 else MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE)
         if size > MAX_EVENT_BYTES or run["event_bytes_written"] + size > limit:
             raise EventLimitExceeded("Event 超出持久化字节额度")
         conn.execute(
@@ -1295,6 +1333,8 @@ class Database:
         return dict(conn.execute("SELECT * FROM events WHERE id=?", (cursor.lastrowid,)).fetchone())
 
     def append_event(self, run_id, event_type, payload=None, dedupe_key=None):
+        if isinstance(event_type, str) and event_type.startswith("run."):
+            raise InvalidRunTransition("Run 状态 Event 必须与状态同事务提交")
         with self._write() as conn:
             return self._append_event_tx(conn, run_id, event_type, payload, dedupe_key)
 
@@ -1316,5 +1356,314 @@ class Database:
     def get_message(self, message_id):
         return self._query_one("SELECT * FROM messages WHERE id=?", (message_id,))
 
+    @staticmethod
+    def _lease_deadline(seconds):
+        if not 1 <= seconds <= 3600:
+            raise ValueError("lease_seconds 必须为 1..3600")
+        return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z")
 
-db = Database()
+    def claim_next_run(self, lease_owner, lease_seconds=30):
+        if not isinstance(lease_owner, str) or not lease_owner:
+            raise ValueError("lease_owner 不能为空")
+        deadline = self._lease_deadline(lease_seconds)
+        with self._write() as conn:
+            candidate = conn.execute("""
+                SELECT * FROM runs WHERE status='queued'
+                ORDER BY created_at,id LIMIT 1
+            """).fetchone()
+            if not candidate:
+                return None
+            now = _utc_now()
+            checkpoint = candidate["checkpoint_json"] or _json({
+                "v": 1, "phase": "model_pending", "round": 1
+            })
+            updated = conn.execute("""
+                UPDATE runs SET status='running', version=version+1,
+                    lease_epoch=lease_epoch+1, lease_owner=?, lease_until=?,
+                    checkpoint_json=?, started_at=COALESCE(started_at,?),
+                    heartbeat_at=?, updated_at=?
+                WHERE id=? AND status='queued' AND version=?
+            """, (lease_owner, deadline, checkpoint, now, now, now,
+                  candidate["id"], candidate["version"]))
+            if updated.rowcount != 1:
+                return None
+            self._append_event_tx(conn, candidate["id"], "run.started",
+                                  {"lease_epoch": candidate["lease_epoch"] + 1},
+                                  f"{candidate['id']}:run.started:{candidate['lease_epoch'] + 1}")
+            return dict(conn.execute("SELECT * FROM runs WHERE id=?", (candidate["id"],)).fetchone())
+
+    def heartbeat_run(self, run_id, lease_owner, lease_epoch, expected_version,
+                      lease_seconds=30):
+        deadline = self._lease_deadline(lease_seconds)
+        with self._write() as conn:
+            now = _utc_now()
+            updated = conn.execute("""
+                UPDATE runs SET lease_until=?,heartbeat_at=?,updated_at=?,version=version+1
+                WHERE id=? AND status='running' AND lease_owner=?
+                    AND lease_epoch=? AND version=? AND lease_until>?
+            """, (deadline, now, now, run_id, lease_owner, lease_epoch,
+                  expected_version, now))
+            if updated.rowcount != 1:
+                raise InvalidRunTransition("Run lease/version 已变化")
+            return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+
+    def transition_run(self, run_id, expected_version, status, event_type,
+                       payload=None, *, checkpoint=None, message=None,
+                       lease_owner=None, lease_epoch=None, wait_reason=None,
+                       error=None):
+        """One CAS commit for status, checkpoint, message, and semantic events."""
+        if status in {"completed", "failed", "cancelled"} and event_type != f"run.{status}":
+            raise InvalidRunTransition("终态 Event type 不匹配")
+        if status not in {"completed", "failed", "cancelled"} and event_type in TERMINAL_EVENTS:
+            raise InvalidRunTransition("非终态不可写终态 Event")
+        if checkpoint is not None and len(_json(checkpoint).encode()) > MAX_EVENT_BYTES:
+            raise ValueError("checkpoint 超过 64 KiB")
+        with self._write() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise ResourceNotFound("Run 不存在")
+            if run["version"] != expected_version:
+                raise InvalidRunTransition("Run version 已变化")
+            if run["status"] == "running" and (
+                lease_owner != run["lease_owner"] or lease_epoch != run["lease_epoch"]
+                or run["lease_until"] <= _utc_now()
+            ):
+                raise InvalidRunTransition("Run lease 已变化")
+            if status == "running" and run["status"] != "running":
+                raise InvalidRunTransition("只能由 claim 进入 running")
+            now = _utc_now()
+            terminal = status in {"completed", "failed", "cancelled"}
+            updated = conn.execute("""
+                UPDATE runs SET status=?,wait_reason=?,control_requested=NULL,
+                    version=version+1,lease_owner=?,lease_until=?,
+                    checkpoint_json=COALESCE(?,checkpoint_json),
+                    error_json=COALESCE(?,error_json),updated_at=?,
+                    finished_at=CASE WHEN ? THEN ? ELSE finished_at END
+                WHERE id=? AND version=?
+            """, (status, wait_reason, run["lease_owner"] if status == "running" else None,
+                  run["lease_until"] if status == "running" else None,
+                  _json(checkpoint) if checkpoint is not None else None,
+                  _json(error) if error is not None else None,
+                  now, terminal, now, run_id, expected_version))
+            if updated.rowcount != 1:
+                raise InvalidRunTransition("Run version 已变化")
+            message_id = None
+            if message is not None:
+                if not isinstance(message, dict):
+                    raise ValueError("message 必须为对象")
+                message_id = self._insert_message_tx(
+                    conn, run["session_id"], message.get("role"), message.get("content"),
+                    task_id=run["task_id"], run_id=run_id,
+                    tool_calls=message.get("tool_calls"),
+                    tool_call_id=message.get("tool_call_id"),
+                )
+                content = message.get("content") or ""
+                self._append_event_tx(conn, run_id, "message.completed", {
+                    "message_id": message_id,
+                    "hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    "length": len(content),
+                }, f"{run_id}:message.completed:{message_id}",
+                    terminal_reserve=terminal)
+            self._append_event_tx(conn, run_id, event_type, payload,
+                                  f"{run_id}:{event_type}" if terminal else None)
+            if terminal:
+                conn.execute("""
+                    UPDATE tasks SET status=?,finished_at=?,updated_at=?
+                    WHERE id=? AND status='open'
+                """, (status, now, now, run["task_id"]))
+            return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), message_id
+
+    def recover_expired_leases(self, now=None):
+        """Startup scan pauses, never re-executes an uncertain tool."""
+        now = now or _utc_now()
+        recovered = []
+        with self._write() as conn:
+            rows = conn.execute("""
+                SELECT id,version,lease_epoch FROM runs
+                WHERE status='running' AND lease_until<=?
+                ORDER BY lease_until,id
+            """, (now,)).fetchall()
+            for row in rows:
+                updated = conn.execute("""
+                    UPDATE runs SET status='paused',wait_reason='restart',
+                        control_requested=NULL,lease_owner=NULL,lease_until=NULL,
+                        version=version+1,lease_epoch=lease_epoch+1,updated_at=?
+                    WHERE id=? AND status='running' AND version=?
+                """, (now, row["id"], row["version"]))
+                if updated.rowcount != 1:
+                    continue
+                self._append_event_tx(conn, row["id"], "run.paused", {"reason": "restart"},
+                                      f"{row['id']}:run.paused:{row['lease_epoch'] + 1}",
+                                      terminal_reserve=True)
+                recovered.append(row["id"])
+        return recovered
+
+    def create_approval(self, run_id, tool_call_id, kind, action_hash,
+                        request_summary, expires_at):
+        if kind not in {"pre_execution", "resolve_unknown_outcome"}:
+            raise ValueError("无效 Approval kind")
+        if not isinstance(tool_call_id, str) or not tool_call_id or not action_hash:
+            raise ValueError("tool_call_id/action_hash 不能为空")
+        if not isinstance(request_summary, dict) or not isinstance(expires_at, str):
+            raise ValueError("无效 Approval 请求")
+        summary_json = _json(request_summary)
+        if len(summary_json.encode()) > MAX_EVENT_BYTES:
+            raise ValueError("Approval 摘要过大")
+        with self._write() as conn:
+            if not conn.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone():
+                raise ResourceNotFound("Run 不存在")
+            existing = conn.execute("""
+                SELECT * FROM approvals WHERE run_id=? AND tool_call_id=?
+                    AND kind=? AND action_hash=?
+            """, (run_id, tool_call_id, kind, action_hash)).fetchone()
+            if existing:
+                if existing["request_summary_json"] != summary_json:
+                    raise InvalidRunTransition("Approval action_hash 摘要冲突")
+                return dict(existing)
+            approval_id, now = str(uuid.uuid4()), _utc_now()
+            conn.execute("""
+                INSERT INTO approvals
+                    (id,run_id,tool_call_id,kind,action_hash,request_summary_json,
+                     status,expires_at,created_at)
+                VALUES (?,?,?,?,?,?,'pending',?,?)
+            """, (approval_id, run_id, tool_call_id, kind, action_hash,
+                  summary_json, expires_at, now))
+            return dict(conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone())
+
+    def get_approval(self, approval_id):
+        return self._query_one("SELECT * FROM approvals WHERE id=?", (approval_id,))
+
+    def list_approvals(self, run_id=None, status="pending", limit=50):
+        if status not in {"pending", "resolved", "expired", None} or not 1 <= limit <= 100:
+            raise ValueError("无效 Approval 查询")
+        return self._query_all("""
+            SELECT * FROM approvals
+            WHERE (? IS NULL OR run_id=?) AND (? IS NULL OR status=?)
+            ORDER BY created_at,id LIMIT ?
+        """, (run_id, run_id, status, status, limit))
+
+    def decide_approval(self, approval_id, decision, decided_by="local-host", note=None):
+        allowed = {
+            "pre_execution": {"approve", "deny"},
+            "resolve_unknown_outcome": {"occurred", "not_occurred", "explicit_retry", "cancel"},
+        }
+        if note is not None and (not isinstance(note, str) or len(note) > 2000):
+            raise ValueError("Approval note 过长")
+        if not isinstance(decided_by, str) or not decided_by:
+            raise ValueError("decided_by 不能为空")
+        with self._write() as conn:
+            row = conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+            if not row:
+                raise ResourceNotFound("Approval 不存在")
+            if decision not in allowed[row["kind"]]:
+                raise ValueError("该 Approval 不接受此 decision")
+            decision_json = _json({"decision": decision, "note": note})
+            if row["status"] == "resolved" and row["decision_json"] == decision_json:
+                return dict(row)
+            if row["status"] != "pending" or row["expires_at"] <= _utc_now():
+                raise InvalidRunTransition("Approval 已决定或已过期")
+            now = _utc_now()
+            updated = conn.execute("""
+                UPDATE approvals SET status='resolved',decided_at=?,decided_by=?,
+                    decision_json=? WHERE id=? AND status='pending'
+            """, (now, decided_by, decision_json, approval_id))
+            if updated.rowcount != 1:
+                raise InvalidRunTransition("Approval 已决定")
+            # Decision is evidence only. In particular, explicit_retry never calls a tool.
+            return dict(conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone())
+
+    def expire_approvals(self, now=None):
+        now = now or _utc_now()
+        with self._write() as conn:
+            return conn.execute("""
+                UPDATE approvals SET status='expired'
+                WHERE status='pending' AND expires_at<=?
+            """, (now,)).rowcount
+
+    def record_unknown_outcome(self, run_id, expected_version, lease_owner,
+                               lease_epoch, outcome, tool_name, action_hash,
+                               expires_at):
+        """Persist uncertainty and independent resolution request; never retry."""
+        if not (outcome.status == "outcome_unknown" or
+                (outcome.status == "timeout" and outcome.effect == "effectful"
+                 and not outcome.quiesced)):
+            raise ValueError("ToolOutcome 不是未知副作用")
+        if not isinstance(action_hash, str) or len(action_hash) != 64 or any(
+            char not in "0123456789abcdef" for char in action_hash
+        ):
+            raise ValueError("action_hash 必须为 SHA-256 hex")
+        if not isinstance(tool_name, str) or not tool_name or not outcome.call_id:
+            raise ValueError("tool_name/call_id 不能为空")
+        with self._write() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise ResourceNotFound("Run 不存在")
+            if (run["status"] != "running" or run["version"] != expected_version or
+                    run["lease_owner"] != lease_owner or run["lease_epoch"] != lease_epoch or
+                    run["lease_until"] <= _utc_now()):
+                raise InvalidRunTransition("Run lease/version 已变化")
+            now, approval_id = _utc_now(), str(uuid.uuid4())
+            summary = _json({"tool_name": tool_name, "effect": outcome.effect,
+                             "error_code": outcome.error_code})
+            conn.execute("""
+                INSERT INTO approvals
+                    (id,run_id,tool_call_id,kind,action_hash,request_summary_json,
+                     status,expires_at,created_at)
+                VALUES (?,?,?,'resolve_unknown_outcome',?,?,'pending',?,?)
+            """, (approval_id, run_id, outcome.call_id, action_hash,
+                  summary, expires_at, now))
+            updated = conn.execute("""
+                UPDATE runs SET status='waiting',wait_reason='approval',
+                    control_requested=NULL,lease_owner=NULL,lease_until=NULL,
+                    version=version+1,updated_at=?
+                WHERE id=? AND status='running' AND version=?
+            """, (now, run_id, expected_version))
+            if updated.rowcount != 1:
+                raise InvalidRunTransition("Run version 已变化")
+            self._append_event_tx(conn, run_id, "tool.outcome_unknown", {
+                "call_id": outcome.call_id, "name": tool_name,
+                "effect": outcome.effect, "error_code": outcome.error_code,
+                "approval_id": approval_id,
+            }, f"{run_id}:{outcome.call_id}:tool.outcome_unknown",
+                terminal_reserve=True)
+            return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), dict(
+                conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone())
+
+    def request_control(self, run_id, action, expected_version=None):
+        """Wave 3 can only cancel a queued Run; active control needs Wave 4 Runner."""
+        run = self.get_run(run_id)
+        if not run:
+            raise ResourceNotFound("Run 不存在")
+        if action != "cancel" or run["status"] != "queued":
+            raise InvalidRunTransition("该控制动作需要 Wave 4 Runner")
+        version = run["version"] if expected_version is None else expected_version
+        return self.transition_run(run_id, version, "cancelled", "run.cancelled",
+                                   {"reason": "user_request"})[0]
+
+
+class _LazyDatabase:
+    """Keep production migration out of module import; lifespan opens it explicitly."""
+
+    def __init__(self):
+        self._instance = None
+        self._lock = threading.Lock()
+
+    def initialize(self):
+        with self._lock:
+            if self._instance is None:
+                self._instance = Database()
+            return self._instance
+
+    def close(self):
+        with self._lock:
+            instance, self._instance = self._instance, None
+        if instance is not None:
+            instance.close()
+
+    def __getattr__(self, name):
+        return getattr(self.initialize(), name)
+
+
+db = _LazyDatabase()
