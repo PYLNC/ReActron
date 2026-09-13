@@ -63,7 +63,7 @@ _api_router_loaded = False
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """按配置、数据库和 MCP 的现有边界启动，并反序关闭。"""
+    """按配置、数据库、Runner、MCP 顺序启动，反序关闭。"""
     global _api_router_loaded
 
     cfg = load_config()
@@ -85,9 +85,13 @@ async def lifespan(application: FastAPI):
 
     logger.info("应用启动：max_rounds=%d，db=%s", cfg.max_rounds, DB_PATH)
 
-    from backend.mcp.manager import get_manager
+    from backend.runtime import get_runner
 
+    runner = get_runner()
     try:
+        await runner.start()
+        from backend.mcp.manager import get_manager
+
         try:
             await get_manager().refresh_registry()
             logger.info("MCP 启动刷新完成")
@@ -99,8 +103,11 @@ async def lifespan(application: FastAPI):
         print(f"[ReActron] One-time local bootstrap secret: {secret}", file=sys.stderr, flush=True)
         yield
     finally:
-        db.close()
-        logger.info("应用关闭：数据库连接已关闭")
+        try:
+            await runner.close()
+        finally:
+            db.close()
+            logger.info("应用关闭：数据库连接已关闭")
 
 
 app = FastAPI(title="ReActron Agent 框架", version="0.9.0", lifespan=lifespan)

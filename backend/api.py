@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -11,13 +10,13 @@ from pathlib import Path
 from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from backend.agent import Agent
 from backend.db import DATA_DIR, db
 from backend.file_parser import parse_uploaded_file
 from backend.harness import get_harness, run_self_tests
 from backend.mcp.manager import get_manager
 from backend.schemas import (
     AgentListResponse,
+    ApprovalDecisionRequest,
     ChatRequest,
     BootstrapRequest,
     ConfigResponse,
@@ -26,6 +25,7 @@ from backend.schemas import (
     ProjectCreateRequest,
     ProjectRenameRequest,
     RunCreateRequest,
+    RunControlRequest,
     RunResponse,
     SessionCreateRequest,
     SessionListResponse,
@@ -43,13 +43,11 @@ from backend.services import (
     InvalidBaseUrl,
     ProviderKeyReentryRequired,
     get_public_settings,
-    get_runtime_config,
     save_public_settings,
 )
 from backend.skills import (
     SKILLS,
     TOOL_DEFINITIONS,
-    build_system_prompt,
     get_skills_info,
 )
 
@@ -64,11 +62,10 @@ def _require_local_session(request: Request):
     return require_host_session(request)
 
 
-def _make_chat_context(session_id: str):
-    """仅由服务端冻结内建工具与最小安全 grant。"""
-    from backend.tool_gateway import make_builtin_run_context
+def _runner():
+    from backend.runtime import get_runner
 
-    return make_builtin_run_context(run_id=session_id)
+    return get_runner()
 
 
 router = APIRouter(prefix="/api", dependencies=[Depends(_require_local_session)])
@@ -77,24 +74,6 @@ public_router = APIRouter(prefix="/api")
 UPLOAD_DIR = DATA_DIR / "uploads"
 ALLOWED_UPLOAD_EXTENSIONS = {".xlsx", ".pptx", ".csv", ".txt", ".md", ".json", ".log"}
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024
-
-# ponytail: single-process gate; delete when P1's persisted active-Run index lands.
-_active_session_ids = set()
-_active_session_lock = threading.Lock()
-
-
-def _reserve_session(session_id: str) -> bool:
-    with _active_session_lock:
-        if session_id in _active_session_ids:
-            return False
-        _active_session_ids.add(session_id)
-        return True
-
-
-def _release_session(session_id: str):
-    with _active_session_lock:
-        _active_session_ids.discard(session_id)
-
 
 def _error_response(status_code: int, code: str, message: str, details=None):
     return JSONResponse(
@@ -120,6 +99,8 @@ def _repository_error(exc: Exception):
         return _error_response(409, code, "该 Agent 已有活动 Run", {"run_id": run_id} if run_id else {})
     if code == "invalid_run_transition":
         return _error_response(409, code, "当前 Run 状态不允许此操作")
+    if code == "runner_unavailable":
+        return _error_response(503, code, "Runner 暂不可用")
     if isinstance(exc, ValueError):
         return _error_response(422, "invalid_request", "请求参数无效")
     raise exc
@@ -141,6 +122,8 @@ def _task_response(row: dict) -> dict:
 
 
 def _run_response(row: dict) -> dict:
+    from backend.runtime import allowed_actions
+
     return {
         "run_id": row["id"],
         "task_id": row["task_id"],
@@ -152,13 +135,85 @@ def _run_response(row: dict) -> dict:
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
         "last_event_id": db.get_last_event_id(row["id"]),
-        "allowed_actions": [],  # Wave 4 才开放 control/Runner。
+        "allowed_actions": allowed_actions(row),
     }
 
 
-def _sse(event: dict) -> str:
-    """把事件包装成 SSE data 行。"""
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+def _cursor(raw: str, last_event_id: int) -> int:
+    if not raw or not raw.isascii() or not raw.isdigit():
+        raise ValueError("invalid cursor")
+    value = int(raw)
+    if value > last_event_id:
+        raise ValueError("future cursor")
+    return value
+
+
+def _event_envelope(row: dict, run: dict) -> dict:
+    return {
+        "v": 1,
+        "event_id": row["id"],
+        "task_id": row["task_id"],
+        "run_id": row["run_id"],
+        "agent_id": run["session_id"],
+        "type": row["type"],
+        "ts": row["created_at"],
+        "data": json.loads(row["payload_json"]),
+    }
+
+
+def _sse(event: dict, data: dict | None = None) -> str:
+    payload = event if data is None else data
+    return (
+        f"id: {event['event_id']}\n"
+        f"event: {event['type']}\n"
+        f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    )
+
+
+async def _legacy_event(event: dict) -> dict | None:
+    kind, data = event["type"], event["data"]
+    if kind == "model.started":
+        return {"type": "round", "round": data.get("round", 0)}
+    if kind == "message.completed":
+        message = await asyncio.to_thread(db.get_message, data.get("message_id"))
+        if message and message["role"] == "assistant" and message["content"]:
+            return {"type": "text", "content": message["content"]}
+    if kind == "tool.requested":
+        return {"type": "tool_call", "name": data.get("name", "")}
+    if kind in {"tool.completed", "tool.failed"}:
+        return {"type": "tool_result", "name": data.get("name", ""),
+                "ok": kind == "tool.completed", "message": data.get("result_summary", "")}
+    if kind == "run.completed":
+        return {"type": "done", "rounds": data.get("rounds", 0),
+                "total_ms": data.get("duration_ms", 0)}
+    if kind in {"run.failed", "run.cancelled"}:
+        return {"type": "error", "message": "运行失败" if kind == "run.failed" else "运行已取消"}
+    return None
+
+
+async def _follow_events(run: dict, cursor: int, request: Request, *, legacy=False):
+    run_id = run["id"]
+    while True:
+        rows = await asyncio.to_thread(db.list_events, run_id, cursor, 100)
+        for row in rows:
+            cursor = row["id"]
+            event = _event_envelope(row, run)
+            if legacy:
+                translated = await _legacy_event(event)
+                if translated is not None:
+                    yield _sse(event, translated)
+            else:
+                yield _sse(event)
+        current = await asyncio.to_thread(db.get_run, run_id)
+        if current is None:
+            break
+        last_id = await asyncio.to_thread(db.get_last_event_id, run_id)
+        if current["status"] in {"completed", "failed", "cancelled"} and cursor >= last_id:
+            break
+        if await request.is_disconnected():
+            break
+        if await _runner().wait_for_change(run_id, cursor, timeout=15) <= cursor:
+            yield ": ping\n\n"
 
 
 def _make_session_title(message: str) -> str:
@@ -260,6 +315,7 @@ async def create_run(
         row, _created = await asyncio.to_thread(db.create_run, task_id, key)
     except Exception as exc:
         return _repository_error(exc)
+    _runner().wake()
     snapshot = await asyncio.to_thread(_run_response, row)
     response.headers["Location"] = f"/api/runs/{row['id']}"
     return snapshot
@@ -271,6 +327,93 @@ async def get_run(run_id: str):
     if not row:
         return _error_response(404, "not_found", "资源不存在")
     return await asyncio.to_thread(_run_response, row)
+
+
+@router.post("/runs/{run_id}/control", status_code=202, response_model=RunResponse)
+async def control_run(run_id: str, payload: RunControlRequest):
+    if not await asyncio.to_thread(db.get_run, run_id):
+        return _error_response(404, "not_found", "资源不存在")
+    try:
+        row = await _runner().control(run_id, payload.action)
+    except Exception as exc:
+        return _repository_error(exc)
+    return await asyncio.to_thread(_run_response, row)
+
+
+@router.get("/runs/{run_id}/events")
+async def run_events(run_id: str, request: Request, after_id: str | None = None):
+    run = await asyncio.to_thread(db.get_run, run_id)
+    if not run:
+        return _error_response(404, "not_found", "资源不存在")
+    raw = request.headers.get("last-event-id")
+    try:
+        cursor = _cursor(raw if raw is not None else (after_id if after_id is not None else "0"),
+                         await asyncio.to_thread(db.get_last_event_id, run_id))
+    except ValueError:
+        return _error_response(400, "invalid_cursor", "Event 游标无效")
+    return StreamingResponse(
+        _follow_events(run, cursor, request), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/messages/{message_id}")
+async def get_message(message_id: int):
+    row = await asyncio.to_thread(db.get_message, message_id)
+    if not row or not await asyncio.to_thread(db.get_session, row["session_id"]):
+        return _error_response(404, "not_found", "资源不存在")
+    return {
+        "message_id": row["id"], "agent_id": row["session_id"],
+        "task_id": row["task_id"], "run_id": row["run_id"],
+        "role": row["role"], "content": row["content"],
+        "created_at": row["created_at"],
+    }
+
+
+def _approval_response(row: dict, run: dict) -> dict:
+    return {
+        "approval_id": row["id"], "run_id": row["run_id"],
+        "agent_id": run["session_id"], "tool_call_id": row["tool_call_id"],
+        "kind": row["kind"], "action_hash": row["action_hash"],
+        "request_summary": json.loads(row["request_summary_json"]),
+        "status": row["status"], "expires_at": row["expires_at"],
+        "decided_at": row["decided_at"],
+        "decision": json.loads(row["decision_json"]) if row["decision_json"] else None,
+    }
+
+
+async def _visible_approval(row: dict):
+    run = await asyncio.to_thread(db.get_run, row["run_id"])
+    session = (await asyncio.to_thread(db.get_session, run["session_id"])) if run else None
+    return run if session and not session.get("archived_at") else None
+
+
+@router.get("/approvals")
+async def list_approvals(agent_id: str | None = None, status: str = Query("pending", pattern="^pending$"),
+                         limit: int = Query(50, ge=1, le=100)):
+    rows = await asyncio.to_thread(db.list_approvals, None, status, limit)
+    approvals = []
+    for row in rows:
+        run = await _visible_approval(row)
+        if run and (agent_id is None or agent_id == run["session_id"]):
+            approvals.append(_approval_response(row, run))
+    return {"approvals": approvals}
+
+
+@router.post("/approvals/{approval_id}/decision")
+async def decide_approval(approval_id: str, payload: ApprovalDecisionRequest,
+                          principal=Depends(_require_local_session)):
+    row = await asyncio.to_thread(db.get_approval, approval_id)
+    run = await _visible_approval(row) if row else None
+    if not run:
+        return _error_response(404, "not_found", "资源不存在")
+    try:
+        decided = await asyncio.to_thread(db.decide_approval, approval_id, payload.decision,
+                                          principal.actor_id, payload.note)
+    except Exception as exc:
+        return _repository_error(exc)
+    await _runner().approval_decided(approval_id)
+    return _approval_response(decided, run)
 
 
 @router.get("/agents", response_model=AgentListResponse)
@@ -568,8 +711,9 @@ async def delete_session(session_id: str):
 
 
 @router.post("/chat")
-async def chat(payload: ChatRequest):
-    """接收消息，按会话持久化并 SSE 流式返回 Agent 执行过程。"""
+async def chat(payload: ChatRequest, request: Request,
+               idempotency_key: str | None = Header(None, alias="Idempotency-Key")):
+    """旧入口仅创建持久 Run 并订阅；浏览器断流不影响 Runner。"""
     message = payload.message.strip()
     if not message:
         return _error_response(400, "invalid_request", "message 不能为空")
@@ -588,73 +732,15 @@ async def chat(payload: ChatRequest):
         session_id = session["id"]
         logger.info("自动创建会话：%s", session_id)
 
-    if not _reserve_session(session_id):
-        return _error_response(
-            409,
-            "run_already_active",
-            "该会话已有活动执行",
-            {"session_id": session_id},
-        )
-
     try:
-        # reserve 必须先于消息写入，拒绝请求不能留下孤立 user message。
-        run_context = _make_chat_context(session_id)
-        db.add_message(session_id, "user", message)
-        session = db.get_session(session_id)
-        if session and session["title"] in ("新会话", ""):
-            db.rename_session(session_id, _make_session_title(message))
-        history = db.get_messages(session_id)
-        cfg = get_runtime_config()
-    except Exception as exc:
-        _release_session(session_id)
-        if getattr(exc, "code", None) == "not_found":
-            return _error_response(404, "not_found", "资源不存在")
-        raise
-    logger.info("聊天请求：session_id=%s，历史消息数=%d", session_id, len(history))
-    logger.info(
-        "聊天运行配置：max_rounds=%d，tool_timeout=%.1f，"
-        "api_key_configured=%s",
-        cfg.max_rounds,
-        cfg.tool_timeout,
-        bool(cfg.api_key),
-    )
-
-    async def persist_message(message_dict: dict):
-        """把 Agent 产生的助手消息和工具消息写入当前会话。"""
-        await asyncio.to_thread(
-            db.add_message,
-            session_id,
-            message_dict.get("role"),
-            message_dict.get("content"),
-            message_dict.get("tool_calls"),
-            message_dict.get("tool_call_id"),
+        _task, run = await asyncio.to_thread(
+            db.create_legacy_chat_run, session_id, message, idempotency_key or uuid.uuid4().hex
         )
-
-    async def event_stream():
-        try:
-            if not cfg.api_key:
-                raise ValueError("缺少 API Key，请先在前端设置中配置")
-            agent = Agent(
-                api_key=cfg.api_key,
-                base_url=cfg.base_url,
-                model=cfg.model,
-                max_rounds=cfg.max_rounds,
-                tool_timeout=cfg.tool_timeout,
-                on_message=persist_message,
-                system_prompt=build_system_prompt(),
-                run_context=run_context,
-            )
-            async for event in agent.run(history):
-                _log_sse_event(event)
-                yield _sse(event)
-            logger.info("SSE 响应完成，session_id=%s", session_id)
-        except Exception:
-            logger.error("处理 /api/chat 请求失败")
-            yield _sse({"type": "error", "message": "请求失败"})
-        finally:
-            _release_session(session_id)
-
+    except Exception as exc:
+        return _repository_error(exc)
+    _runner().wake()
     return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream; charset=utf-8",
+        _follow_events(run, 0, request, legacy=True),
+        media_type="text/event-stream",
+        headers={"X-ReActron-Run-ID": run["id"], "Cache-Control": "no-cache"},
     )

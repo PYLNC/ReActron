@@ -8,7 +8,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
 from zipfile import ZipFile
 from pathlib import Path
@@ -24,86 +23,35 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 ROOT = Path(__file__).resolve().parent.parent
 
 
-class _ArchivedResource(ValueError):
-    code = "not_found"
-
-
-class _FakeChatDatabase:
+class _FakeRunner:
     def __init__(self):
-        self.messages = []
-        self.get_messages_calls = 0
-        self.archived_at = None
-        self.archive_on_write = False
-        self._lock = threading.Lock()
+        self.wakes = 0
+        self.started = False
+        self.closed = False
+        self.control_result = None
+        self.control_error = None
+        self.approval_calls = []
 
-    def get_session(self, session_id):
-        if session_id != "session-1":
-            return None
-        return {"id": session_id, "title": "existing", "archived_at": self.archived_at}
+    def wake(self):
+        self.wakes += 1
 
-    def add_message(self, session_id, role, content, *unused):
-        with self._lock:
-            if self.archive_on_write:
-                self.archived_at = "2026-09-13T00:00:00Z"
-            if self.archived_at:
-                raise _ArchivedResource()
-            self.messages.append((session_id, role, content))
+    async def start(self):
+        self.started = True
 
-    def get_messages(self, session_id):
-        with self._lock:
-            self.get_messages_calls += 1
-            return [
-                {"role": role, "content": content}
-                for current_id, role, content in self.messages
-                if current_id == session_id
-            ]
+    async def close(self):
+        self.closed = True
 
-    def rename_session(self, session_id, title):
-        return self.get_session(session_id)
+    async def control(self, run_id, action):
+        if self.control_error:
+            raise self.control_error
+        return self.control_result
 
+    async def approval_decided(self, approval_id):
+        self.approval_calls.append(approval_id)
+        return None
 
-class _BlockingAgent:
-    started = threading.Event()
-    release = threading.Event()
-    calls = 0
-
-    def __init__(self, **unused):
-        type(self).calls += 1
-
-    async def run(self, history):
-        type(self).started.set()
-        released = await asyncio.to_thread(type(self).release.wait, 5)
-        if not released:
-            raise TimeoutError("test barrier timed out")
-        yield {"type": "done"}
-
-
-class _FailingAgent:
-    async def run(self, history):
-        raise RuntimeError("fake model failure")
-        yield
-
-    def __init__(self, **unused):
-        pass
-
-
-class _CompletingAgent:
-    def __init__(self, **unused):
-        pass
-
-    async def run(self, history):
-        yield {"type": "done"}
-
-
-async def _request_and_consume(api_module, message):
-    response = await api_module.chat(
-        api_module.ChatRequest(session_id="session-1", message=message)
-    )
-    chunks = []
-    if hasattr(response, "body_iterator"):
-        async for chunk in response.body_iterator:
-            chunks.append(chunk)
-    return response, chunks
+    async def wait_for_change(self, run_id, after_id, timeout=15):
+        return after_id
 
 
 class AppImportTest(unittest.TestCase):
@@ -136,6 +84,7 @@ class AppLifespanTest(unittest.TestCase):
     def test_health_validation_shape_and_shutdown(self):
         from backend import app as app_module
         from backend import db as db_module
+        from backend import runtime as runtime_module
 
         class FakeDatabase:
             initialized = False
@@ -152,6 +101,7 @@ class AppLifespanTest(unittest.TestCase):
 
             async def refresh_registry(self):
                 self.assert_database_ready()
+                assert fake_runner.started
                 self.refreshed = True
                 return {"server_count": 0, "tool_count": 0, "errors": []}
 
@@ -159,9 +109,11 @@ class AppLifespanTest(unittest.TestCase):
                 assert fake_db.initialized
 
         fake_db = FakeDatabase()
+        fake_runner = _FakeRunner()
         fake_manager = FakeManager()
         with (
             patch.object(db_module, "db", fake_db),
+            patch.object(runtime_module, "get_runner", return_value=fake_runner, create=True),
             patch("backend.security.validate_secret_key") as validate_secret_key,
             patch("backend.mcp.manager.get_manager", return_value=fake_manager),
             patch.dict(sys.modules, {"backend.auth": SimpleNamespace(
@@ -196,6 +148,8 @@ class AppLifespanTest(unittest.TestCase):
         validate_secret_key.assert_called_once_with()
         self.assertTrue(fake_manager.refreshed)
         self.assertTrue(fake_db.initialized)
+        self.assertTrue(fake_runner.started)
+        self.assertTrue(fake_runner.closed)
         self.assertTrue(fake_db.closed)
 
     def test_invalid_secret_fails_before_database_or_mcp_import(self):
@@ -398,6 +352,10 @@ class Wave3RouteTest(unittest.TestCase):
         from backend.app import http_error_handler, validation_error_handler
 
         self.api = api
+        self.runner = _FakeRunner()
+        runner_patch = patch.object(api, "_runner", return_value=self.runner)
+        runner_patch.start()
+        self.addCleanup(runner_patch.stop)
         self.database = Mock()
         self.task = {
             "id": "task-1", "session_id": "agent-1", "goal": "goal",
@@ -696,155 +654,166 @@ class MCPCreateContractTest(unittest.TestCase):
                 database.close()
 
 
-class ChatContextWiringTest(unittest.TestCase):
-    def test_context_factory_receives_server_session_id_only(self):
-        from backend import api
-
-        make_context = Mock(return_value=object())
-        with patch.dict(sys.modules, {"backend.tool_gateway": SimpleNamespace(
-            make_builtin_run_context=make_context,
-        )}):
-            context = api._make_chat_context("session-1")
-        self.assertIs(context, make_context.return_value)
-        make_context.assert_called_once_with(run_id="session-1")
-
-
-class ChatGateTest(unittest.TestCase):
+class RunStreamTest(unittest.TestCase):
     def setUp(self):
+        from fastapi import FastAPI
         from backend import api
+        from backend.app import http_error_handler, validation_error_handler
 
         self.api = api
-        self.db = _FakeChatDatabase()
-        self.config = SimpleNamespace(
-            api_key="test-key",
-            base_url="https://example.invalid/v1",
-            model="fake",
-            max_rounds=1,
-            tool_timeout=1.0,
-        )
-        with api._active_session_lock:
-            api._active_session_ids.clear()
+        self.db = Mock()
+        self.runner = _FakeRunner()
+        self.run = {"id": "run-1", "task_id": "task-1", "session_id": "session-1",
+                    "status": "completed", "attempt": 1, "wait_reason": None,
+                    "created_at": "2026-09-13T00:00:00Z", "started_at": None,
+                    "finished_at": "2026-09-13T00:01:00Z"}
+        self.events = [
+            {"id": 1, "task_id": "task-1", "run_id": "run-1", "type": "run.queued",
+             "created_at": "2026-09-13T00:00:00Z", "payload_json": "{}"},
+            {"id": 2, "task_id": "task-1", "run_id": "run-1", "type": "message.completed",
+             "created_at": "2026-09-13T00:00:01Z",
+             "payload_json": json.dumps({"message_id": 7, "hash": "hash", "length": 4})},
+            {"id": 3, "task_id": "task-1", "run_id": "run-1", "type": "run.completed",
+             "created_at": "2026-09-13T00:00:02Z", "payload_json": "{}"},
+        ]
+        self.db.get_run.return_value = self.run
+        self.db.get_last_event_id.return_value = 3
+        self.db.list_events.side_effect = lambda _id, after, _limit: [
+            event for event in self.events if event["id"] > after
+        ]
+        self.db.get_message.return_value = {
+            "id": 7, "session_id": "session-1", "task_id": "task-1", "run_id": "run-1",
+            "role": "assistant", "content": "done", "created_at": "2026-09-13T00:00:01Z",
+        }
+        self.db.get_session.return_value = {"id": "session-1", "archived_at": None}
+        application = FastAPI()
+        application.include_router(api.router)
+        application.dependency_overrides[api._require_local_session] = lambda: SimpleNamespace(actor_id="local-host")
+        application.add_exception_handler(StarletteHTTPException, http_error_handler)
+        application.add_exception_handler(RequestValidationError, validation_error_handler)
+        self.client = TestClient(application)
+        db_patch = patch.object(api, "db", self.db)
+        runner_patch = patch.object(api, "_runner", return_value=self.runner)
+        db_patch.start()
+        runner_patch.start()
+        self.addCleanup(db_patch.stop)
+        self.addCleanup(runner_patch.stop)
 
-    def tearDown(self):
-        with self.api._active_session_lock:
-            self.api._active_session_ids.clear()
+    def test_replay_envelope_cursor_and_message_repair(self):
+        replay = self.client.get("/api/runs/run-1/events?after_id=0")
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.text.count("event: run.completed"), 1)
+        self.assertIn("id: 2\nevent: message.completed\n", replay.text)
+        frame = next(line[6:] for line in replay.text.splitlines() if line.startswith("data: "))
+        self.assertEqual(set(json.loads(frame)), {"v", "event_id", "task_id", "run_id",
+                                                "agent_id", "type", "ts", "data"})
+        repaired = self.client.get("/api/messages/7")
+        self.assertEqual(repaired.json()["content"], "done")
+        self.assertEqual(repaired.json()["agent_id"], "session-1")
 
-    def test_archived_session_returns_404_without_message(self):
-        self.db.archived_at = "2026-09-13T00:00:00Z"
-        with (
-            patch.object(self.api, "db", self.db),
-            patch.object(self.api, "_make_chat_context") as make_context,
-        ):
-            response = asyncio.run(self.api.chat(
-                self.api.ChatRequest(session_id="session-1", message="blocked")
-            ))
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(json.loads(response.body)["code"], "not_found")
-        self.assertEqual(set(json.loads(response.body)),
-                         {"code", "message", "details", "trace_id"})
-        self.assertEqual(self.db.messages, [])
-        self.assertEqual(self.db.get_messages_calls, 0)
-        make_context.assert_not_called()
+    def test_header_precedes_query_and_future_cursor_rejected(self):
+        replay = self.client.get("/api/runs/run-1/events?after_id=1",
+                                 headers={"Last-Event-ID": "2"})
+        self.assertNotIn("id: 2\n", replay.text)
+        self.assertIn("id: 3\n", replay.text)
+        for cursor in ("-1", "4", "not-a-number"):
+            denied = self.client.get("/api/runs/run-1/events?after_id=" + cursor)
+            self.assertEqual((denied.status_code, denied.json()["code"]),
+                             (400, "invalid_cursor"))
+            self.assertEqual(set(denied.json()), {"code", "message", "details", "trace_id"})
 
-    def test_archive_race_is_404_and_releases_gate(self):
-        self.db.archive_on_write = True
-        with (
-            patch.object(self.api, "db", self.db),
-            patch.object(self.api, "_make_chat_context", return_value=object()),
-        ):
-            response = asyncio.run(self.api.chat(
-                self.api.ChatRequest(session_id="session-1", message="blocked")
-            ))
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(json.loads(response.body)["code"], "not_found")
-        self.assertEqual(self.db.messages, [])
-        self.assertEqual(self.db.get_messages_calls, 0)
-        with self.api._active_session_lock:
-            self.assertNotIn("session-1", self.api._active_session_ids)
+    def test_subscription_disconnect_does_not_control_run(self):
+        self.run["status"] = "running"
+        self.events = self.events[:1]
+        self.db.get_last_event_id.return_value = 1
+        request = SimpleNamespace(is_disconnected=lambda: asyncio.sleep(0, result=True))
 
-    def test_concurrent_request_is_rejected_before_message_write(self):
-        _BlockingAgent.started = threading.Event()
-        _BlockingAgent.release = threading.Event()
-        _BlockingAgent.calls = 0
-        outcome = {}
+        async def disconnect():
+            stream = self.api._follow_events(self.run, 0, request)
+            first = await anext(stream)
+            with self.assertRaises(StopAsyncIteration):
+                await anext(stream)
+            return first
 
-        def run_first_request():
-            try:
-                outcome["result"] = asyncio.run(
-                    _request_and_consume(self.api, "first")
-                )
-            except BaseException as exc:  # surfaced in the owning test thread
-                outcome["error"] = exc
+        first = asyncio.run(disconnect())
+        self.assertIn("id: 1\n", first)
+        self.assertEqual(self.run["status"], "running")
+        self.assertEqual(self.runner.wakes, 0)
 
-        with (
-            patch.object(self.api, "db", self.db),
-            patch.object(self.api, "Agent", _BlockingAgent),
-            patch.object(self.api, "_make_chat_context", return_value=object()),
-            patch.object(self.api, "get_runtime_config", return_value=self.config),
-            patch.object(self.api, "build_system_prompt", return_value=""),
-        ):
-            first = threading.Thread(target=run_first_request)
-            first.start()
-            self.assertTrue(_BlockingAgent.started.wait(5), "first request did not start")
-
-            conflict = asyncio.run(
-                self.api.chat(
-                    self.api.ChatRequest(session_id="session-1", message="second")
-                )
-            )
-            body = json.loads(conflict.body)
-
-            self.assertEqual(conflict.status_code, 409)
-            self.assertEqual(body["code"], "run_already_active")
-            self.assertEqual(
-                set(body), {"code", "message", "details", "trace_id"}
-            )
-            self.assertEqual(self.db.messages, [("session-1", "user", "first")])
-            self.assertEqual(self.db.get_messages_calls, 1)
-            self.assertEqual(_BlockingAgent.calls, 1)
-
-            _BlockingAgent.release.set()
-            first.join(5)
-            self.assertFalse(first.is_alive(), "first request did not finish")
-            if "error" in outcome:
-                raise outcome["error"]
-
-            completed, _ = asyncio.run(
-                _request_and_consume(self.api, "after-release")
-            )
-
-        self.assertEqual(completed.status_code, 200)
-        self.assertEqual(len(self.db.messages), 2)
-        self.assertEqual(_BlockingAgent.calls, 2)
-
-    def test_generator_failure_releases_gate(self):
-        with (
-            patch.object(self.api, "db", self.db),
-            patch.object(self.api, "_make_chat_context", return_value=object()),
-            patch.object(self.api, "get_runtime_config", return_value=self.config),
-            patch.object(self.api, "build_system_prompt", return_value=""),
-        ):
-            with patch.object(self.api, "Agent", _FailingAgent):
-                _, chunks = asyncio.run(
-                    _request_and_consume(self.api, "will-fail")
-                )
-            with self.api._active_session_lock:
-                self.assertNotIn("session-1", self.api._active_session_ids)
-            with patch.object(self.api, "Agent", _CompletingAgent):
-                response, _ = asyncio.run(
-                    _request_and_consume(self.api, "after-failure")
-                )
-
-        self.assertTrue(any('"type": "error"' in chunk for chunk in chunks))
+    def test_legacy_chat_uses_one_transaction_and_same_run(self):
+        self.db.create_legacy_chat_run.return_value = ({"id": "task-1"}, self.run)
+        response = self.client.post("/api/chat", json={"session_id": "session-1", "message": "hi"})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(self.db.messages), 2)
+        self.assertEqual(response.headers["X-ReActron-Run-ID"], "run-1")
+        self.assertIn('"type":"text","content":"done"', response.text)
+        self.db.create_legacy_chat_run.assert_called_once()
+        self.db.add_message.assert_not_called()
+        self.assertEqual(self.runner.wakes, 1)
+
+    def test_archived_chat_is_404_without_write(self):
+        self.db.get_session.return_value = {"id": "session-1", "archived_at": "2026-09-13T00:00:00Z"}
+        response = self.client.post("/api/chat", json={"session_id": "session-1", "message": "hi"})
+        self.assertEqual((response.status_code, response.json()["code"]), (404, "not_found"))
+        self.db.create_legacy_chat_run.assert_not_called()
+
+    def test_control_delegates_and_conflict_is_four_fields(self):
+        self.runner.control_result = dict(self.run, status="paused")
+        accepted = self.client.post("/api/runs/run-1/control", json={"action": "pause"})
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(accepted.json()["status"], "paused")
+
+        class InvalidTransition(ValueError):
+            code = "invalid_run_transition"
+
+        self.runner.control_error = InvalidTransition()
+        denied = self.client.post("/api/runs/run-1/control", json={"action": "resume"})
+        self.assertEqual((denied.status_code, denied.json()["code"]),
+                         (409, "invalid_run_transition"))
+        self.assertEqual(set(denied.json()), {"code", "message", "details", "trace_id"})
+
+    def test_approval_decision_uses_server_hash_and_keeps_waiting(self):
+        self.run["status"] = "waiting"
+        approval = {
+            "id": "approval-1", "run_id": "run-1", "tool_call_id": "call-1",
+            "kind": "resolve_unknown_outcome", "action_hash": "server-hash",
+            "request_summary_json": '{"tool":"demo"}', "status": "pending",
+            "expires_at": "2099-01-01T00:00:00Z", "decided_at": None,
+            "decision_json": None,
+        }
+        self.db.list_approvals.return_value = [approval]
+        self.db.get_approval.return_value = approval
+        self.db.decide_approval.return_value = dict(
+            approval, status="resolved", decision_json='{"decision":"occurred","note":null}'
+        )
+        listed = self.client.get("/api/approvals")
+        rejected = self.client.post("/api/approvals/approval-1/decision", json={
+            "decision": "occurred", "action_hash": "client-hash",
+        })
+        decided = self.client.post("/api/approvals/approval-1/decision",
+                                   json={"decision": "occurred"})
+        self.assertEqual(listed.json()["approvals"][0]["action_hash"], "server-hash")
+        self.assertEqual(rejected.status_code, 422)
+        self.assertEqual(decided.status_code, 200)
+        self.assertEqual(decided.json()["status"], "resolved")
+        self.assertEqual(self.run["status"], "waiting")
+        self.db.decide_approval.assert_called_once_with(
+            "approval-1", "occurred", "local-host", None
+        )
+        self.assertEqual(self.runner.approval_calls, ["approval-1"])
+
+        self.db.get_session.return_value = {"id": "session-1", "archived_at": "archived"}
+        hidden = self.client.get("/api/approvals")
+        blocked = self.client.post("/api/approvals/approval-1/decision",
+                                   json={"decision": "occurred"})
+        self.assertEqual(hidden.json(), {"approvals": []})
+        self.assertEqual((blocked.status_code, blocked.json()["code"]), (404, "not_found"))
 
 
 class ConflictResponseTest(unittest.TestCase):
     def test_chat_missing_project_uses_four_field_error(self):
         from backend import api
 
-        response = asyncio.run(api.chat(api.ChatRequest(message="hello")))
+        response = asyncio.run(api.chat(api.ChatRequest(message="hello"), SimpleNamespace()))
         body = json.loads(response.body)
         self.assertEqual(response.status_code, 400)
         self.assertEqual(body["code"], "invalid_request")

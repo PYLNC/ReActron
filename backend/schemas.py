@@ -1,6 +1,6 @@
 """Pydantic 请求与响应模型。"""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from typing import Annotated
@@ -44,9 +44,22 @@ class TaskCreateRequest(BaseModel):
 
 
 class RunCreateRequest(BaseModel):
-    """Wave 3 的 Run 启动不开放客户端选项。"""
+    """Run 启动不开放客户端选项。"""
 
     model_config = ConfigDict(extra="forbid")
+
+
+class RunControlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["pause", "resume", "cancel"]
+
+
+class ApprovalDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["approve", "deny", "occurred", "not_occurred", "explicit_retry", "cancel"]
+    note: Optional[str] = Field(default=None, max_length=2000)
 
 
 class TaskResponse(BaseModel):
