@@ -152,6 +152,43 @@ def make_builtin_run_context(run_id: str, task_id: str = "", actor_id: str = "lo
     )
 
 
+def make_frozen_run_context(run_row: dict) -> RunContext:
+    """只恢复与当前审核内建规格完全一致的 Run 快照能力。"""
+    if not isinstance(run_row, dict):
+        return make_run_context("")
+    context = make_run_context(run_row.get("id", ""), run_row.get("task_id", ""))
+    try:
+        if not all(isinstance(run_row.get(field), str) and run_row[field]
+                   for field in ("id", "task_id", "session_id")):
+            return make_run_context("")
+        snapshot = json.loads(run_row["tool_snapshot_json"])
+        frozen = snapshot["specs"]
+        grants = snapshot["grants"]
+        if (type(snapshot.get("v")) is not int or snapshot["v"] != 1
+                or not isinstance(frozen, dict)
+                or not isinstance(grants, list)
+                or not all(isinstance(grant, str) for grant in grants)):
+            return context
+        current = snapshot_builtin_tools()
+        allowed = {name: spec for name, spec in current.items() if frozen.get(name) == {
+            "schema": spec.schema,
+            "effects": sorted(spec.effects),
+            "path_fields": list(spec.path_fields),
+            "idempotent": spec.idempotent,
+            "approval": spec.approval,
+            "timeout_seconds": spec.timeout_seconds,
+            "origin": spec.origin,
+        }}
+        return RunContext(
+            run_id=context.run_id,
+            task_id=context.task_id,
+            tool_specs=MappingProxyType(allowed),
+            grants=frozenset(grants) & frozenset({"read_only"}),
+        )
+    except (KeyError, TypeError, ValueError):
+        return context
+
+
 def _path_values(arguments: dict, pointer: str) -> list[str]:
     values = [arguments]
     for part in pointer.strip("/").split("/"):
@@ -258,9 +295,10 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
         [tool_name, arguments, sorted(spec.effects), resolved_paths, spec.origin],
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
+    call_hash = hashlib.sha256(str(run_context.call_id).encode("utf-8")).hexdigest()[:16]
     if spec.approval in {"always", "on_risk"}:
-        logger.info("tool rejected run=%s call=%s name=%s code=approval_unavailable hash=%s",
-                    run_context.run_id, run_context.call_id, tool_name, action_hash)
+        logger.info("tool rejected run=%s call_hash=%s name=%s code=approval_unavailable hash=%s",
+                    run_context.run_id, call_hash, tool_name, action_hash)
         return _outcome(run_context, "error", effect, "approval_unavailable")
     if spec.approval != "never":
         return _outcome(run_context, "error", effect, "approval_unavailable")
@@ -280,8 +318,8 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
             return _outcome(run_context, "error", effect, "limit_exceeded")
         safe_result = _redact(result if isinstance(result, str) else json.loads(raw_result), run_context.secrets)
         model_result = json.dumps(safe_result, ensure_ascii=False, allow_nan=False)
-        logger.info("tool completed run=%s call=%s name=%s hash=%s bytes=%d ms=%d",
-                    run_context.run_id, run_context.call_id, tool_name, action_hash,
+        logger.info("tool completed run=%s call_hash=%s name=%s hash=%s bytes=%d ms=%d",
+                    run_context.run_id, call_hash, tool_name, action_hash,
                     raw_bytes, int((time.monotonic()-started)*1000))
         return _outcome(run_context, "ok", effect, text=model_result)
     except asyncio.TimeoutError:
@@ -291,6 +329,6 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
                         "timeout_unknown_effect" if unknown else "tool_timeout",
                         quiesced=bool(async_task and async_task.done()) and not unknown)
     except Exception:
-        logger.warning("tool failed run=%s call=%s name=%s hash=%s code=tool_failed",
-                       run_context.run_id, run_context.call_id, tool_name, action_hash)
+        logger.warning("tool failed run=%s call_hash=%s name=%s hash=%s code=tool_failed",
+                       run_context.run_id, call_hash, tool_name, action_hash)
         return _outcome(run_context, "error", effect, "tool_failed")

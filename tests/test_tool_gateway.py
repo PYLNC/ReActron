@@ -26,6 +26,7 @@ from backend.tool_gateway import (
     ToolSpec,
     execute_tool,
     make_builtin_run_context,
+    make_frozen_run_context,
     make_run_context,
     snapshot_builtin_tools,
 )
@@ -44,6 +45,29 @@ def _spec(handler, *, effects=frozenset({"read_only"}), paths=(), approval="neve
 
 
 class GatewayTest(unittest.IsolatedAsyncioTestCase):
+    async def test_frozen_context_intersects_current_specs_and_grants(self):
+        spec = snapshot_builtin_tools()["get_current_time"]
+        frozen = {"schema": spec.schema, "effects": sorted(spec.effects),
+                  "path_fields": list(spec.path_fields), "idempotent": spec.idempotent,
+                  "approval": spec.approval, "timeout_seconds": spec.timeout_seconds,
+                  "origin": spec.origin}
+        row = {"id": "run", "task_id": "task", "session_id": "session",
+               "tool_snapshot_json": json.dumps({"v": 1, "specs": {
+                   "get_current_time": frozen, "unreviewed_tool": frozen},
+                   "grants": ["read_only", "filesystem.write"]})}
+        context = make_frozen_run_context(row)
+        self.assertEqual(context.grants, frozenset({"read_only"}))
+        self.assertEqual(set(context.tool_specs), {"get_current_time"})
+        self.assertEqual((await execute_tool(context, "get_current_time", "{}")).status, "ok")
+        self.assertEqual((await execute_tool(context, "unreviewed_tool", "{}")).error_code,
+                         "tool_not_granted")
+        changed = {**frozen, "approval": "always"}
+        row["tool_snapshot_json"] = json.dumps({"v": 1,
+            "specs": {"get_current_time": changed}, "grants": ["read_only"]})
+        self.assertEqual(make_frozen_run_context(row).tool_specs, {})
+        row["tool_snapshot_json"] = "not-json"
+        self.assertEqual(make_frozen_run_context(row).grants, frozenset())
+
     async def test_effectful_thread_timeout_is_unknown_and_never_retried(self):
         release = threading.Event()
         started = threading.Event()
@@ -309,7 +333,8 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
         logger.setLevel(logging.INFO)
         try:
             context = RunContext(
-                "run", tool_specs={"demo": _spec(lambda: {"api_key": marker, "value": marker})},
+                "run", call_id=marker,
+                tool_specs={"demo": _spec(lambda: {"api_key": marker, "value": marker})},
                 grants=frozenset({"read_only"}), secrets=(marker,),
             )
             outcome = await execute_tool(context, "demo", "{}")
