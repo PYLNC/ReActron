@@ -4,6 +4,7 @@ import json
 import hashlib
 import sqlite3
 import sys
+import uuid
 import tempfile
 import threading
 import unittest
@@ -32,6 +33,14 @@ class RunRepositoryTest(unittest.TestCase):
     def _run(self, task_id=None, key="key-1"):
         task_id = task_id or self.db.create_task(self.agent_id, "Do the thing")["id"]
         return self.db.create_run(task_id, key, config_snapshot={}, tool_snapshot={})
+
+    def _next_event_size(self, run, event_type, payload, timestamp):
+        return len(_json({
+            "v": 1, "event_id": self.db.get_last_event_id(run["id"]) + 1,
+            "task_id": run["task_id"], "run_id": run["id"],
+            "agent_id": run["session_id"], "type": event_type,
+            "ts": timestamp, "data": payload,
+        }).encode("utf-8"))
 
     def test_v3_migration_task_input_constraints_and_reopen_noop(self):
         task = self.db.create_task(self.agent_id, "first", ["done"], {"source": "test"})
@@ -275,6 +284,74 @@ class RunRepositoryTest(unittest.TestCase):
             self.db.decide_approval(approval["id"], "approve")
         with self.assertRaises(InvalidRunTransition):
             self.db.decide_approval(approval["id"], "cancel")
+
+    def test_unknown_event_obeys_nonterminal_cap_and_rolls_back_approval(self):
+        cap = MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE
+        timestamp = "2026-09-13T00:00:00.000Z"
+        outcome = SimpleNamespace(call_id="call-1", status="outcome_unknown",
+                                  effect="effectful", quiesced=False,
+                                  model_text="not an event", result_ref=None,
+                                  error_code="tool_timeout")
+        action_hash = hashlib.sha256(b"action").hexdigest()
+        for offset, expected_status in ((0, "waiting"), (1, "running")):
+            agent_id = self.db.create_session()["id"]
+            task = self.db.create_task(agent_id, "unknown")
+            run, _ = self.db.create_run(task["id"], f"key-{offset}",
+                                        config_snapshot={}, tool_snapshot={})
+            active = self.db.claim_next_run(f"worker-{offset}")
+            approval_id = str(uuid.UUID(int=offset + 1))
+            payload = {"call_id": outcome.call_id, "name": "file.write",
+                       "effect": outcome.effect, "error_code": outcome.error_code,
+                       "approval_id": approval_id}
+            size = self._next_event_size(run, "tool.outcome_unknown", payload, timestamp)
+            before = cap - size + offset
+            self.db._execute("UPDATE runs SET event_bytes_written=? WHERE id=?",
+                             (before, run["id"]))
+            with (patch("backend.db._utc_now", return_value=timestamp),
+                  patch("backend.db.uuid.uuid4", return_value=uuid.UUID(int=offset + 1))):
+                if offset:
+                    with self.assertRaises(EventLimitExceeded):
+                        self.db.record_unknown_outcome(
+                            run["id"], active["version"], f"worker-{offset}",
+                            active["lease_epoch"], outcome, "file.write",
+                            action_hash, "9999-01-01T00:00:00.000Z")
+                else:
+                    self.db.record_unknown_outcome(
+                        run["id"], active["version"], f"worker-{offset}",
+                        active["lease_epoch"], outcome, "file.write",
+                        action_hash, "9999-01-01T00:00:00.000Z")
+            state = self.db.get_run(run["id"])
+            self.assertEqual(state["status"], expected_status)
+            self.assertEqual(state["event_bytes_written"], cap if not offset else before)
+            self.assertEqual(len(self.db.list_approvals(run_id=run["id"])), 0 if offset else 1)
+            self.assertEqual(len(self.db.list_events(run["id"])), 2 if offset else 3)
+
+    def test_recovery_event_obeys_nonterminal_cap_and_rolls_back_status(self):
+        cap = MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE
+        timestamp = "2026-09-13T00:00:00.000Z"
+        for offset, expected_status in ((0, "paused"), (1, "running")):
+            agent_id = self.db.create_session()["id"]
+            task = self.db.create_task(agent_id, "recover")
+            run, _ = self.db.create_run(task["id"], f"recovery-{offset}",
+                                        config_snapshot={}, tool_snapshot={})
+            self.db.claim_next_run(f"worker-{offset}")
+            self.db._execute("UPDATE runs SET lease_until='2000-01-01T00:00:00.000Z' WHERE id=?",
+                             (run["id"],))
+            size = self._next_event_size(run, "run.paused", {"reason": "restart"}, timestamp)
+            before = cap - size + offset
+            self.db._execute("UPDATE runs SET event_bytes_written=? WHERE id=?",
+                             (before, run["id"]))
+            with patch("backend.db._utc_now", return_value=timestamp):
+                if offset:
+                    with self.assertRaises(EventLimitExceeded):
+                        self.db.recover_expired_leases("9999-01-01T00:00:00.000Z")
+                else:
+                    self.assertEqual(self.db.recover_expired_leases(
+                        "9999-01-01T00:00:00.000Z"), [run["id"]])
+            state = self.db.get_run(run["id"])
+            self.assertEqual(state["status"], expected_status)
+            self.assertEqual(state["event_bytes_written"], cap if not offset else before)
+            self.assertEqual(len(self.db.list_events(run["id"])), 2 if offset else 3)
 
     def test_approval_kind_decisions_and_idempotency(self):
         run, _ = self._run()

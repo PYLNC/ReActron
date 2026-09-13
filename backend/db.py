@@ -1297,6 +1297,8 @@ class Database:
             raise ResourceNotFound("Run 不存在")
         if event_type in TERMINAL_EVENTS and run["status"] != event_type.removeprefix("run."):
             raise InvalidRunTransition("终态 Event 必须与 Run 状态同事务提交")
+        if terminal_reserve and run["status"] not in {"completed", "failed", "cancelled"}:
+            raise InvalidRunTransition("非终态 Event 不得使用终态预留额度")
         if dedupe_key is not None:
             existing = conn.execute(
                 "SELECT * FROM events WHERE dedupe_key=?", (dedupe_key,)
@@ -1495,8 +1497,7 @@ class Database:
                 if updated.rowcount != 1:
                     continue
                 self._append_event_tx(conn, row["id"], "run.paused", {"reason": "restart"},
-                                      f"{row['id']}:run.paused:{row['lease_epoch'] + 1}",
-                                      terminal_reserve=True)
+                                      f"{row['id']}:run.paused:{row['lease_epoch'] + 1}")
                 recovered.append(row["id"])
         return recovered
 
@@ -1626,8 +1627,7 @@ class Database:
                 "call_id": outcome.call_id, "name": tool_name,
                 "effect": outcome.effect, "error_code": outcome.error_code,
                 "approval_id": approval_id,
-            }, f"{run_id}:{outcome.call_id}:tool.outcome_unknown",
-                terminal_reserve=True)
+            }, f"{run_id}:{outcome.call_id}:tool.outcome_unknown")
             return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), dict(
                 conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone())
 
