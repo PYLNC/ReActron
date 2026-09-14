@@ -16,6 +16,7 @@ from backend.harness import get_harness, run_self_tests
 from backend.mcp.manager import get_manager
 from backend.schemas import (
     AgentListResponse,
+    AgentRenameRequest,
     ApprovalDecisionRequest,
     ChatRequest,
     BootstrapRequest,
@@ -34,10 +35,13 @@ from backend.schemas import (
     SessionSummary,
     SettingsRequest,
     SettingsResponse,
+    SupervisorCreateRequest,
+    SupervisorSelectRequest,
     TaskCreateRequest,
     TaskListResponse,
     TaskResponse,
     ToolsResponse,
+    WorkerCreateRequest,
 )
 from backend.services import (
     InvalidBaseUrl,
@@ -74,6 +78,11 @@ public_router = APIRouter(prefix="/api")
 UPLOAD_DIR = DATA_DIR / "uploads"
 ALLOWED_UPLOAD_EXTENSIONS = {".xlsx", ".pptx", ".csv", ".txt", ".md", ".json", ".log"}
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024
+SAFE_AGENT_GRANTS = frozenset({
+    "read_only", "control.delegate_task", "control.send_agent_message",
+    "control.get_task_status", "control.wait_for_tasks", "control.cancel_task",
+    "control.request_human_approval",
+})
 
 def _error_response(status_code: int, code: str, message: str, details=None):
     return JSONResponse(
@@ -99,6 +108,10 @@ def _repository_error(exc: Exception):
         return _error_response(409, code, "该 Agent 已有活动 Run", {"run_id": run_id} if run_id else {})
     if code == "invalid_run_transition":
         return _error_response(409, code, "当前 Run 状态不允许此操作")
+    if code == "supervisor_exists":
+        return _error_response(409, code, "已有活动 Supervisor")
+    if code == "invalid_agent_hierarchy":
+        return _error_response(409, code, "Agent 树结构不允许此操作")
     if isinstance(exc, ValueError):
         return _error_response(422, "invalid_request", "请求参数无效")
     raise exc
@@ -134,6 +147,26 @@ def _run_response(row: dict) -> dict:
         "finished_at": row["finished_at"],
         "last_event_id": db.get_last_event_id(row["id"]),
         "allowed_actions": allowed_actions(row),
+    }
+
+
+def _agent_tree_response(row: dict, status: dict | None = None) -> dict:
+    """仅投影宿主可见的树字段；不回显 prompt、路径或内部凭据。"""
+    capabilities = json.loads(row.get("capabilities_json") or "{}")
+    grants = capabilities.get("grants", [])
+    return {
+        "agent_id": row["id"],
+        "title": row["title"],
+        "agent_role": row["agent_role"],
+        "parent_agent_id": row.get("parent_session_id"),
+        "root_agent_id": row.get("root_session_id"),
+        "depth": row["depth"],
+        "can_delegate": bool(row["can_delegate"]),
+        "capability_grants": [grant for grant in grants if grant in SAFE_AGENT_GRANTS],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "archived_at": row.get("archived_at"),
+        "status": status,
     }
 
 
@@ -427,6 +460,84 @@ async def list_agents():
         }
         for row in sessions
     ]}
+
+
+async def _tree_agent(row: dict) -> dict:
+    status = await asyncio.to_thread(db.get_agent_status, row["id"])
+    return _agent_tree_response(row, status)
+
+
+@router.get("/supervisor")
+async def get_supervisor():
+    row = await asyncio.to_thread(db.get_supervisor)
+    return {"supervisor": await _tree_agent(row) if row else None}
+
+
+@router.post("/supervisor", status_code=201)
+async def create_supervisor(payload: SupervisorCreateRequest):
+    try:
+        row = await asyncio.to_thread(
+            db.create_supervisor, payload.title, payload.system_prompt,
+            payload.capabilities.model_dump() if payload.capabilities else None,
+        )
+    except Exception as exc:
+        return _repository_error(exc)
+    return await _tree_agent(row)
+
+
+@router.post("/supervisor/select")
+async def select_supervisor(payload: SupervisorSelectRequest):
+    try:
+        row = await asyncio.to_thread(db.select_supervisor, payload.agent_id)
+    except Exception as exc:
+        return _repository_error(exc)
+    return await _tree_agent(row)
+
+
+@router.get("/agents/tree")
+async def get_agent_tree(include_archived: bool = False):
+    rows = await asyncio.to_thread(db.list_agent_tree, None, include_archived)
+    return {"agents": [await _tree_agent(row) for row in rows]}
+
+
+@router.post("/agents/workers", status_code=201)
+async def create_worker(payload: WorkerCreateRequest):
+    try:
+        row = await asyncio.to_thread(
+            db.create_worker, payload.parent_agent_id, payload.title,
+            payload.system_prompt,
+            payload.capabilities.model_dump() if payload.capabilities else None,
+            payload.can_delegate,
+        )
+    except Exception as exc:
+        return _repository_error(exc)
+    return await _tree_agent(row)
+
+
+@router.get("/agents/{agent_id}/status")
+async def get_agent_status(agent_id: str):
+    try:
+        return await asyncio.to_thread(db.get_agent_status, agent_id)
+    except Exception as exc:
+        return _repository_error(exc)
+
+
+@router.patch("/agents/{agent_id}")
+async def rename_agent(agent_id: str, payload: AgentRenameRequest):
+    try:
+        row = await asyncio.to_thread(db.rename_agent, agent_id, payload.title)
+    except Exception as exc:
+        return _repository_error(exc)
+    return await _tree_agent(row)
+
+
+@router.delete("/agents/{agent_id}")
+async def archive_worker(agent_id: str):
+    try:
+        row = await asyncio.to_thread(db.archive_worker, agent_id)
+    except Exception as exc:
+        return _repository_error(exc)
+    return await _tree_agent(row)
 
 
 @router.post("/upload")

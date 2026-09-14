@@ -105,6 +105,54 @@ class AgentListResponse(BaseModel):
     agents: List[AgentSummary]
 
 
+AgentTitle = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
+ControlGrant = Literal[
+    "read_only",
+    "control.delegate_task",
+    "control.send_agent_message",
+    "control.get_task_status",
+    "control.wait_for_tasks",
+    "control.cancel_task",
+    "control.request_human_approval",
+]
+
+
+class AgentCapabilitiesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    grants: List[ControlGrant] = Field(default_factory=list, max_length=32)
+
+
+class SupervisorCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: AgentTitle = "Supervisor"
+    system_prompt: str = Field(default="", max_length=4000)
+    capabilities: AgentCapabilitiesRequest | None = None
+
+
+class SupervisorSelectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: NonEmptyText
+
+
+class WorkerCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    parent_agent_id: NonEmptyText
+    title: AgentTitle
+    system_prompt: str = Field(default="", max_length=4000)
+    capabilities: AgentCapabilitiesRequest | None = None
+    can_delegate: bool = False
+
+
+class AgentRenameRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: AgentTitle
+
+
 class SettingsRequest(BaseModel):
     """PUT /api/settings 请求体。"""
 
