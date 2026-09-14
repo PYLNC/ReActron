@@ -235,6 +235,12 @@ class TaskRunner:
                         # Preserve expired lease for recovery; never mislabel a side effect.
                         logger.exception("Cannot persist unknown outcome; Run held: %s", run_id)
                     return
+                if latest["control_requested"]:
+                    try:
+                        self._apply_control(latest)
+                    except InvalidRunTransition:
+                        pass
+                    return
                 code = ("event_limit_exceeded" if isinstance(exc, EventLimitExceeded)
                         else str(exc) if str(exc) in {"provider_snapshot_mismatch",
                                                       "model_step_output_exceeded"}

@@ -637,6 +637,41 @@ class RunnerCoreTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(self.db._query_all("SELECT * FROM messages WHERE run_id=?",
                                                 (run["id"],)))
 
+    async def test_model_error_after_control_honors_intent_not_failed(self):
+        for index, action in enumerate(("pause", "cancel")):
+            if index:
+                other_agent = self.db.create_session()["id"]
+                task = self.db.create_task(other_agent, "cancel after model error")
+                run, _ = self.db.create_run(task["id"], "run-cancel",
+                                            config_snapshot={"model": "fake", "max_rounds": 2},
+                                            tool_snapshot={})
+            else:
+                run = self.run
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            def factory(*_):
+                async def step(_messages, **kwargs):
+                    await kwargs["on_delta"]("partial")
+                    entered.set()
+                    await release.wait()
+                    raise RuntimeError("model failed after control intent")
+                return step
+
+            runner = TaskRunner(self.db, model_factory=factory,
+                                provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+                                tool_context_factory=lambda row: make_run_context(row["id"]))
+            worker = asyncio.create_task(runner.run_once())
+            await asyncio.wait_for(entered.wait(), 2)
+            await runner.control(run["id"], action)
+            release.set()
+            await worker
+            final = self.db.get_run(run["id"])
+            self.assertEqual(final["status"], "paused" if action == "pause" else "cancelled")
+            self.assertFalse(any(e["type"] == "model.output.delta" for e in
+                                 self.db.list_events(run["id"])))
+            self.assertFalse(any(e["type"] == "run.failed" for e in
+                                 self.db.list_events(run["id"])))
+
     async def test_pause_resume_same_run_and_attempt_at_model_boundary(self):
         entered, release = asyncio.Event(), asyncio.Event()
         calls = []
