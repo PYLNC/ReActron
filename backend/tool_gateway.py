@@ -23,6 +23,11 @@ MAX_ARGUMENT_BYTES = 64 * 1024
 MAX_RAW_BYTES = 256 * 1024
 MAX_MODEL_CHARS = 8_000
 _SECRET_FIELDS = frozenset({"authorization", "cookie", "api_key", "token", "secret", "password"})
+P2_HOST_GRANT_CEILING = frozenset({
+    "read_only", "control.delegate_task", "control.send_agent_message",
+    "control.get_task_status", "control.wait_for_tasks", "control.cancel_task",
+    "control.request_human_approval",
+})
 _BUILTIN_POLICY = {
     "get_current_time": ("read_only", (), "never"),
     "list_dir": ("filesystem.read", ("/path",), "never"),
@@ -81,6 +86,11 @@ class RunContext:
     mcp_tools: frozenset[str] = frozenset()
     budget: ToolBudget = field(default_factory=ToolBudget)
     secrets: tuple[str, ...] = ()
+    agent_id: str = ""
+    role: str = ""
+    parent_agent_id: str = ""
+    root_agent_id: str = ""
+    can_delegate: bool = False
 
 
 @dataclass(frozen=True)
@@ -97,6 +107,20 @@ class ToolOutcome:
 def make_run_context(run_id: str, task_id: str = "", actor_id: str = "local-host") -> RunContext:
     """P0 默认无 ToolSpec/grant；只有可信 Runner 能附加不可变快照。"""
     return RunContext(run_id=run_id, task_id=task_id, actor_id=actor_id)
+
+
+def intersect_effective_grants(parent_run, worker_capability, task_requested,
+                               host_ceiling=P2_HOST_GRANT_CEILING) -> frozenset[str]:
+    """四个可信上界求交；畸形输入失败关闭，P2 不开放 Workspace/网络/进程。"""
+    def grant_set(value):
+        if (not isinstance(value, (set, frozenset, list, tuple))
+                or any(not isinstance(item, str) for item in value)):
+            return frozenset()
+        return frozenset(value)
+
+    return (grant_set(parent_run) & grant_set(worker_capability)
+            & grant_set(task_requested) & grant_set(host_ceiling)
+            & P2_HOST_GRANT_CEILING)
 
 
 def _strict_schema(schema: dict) -> dict:

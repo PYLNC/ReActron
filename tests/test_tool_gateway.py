@@ -25,6 +25,7 @@ from backend.tool_gateway import (
     ToolBudget,
     ToolSpec,
     execute_tool,
+    intersect_effective_grants,
     make_builtin_run_context,
     make_frozen_run_context,
     make_run_context,
@@ -45,6 +46,19 @@ def _spec(handler, *, effects=frozenset({"read_only"}), paths=(), approval="neve
 
 
 class GatewayTest(unittest.IsolatedAsyncioTestCase):
+    async def test_p2_grant_intersection_never_expands_worker(self):
+        parent = {"read_only", "control.delegate_task", "filesystem.read", "network.external"}
+        worker = {"read_only", "control.delegate_task", "filesystem.write", "process.spawn"}
+        task = {"read_only", "control.delegate_task", "filesystem.write", "network.external"}
+        self.assertEqual(intersect_effective_grants(parent, worker, task),
+                         frozenset({"read_only", "control.delegate_task"}))
+        self.assertEqual(intersect_effective_grants(parent, worker - {"control.delegate_task"}, task),
+                         frozenset({"read_only"}))
+        self.assertEqual(intersect_effective_grants(parent, worker, task, {"filesystem.write"}),
+                         frozenset())
+        self.assertEqual(intersect_effective_grants("read_only", worker, task), frozenset())
+        self.assertEqual(intersect_effective_grants(parent, {"read_only", 1}, task), frozenset())
+
     async def test_frozen_context_intersects_current_specs_and_grants(self):
         spec = snapshot_builtin_tools()["get_current_time"]
         frozen = {"schema": spec.schema, "effects": sorted(spec.effects),
