@@ -91,6 +91,14 @@ class RunContext:
     parent_agent_id: str = ""
     root_agent_id: str = ""
     can_delegate: bool = False
+    delegate_agent_ids: frozenset[str] = frozenset()
+    message_agent_ids: frozenset[str] = frozenset()
+    status_task_ids: frozenset[str] = frozenset()
+    wait_child_task_ids: frozenset[str] = frozenset()
+    cancel_task_ids: frozenset[str] = frozenset()
+    remaining_depth: int = 0
+    remaining_children: int = 0
+    remaining_hops: int = 0
 
 
 @dataclass(frozen=True)
@@ -165,6 +173,22 @@ def snapshot_builtin_tools() -> Mapping[str, ToolSpec]:
     return MappingProxyType(specs)
 
 
+def control_dispatch(_context: RunContext, _name: str, _arguments: dict) -> dict:
+    """纯控制预检确认；A 的单事务稍后提交实际动作和工具结果。"""
+    return {"accepted": True}
+
+
+def snapshot_internal_tools() -> Mapping[str, ToolSpec]:
+    """固定内部控制面规格；真正副作用仅由 A 的 Run 事务提交。"""
+    from backend.skills.control_skill import CONTROL_TOOLS
+
+    return MappingProxyType({name: ToolSpec(
+        name=name, schema=_strict_schema(schema), handler=control_dispatch,
+        effects=frozenset({f"control.{name}"}), idempotent=name == "get_task_status",
+        approval="never", timeout_seconds=30.0, origin="internal",
+    ) for name, (_description, schema) in CONTROL_TOOLS.items()})
+
+
 def make_builtin_run_context(run_id: str, task_id: str = "", actor_id: str = "local-host") -> RunContext:
     """本地主机 P0 固定只读能力：仅无路径的 builtin 工具可执行。"""
     return RunContext(
@@ -193,7 +217,7 @@ def make_frozen_run_context(run_row: dict) -> RunContext:
                 or not isinstance(grants, list)
                 or not all(isinstance(grant, str) for grant in grants)):
             return context
-        current = snapshot_builtin_tools()
+        current = {**snapshot_builtin_tools(), **snapshot_internal_tools()}
         allowed = {name: spec for name, spec in current.items() if frozen.get(name) == {
             "schema": spec.schema,
             "effects": sorted(spec.effects),
@@ -207,7 +231,7 @@ def make_frozen_run_context(run_row: dict) -> RunContext:
             run_id=context.run_id,
             task_id=context.task_id,
             tool_specs=MappingProxyType(allowed),
-            grants=frozenset(grants) & frozenset({"read_only"}),
+            grants=frozenset(grants) & P2_HOST_GRANT_CEILING,
         )
     except (KeyError, TypeError, ValueError):
         return context
@@ -239,6 +263,41 @@ def _redact(value, secrets: tuple[str, ...]):
             if secret:
                 value = value.replace(secret, "[redacted]")
     return value
+
+
+def _control_rejection(context: RunContext, name: str, arguments: dict) -> str | None:
+    if any(field in arguments for field in (
+        "from_agent_id", "actor_id", "agent_id", "grant", "requested_grant",
+        "root_path", "workspace_root", "parent_agent_id", "root_agent_id",
+    )):
+        return "invalid_arguments"
+    if (not context.agent_id or not context.run_id or not context.task_id
+            or context.role not in {"supervisor", "worker"}):
+        return "control_unavailable"
+    if name == "delegate_task":
+        if context.role != "supervisor" and not context.can_delegate:
+            return "tool_not_granted"
+        if not all(type(value) is int and value > 0 for value in (
+            context.remaining_depth, context.remaining_children, context.remaining_hops,
+        )):
+            return "limit_exceeded"
+        if arguments["assignee_agent_id"] not in context.delegate_agent_ids:
+            return "not_found"
+    elif name == "send_agent_message":
+        if type(context.remaining_hops) is not int or context.remaining_hops <= 0:
+            return "limit_exceeded"
+        if arguments["to_agent_id"] not in context.message_agent_ids:
+            return "not_found"
+    elif name == "get_task_status":
+        if arguments["task_id"] not in context.status_task_ids:
+            return "not_found"
+    elif name == "wait_for_tasks":
+        if not set(arguments["task_ids"]) <= context.wait_child_task_ids:
+            return "not_found"
+    elif name == "cancel_task":
+        if arguments["task_id"] not in context.cancel_task_ids:
+            return "not_found"
+    return None
 
 
 def _outcome(context: RunContext, status: str, effect: str, code: str | None = None,
@@ -278,6 +337,8 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
     spec = run_context.tool_specs.get(tool_name)
     if not spec or spec.name != tool_name:
         return _outcome(run_context, "error", effect, "tool_not_granted")
+    if spec.origin == "internal" and spec != snapshot_internal_tools().get(tool_name):
+        return _outcome(run_context, "error", effect, "tool_not_granted")
     effect = "read_only" if spec.effects <= {"read_only", "filesystem.read"} else (
         "idempotent" if spec.idempotent else "effectful"
     )
@@ -289,6 +350,10 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
         return _outcome(run_context, "error", effect, "invalid_arguments")
     if not spec.effects <= run_context.grants:
         return _outcome(run_context, "error", effect, "tool_not_granted")
+    if spec.origin == "internal":
+        rejection = _control_rejection(run_context, tool_name, arguments)
+        if rejection:
+            return _outcome(run_context, "error", effect, rejection)
 
     resolved_paths = []
     if spec.path_fields:
@@ -309,10 +374,10 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
         except (HarnessError, OSError, ValueError):
             return _outcome(run_context, "error", effect, "path_not_granted")
 
-    if spec.origin != "builtin":
+    if spec.origin not in {"builtin", "internal"}:
         if not spec.origin.startswith("mcp:") or tool_name not in run_context.mcp_tools:
             return _outcome(run_context, "error", effect, "mcp_not_approved")
-    if not run_context.budget.reserve(mcp=spec.origin != "builtin"):
+    if not run_context.budget.reserve(mcp=spec.origin.startswith("mcp:")):
         return _outcome(run_context, "error", effect, "limit_exceeded")
 
     action_hash = hashlib.sha256(json.dumps(
@@ -329,11 +394,16 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
 
     async_task = None
     try:
-        if inspect.iscoroutinefunction(spec.handler):
+        if spec.origin == "internal":
+            result = spec.handler(run_context, tool_name, arguments)
+        elif inspect.iscoroutinefunction(spec.handler):
             async_task = asyncio.create_task(spec.handler(**arguments))
             result = await asyncio.wait_for(async_task, timeout=spec.timeout_seconds)
         else:
-            result = await asyncio.wait_for(asyncio.to_thread(spec.handler, **arguments), timeout=spec.timeout_seconds)
+            result = await asyncio.wait_for(asyncio.to_thread(spec.handler, **arguments),
+                                            timeout=spec.timeout_seconds)
+        if spec.origin == "internal" and result != {"accepted": True}:
+            return _outcome(run_context, "error", effect, "control_unavailable")
         raw_result = result if isinstance(result, str) else json.dumps(
             result, ensure_ascii=False, default=str, allow_nan=False
         )
@@ -342,7 +412,8 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
             return _outcome(run_context, "error", effect, "limit_exceeded")
         safe_result = _redact(result if isinstance(result, str) else json.loads(raw_result), run_context.secrets)
         model_result = json.dumps(safe_result, ensure_ascii=False, allow_nan=False)
-        logger.info("tool completed run=%s call_hash=%s name=%s hash=%s bytes=%d ms=%d",
+        logger.info("%s run=%s call_hash=%s name=%s hash=%s bytes=%d ms=%d",
+                    "control preflight accepted" if spec.origin == "internal" else "tool completed",
                     run_context.run_id, call_hash, tool_name, action_hash,
                     raw_bytes, int((time.monotonic()-started)*1000))
         return _outcome(run_context, "ok", effect, text=model_result)

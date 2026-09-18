@@ -17,7 +17,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from fastapi import HTTPException, Response
 from starlette.requests import Request
 
-from backend import auth, file_parser, harness
+from backend import auth, file_parser, harness, tool_gateway
 from backend.mcp.manager import MCPManager, MCPNotApproved, MCPServerConfig, config_hash, schema_hash
 from backend.tool_gateway import (
     MAX_RAW_BYTES,
@@ -30,6 +30,7 @@ from backend.tool_gateway import (
     make_frozen_run_context,
     make_run_context,
     snapshot_builtin_tools,
+    snapshot_internal_tools,
 )
 
 
@@ -58,6 +59,172 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
                          frozenset())
         self.assertEqual(intersect_effective_grants("read_only", worker, task), frozenset())
         self.assertEqual(intersect_effective_grants(parent, {"read_only", 1}, task), frozenset())
+
+    async def test_internal_controls_are_fixed_and_dispatch_only_after_scope_checks(self):
+        calls = []
+
+        def dispatch(context, name, arguments):
+            calls.append((context.agent_id, context.run_id, name, arguments))
+            return {"accepted": True}
+
+        patcher = patch.object(tool_gateway, "control_dispatch", dispatch)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        arguments = {
+            "delegate_task": {"assignee_agent_id": "child", "goal": "Review", "acceptance": []},
+            "send_agent_message": {"to_agent_id": "child", "kind": "progress", "content": "working"},
+            "get_task_status": {"task_id": "task"},
+            "wait_for_tasks": {"task_ids": ["child-task"]},
+            "cancel_task": {"task_id": "task"},
+            "request_human_approval": {"reason": "Need host decision"},
+        }
+        specs = snapshot_internal_tools()
+        self.assertEqual(set(specs), set(arguments))
+        from backend.skills import TOOL_DEFINITIONS
+        self.assertTrue(set(arguments) <= {item["function"]["name"] for item in TOOL_DEFINITIONS})
+        for name, value in arguments.items():
+            with self.subTest(name=name):
+                context = RunContext(
+                    "run", task_id="task", call_id="call", tool_specs=specs,
+                    grants=frozenset({f"control.{name}"}), agent_id="supervisor",
+                    role="supervisor",
+                    delegate_agent_ids=frozenset({"child"}),
+                    message_agent_ids=frozenset({"child"}),
+                    status_task_ids=frozenset({"task"}),
+                    wait_child_task_ids=frozenset({"child-task"}),
+                    cancel_task_ids=frozenset({"task"}),
+                    remaining_depth=1, remaining_children=1, remaining_hops=1,
+                )
+                outcome = await execute_tool(context, name, value)
+                self.assertEqual(outcome.status, "ok")
+                self.assertEqual(calls[-1], ("supervisor", "run", name, value))
+        self.assertEqual(len(calls), 6)
+
+    async def test_internal_forged_identity_and_cross_tree_targets_never_dispatch(self):
+        calls = []
+
+        def dispatch(*arguments):
+            calls.append(arguments)
+            return {"accepted": True}
+
+        patcher = patch.object(tool_gateway, "control_dispatch", dispatch)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        specs = snapshot_internal_tools()
+        context = RunContext(
+            "run", task_id="task", tool_specs=specs,
+            grants=frozenset(f"control.{name}" for name in specs),
+            agent_id="worker", role="worker",
+            message_agent_ids=frozenset({"parent"}),
+            status_task_ids=frozenset({"own-task"}),
+            wait_child_task_ids=frozenset({"own-child"}),
+            cancel_task_ids=frozenset({"own-task"}), remaining_hops=1,
+        )
+        for forged in ("from_agent_id", "actor_id", "requested_grant", "root_path"):
+            with self.subTest(forged=forged):
+                outcome = await execute_tool(context, "send_agent_message", {
+                    "to_agent_id": "parent", "kind": "progress", "content": "ok", forged: "forged"})
+                self.assertEqual(outcome.error_code, "invalid_arguments")
+        for name, value in (
+            ("send_agent_message", {"to_agent_id": "sibling", "kind": "progress", "content": "x"}),
+            ("get_task_status", {"task_id": "other-tree"}),
+            ("wait_for_tasks", {"task_ids": ["other-child"]}),
+            ("cancel_task", {"task_id": "other-tree"}),
+        ):
+            with self.subTest(name=name):
+                outcome = await execute_tool(context, name, value)
+                self.assertEqual(outcome.error_code, "not_found")
+        self.assertEqual((await execute_tool(context, "wait_for_tasks",
+                                              {"task_ids": ["own-child", "own-child"]})).error_code,
+                         "invalid_arguments")
+        self.assertEqual(calls, [])
+
+    async def test_worker_delegation_and_budget_fail_closed(self):
+        calls = []
+
+        def dispatch(*arguments):
+            calls.append(arguments)
+            return {"accepted": True}
+
+        patcher = patch.object(tool_gateway, "control_dispatch", dispatch)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        context = RunContext(
+            "run", task_id="task", tool_specs=snapshot_internal_tools(),
+            grants=frozenset({"control.delegate_task"}), agent_id="worker", role="worker",
+            delegate_agent_ids=frozenset({"child"}),
+            remaining_depth=1, remaining_children=1, remaining_hops=1,
+        )
+        args = {"assignee_agent_id": "child", "goal": "Review", "acceptance": []}
+        for forged in ({"requested_grant": {"tools": ["process.spawn"]}},
+                       {"context": {"root_path": "C:/secret"}}):
+            self.assertEqual((await execute_tool(context, "delegate_task", {**args, **forged})).error_code,
+                             "invalid_arguments")
+        self.assertEqual((await execute_tool(context, "delegate_task", args)).error_code,
+                         "tool_not_granted")
+        for field in ("remaining_depth", "remaining_children", "remaining_hops"):
+            with self.subTest(field=field):
+                limited = replace(context, can_delegate=True, **{field: 0})
+                self.assertEqual((await execute_tool(limited, "delegate_task", args)).error_code,
+                                 "limit_exceeded")
+        self.assertEqual((await execute_tool(replace(context, can_delegate=True),
+                                             "delegate_task", {**args, "assignee_agent_id": "other"})).error_code,
+                         "not_found")
+        self.assertEqual(calls, [])
+
+    async def test_frozen_internal_tool_requires_server_scope_and_fixed_handler(self):
+        spec = snapshot_internal_tools()["delegate_task"]
+        frozen = {"schema": spec.schema, "effects": sorted(spec.effects),
+                  "path_fields": list(spec.path_fields), "idempotent": spec.idempotent,
+                  "approval": spec.approval, "timeout_seconds": spec.timeout_seconds,
+                  "origin": spec.origin}
+        row = {"id": "run", "task_id": "task", "session_id": "supervisor",
+               "tool_snapshot_json": json.dumps({"v": 1,
+                   "specs": {"delegate_task": frozen},
+                   "grants": ["control.delegate_task", "filesystem.write"]})}
+        context = make_frozen_run_context(row)
+        self.assertEqual(context.grants, frozenset({"control.delegate_task"}))
+        self.assertEqual(context.agent_id, "")
+        args = {"assignee_agent_id": "child", "goal": "Review", "acceptance": []}
+        self.assertEqual((await execute_tool(context, "delegate_task", args)).error_code,
+                         "control_unavailable")
+        invoked = []
+        fake = replace(spec, handler=lambda **_args: invoked.append("forged"))
+        context = replace(context, agent_id="supervisor", role="supervisor",
+                          delegate_agent_ids=frozenset({"child"}), remaining_depth=1,
+                          remaining_children=1, remaining_hops=1,
+                          tool_specs={"delegate_task": fake})
+        self.assertEqual((await execute_tool(context, "delegate_task", args)).error_code,
+                         "tool_not_granted")
+        self.assertEqual((await execute_tool(replace(context, grants=frozenset(),
+                                                    tool_specs={"delegate_task": spec}),
+                                              "delegate_task", args)).error_code,
+                         "tool_not_granted")
+        self.assertEqual(invoked, [])
+
+    async def test_internal_control_argument_marker_never_enters_info(self):
+        marker = "CONTROL-ARGUMENT-SECRET-MARKER"
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger = logging.getLogger("agent.tool_gateway")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        try:
+            context = RunContext(
+                "run", task_id="task", call_id=marker,
+                tool_specs=snapshot_internal_tools(),
+                grants=frozenset({"control.request_human_approval"}),
+                agent_id="supervisor", role="supervisor",
+            )
+            outcome = await execute_tool(context, "request_human_approval", {"reason": marker})
+        finally:
+            logger.removeHandler(handler)
+        self.assertEqual(outcome.status, "ok")
+        self.assertNotIn(marker, outcome.model_text)
+        self.assertNotIn(marker, stream.getvalue())
 
     async def test_frozen_context_intersects_current_specs_and_grants(self):
         spec = snapshot_builtin_tools()["get_current_time"]

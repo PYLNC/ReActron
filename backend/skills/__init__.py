@@ -5,6 +5,7 @@ import logging
 from backend.skills.file_skill import FILE_SKILL
 from backend.skills.excel_skill import EXCEL_SKILL
 from backend.skills.ppt_skill import PPT_SKILL
+from backend.skills.control_skill import CONTROL_TOOLS
 from backend.tools import TOOL_DEFINITIONS as CORE_TOOL_DEFINITIONS
 from backend.tools import TOOL_FUNCTIONS as CORE_TOOL_FUNCTIONS
 
@@ -24,6 +25,11 @@ TOOL_FUNCTIONS = dict(CORE_TOOL_FUNCTIONS)
 for skill in SKILLS:
     TOOL_DEFINITIONS.extend(skill["tool_definitions"])
     TOOL_FUNCTIONS.update(skill["tool_functions"])
+TOOL_DEFINITIONS.extend(
+    {"type": "function", "function": {"name": name, "description": description,
+                                    "parameters": schema}}
+    for name, (description, schema) in CONTROL_TOOLS.items()
+)
 
 MCP_TOOL_DEFINITIONS = []
 MCP_TOOL_FUNCTIONS = {}
