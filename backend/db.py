@@ -1957,6 +1957,39 @@ class Database:
             raise EventLimitExceeded("父 Run 的子结果 Event 预留空间不足")
         conn.execute("UPDATE runs SET usage_json=? WHERE id=?", (_json(usage), run_id))
 
+    def _notify_parent_child_terminal_tx(self, conn, task_id, source_run_id, status):
+        task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task or not task["creator_run_id"]:
+            return
+        parent = conn.execute("SELECT * FROM runs WHERE id=?",
+                              (task["creator_run_id"],)).fetchone()
+        recipient = conn.execute("SELECT archived_at FROM sessions WHERE id=?",
+                                 (parent["session_id"],)).fetchone()
+        if not recipient or recipient["archived_at"]:
+            return  # A terminal/archived parent is never reactivated by a child.
+        message_id = self._insert_message_tx(
+            conn, parent["session_id"], "user",
+            _json({"task_id": task_id, "status": status}),
+            sender_session_id=task["session_id"], related_task_id=task_id,
+            source_run_id=source_run_id, recipient_run_id=parent["id"],
+            kind="result")
+        if parent["status"] in {"completed", "failed", "cancelled"}:
+            return
+        self._append_event_tx(conn, parent["id"], "agent.child_terminal",
+                              {"message_id": message_id, "task_id": task_id,
+                               "status": status},
+                              child_receipt_task_id=task_id,
+                              actor_session_id=task["session_id"],
+                              recipient_session_id=parent["session_id"])
+        if parent["status"] == "waiting" and parent["wait_reason"] == "children":
+            awaited = json.loads(parent["checkpoint_json"] or "{}").get(
+                "awaited_child_task_ids", [])
+            if task_id in awaited:
+                conn.execute("""
+                    UPDATE runs SET status='queued',wait_reason=NULL,
+                        version=version+1,updated_at=? WHERE id=?
+                """, (_utc_now(), parent["id"]))
+
     def append_event(self, run_id, event_type, payload=None, dedupe_key=None):
         if isinstance(event_type, str) and event_type.startswith("run."):
             raise InvalidRunTransition("Run 状态 Event 必须与状态同事务提交")
@@ -2049,10 +2082,13 @@ class Database:
                 self._append_event_tx(conn, candidate["id"], "run.failed",
                                       {"code": "event_limit_exceeded"},
                                       f"{candidate['id']}:run.failed")
-                conn.execute("""
+                updated_task = conn.execute("""
                     UPDATE tasks SET status='failed',finished_at=?,updated_at=?
                     WHERE id=? AND status='open'
                 """, (now, now, candidate["task_id"]))
+                if updated_task.rowcount:
+                    self._notify_parent_child_terminal_tx(conn, candidate["task_id"],
+                                                          candidate["id"], "failed")
                 return None
             conn.execute("RELEASE claim_one")
             return dict(conn.execute("SELECT * FROM runs WHERE id=?", (candidate["id"],)).fetchone())
@@ -2144,10 +2180,13 @@ class Database:
                 conn.execute("DELETE FROM events WHERE run_id=? AND type='model.output.delta'",
                              (run_id,))
             if terminal:
-                conn.execute("""
+                updated_task = conn.execute("""
                     UPDATE tasks SET status=?,finished_at=?,updated_at=?
                     WHERE id=? AND status='open'
                 """, (status, now, now, run["task_id"]))
+                if updated_task.rowcount:
+                    self._notify_parent_child_terminal_tx(conn, run["task_id"],
+                                                          run_id, status)
             return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), message_id
 
     def apply_control_tool(self, run_id, expected_version, lease_owner, lease_epoch,
@@ -2299,7 +2338,11 @@ class Database:
                                             (arguments.get("reply_to_message_id"),)).fetchone()
                     child_run = conn.execute("SELECT * FROM runs WHERE id=?",
                                              (question["source_run_id"],)).fetchone() if question else None
+                    latest_question_id = conn.execute("""
+                        SELECT MAX(id) FROM messages WHERE source_run_id=? AND kind='question'
+                    """, (question["source_run_id"],)).fetchone()[0] if question else None
                     if (not question or question["kind"] != "question" or
+                            question["id"] != latest_question_id or
                             question["session_id"] != agent["id"] or
                             question["sender_session_id"] != recipient["id"] or
                             not child_run or child_run["status"] != "waiting" or
@@ -2517,10 +2560,13 @@ class Database:
                     self._append_event_tx(conn, row["id"], "run.failed",
                                           {"code": "event_limit_exceeded"},
                                           f"{row['id']}:run.failed")
-                    conn.execute("""
+                    updated_task = conn.execute("""
                         UPDATE tasks SET status='failed',finished_at=?,updated_at=?
                         WHERE id=? AND status='open'
                     """, (now, now, row["task_id"]))
+                    if updated_task.rowcount:
+                        self._notify_parent_child_terminal_tx(conn, row["task_id"],
+                                                              row["id"], "failed")
                 else:
                     conn.execute("RELEASE recovery_one")
                 recovered.append(row["id"])
@@ -2691,10 +2737,13 @@ class Database:
                 """, (now, now, run_id, old, run["version"]))
                 self._append_event_tx(conn, run_id, "run.cancelled",
                                       {"reason": "user_request"})
-                conn.execute("""
+                updated_task = conn.execute("""
                     UPDATE tasks SET status='cancelled',finished_at=?,updated_at=?
                     WHERE id=? AND status='open'
                 """, (now, now, run["task_id"]))
+                if updated_task.rowcount:
+                    self._notify_parent_child_terminal_tx(conn, run["task_id"],
+                                                          run_id, "cancelled")
             else:
                 raise InvalidRunTransition("Run 状态不允许此控制动作")
             return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())

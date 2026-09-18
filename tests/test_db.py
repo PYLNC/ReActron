@@ -12,8 +12,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from backend.db import (AgentHierarchyError, Database, InvalidRunTransition,
-                        ResourceNotFound, SupervisorAlreadyExists)
+from backend.db import (AgentHierarchyError, Database, EventLimitExceeded,
+                        InvalidRunTransition, ResourceNotFound,
+                        SupervisorAlreadyExists, MAX_RUN_EVENT_BYTES,
+                        TERMINAL_EVENT_RESERVE, CHILD_RECEIPT_RESERVE)
 
 
 NOW = "2026-01-01 00:00:00"
@@ -664,6 +666,10 @@ class P2AgentSchemaTest(unittest.TestCase):
                          frozenset({child_id}))
         self.assertGreater(json.loads(self.db.get_run(parent_run["id"])["usage_json"])
                            ["p2_child_reserve"][child_id], 0)
+        before_receipt = (MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE -
+                          CHILD_RECEIPT_RESERVE)
+        self.db._execute("UPDATE runs SET event_bytes_written=? WHERE id=?",
+                         (before_receipt, parent_run["id"]))
         result = {"summary": "done", "acceptance_results": [], "artifacts": [],
                   "evidence": [], "followups": []}
         result_call = self._call("result-1", "send_agent_message",
@@ -674,12 +680,201 @@ class P2AgentSchemaTest(unittest.TestCase):
         self.assertEqual(child_run["status"], "completed")
         self.assertEqual(self.db.get_task_result(child_id), result)
         self.assertEqual(self.db.get_run(parent_run["id"])["status"], "queued")
+        self.assertGreater(self.db.get_run(parent_run["id"])["event_bytes_written"],
+                           before_receipt)
+        self.assertLessEqual(self.db.get_run(parent_run["id"])["event_bytes_written"],
+                             MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE)
         self.assertNotIn(child_id, json.loads(self.db.get_run(parent_run["id"])["usage_json"])
                          ["p2_child_reserve"])
         received = self.db.list_agent_messages(root["id"])
         self.assertEqual((received[0]["kind"], received[0]["recipient_run_id"]),
                          ("result", parent_run["id"]))
         self.assertEqual(self.db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_cross_tree_target_and_forged_sender_have_no_message(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker")
+        outsider = self.db.create_session("outside")
+        _, run = self.db.host_delegate_task(root["id"], worker["id"], "work")
+        call = self._call("cross-1", "send_agent_message",
+                          {"to_agent_id": outsider["id"], "kind": "progress",
+                           "content": "fake"})
+        running = self._control_run(run, [call])
+        running = self.db.start_tool_call(running["id"], running["version"],
+            "p2-test", running["lease_epoch"], call["id"], "send_agent_message",
+            "effectful", "a" * 64, 8192)
+        with self.assertRaises(ResourceNotFound):
+            self.db.apply_control_tool(running["id"], running["version"],
+                "p2-test", running["lease_epoch"], call["id"],
+                "send_agent_message", call["function"]["arguments"])
+        with self.assertRaises(sqlite3.IntegrityError):
+            with self.db._write() as conn:
+                self.db._insert_message_tx(conn, root["id"], "user", "forged",
+                    sender_session_id=outsider["id"], source_run_id=run["id"],
+                    related_task_id=run["task_id"], kind="progress")
+        self.assertEqual(self.db.list_agent_messages(root["id"]), [])
+        self.assertEqual(self.db.get_run(run["id"])["status"], "running")
+
+    def test_delegate_event_reserve_rejects_before_write_and_rolls_back(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker")
+        task = self.db.create_task(root["id"], "coordinate")
+        run, _ = self.db.create_run(task["id"], "parent")
+        call = self._call("delegate-1", "delegate_task",
+                          {"assignee_agent_id": worker["id"], "goal": "child",
+                           "acceptance": []})
+        running = self._control_run(run, [call])
+        cap = MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE
+        self.db._execute("UPDATE runs SET event_bytes_written=? WHERE id=?",
+                         (cap - 1000, run["id"]))
+        with self.assertRaises(EventLimitExceeded):
+            self.db.start_tool_call(running["id"], running["version"],
+                "p2-test", running["lease_epoch"], call["id"], "delegate_task",
+                "effectful", "a" * 64, 8192)
+        self.assertIsNone(self.db.get_tool_start(run["id"], call["id"]))
+        self.assertEqual(self.db._query_one("SELECT COUNT(*) AS n FROM tasks WHERE "
+                                            "creator_run_id=?", (run["id"],))["n"], 0)
+        self.db._execute("UPDATE runs SET event_bytes_written=? WHERE id=?",
+                         (cap - 9000, run["id"]))
+        running = self.db.start_tool_call(running["id"], running["version"],
+            "p2-test", running["lease_epoch"], call["id"], "delegate_task",
+            "effectful", "a" * 64, 8192)
+        self.db._execute("UPDATE runs SET event_bytes_written=? WHERE id=?",
+                         (cap - 5000, run["id"]))
+        before = self.db.get_run(run["id"])["event_bytes_written"]
+        with self.assertRaises(EventLimitExceeded):
+            self.db.apply_control_tool(running["id"], running["version"],
+                "p2-test", running["lease_epoch"], call["id"], "delegate_task",
+                call["function"]["arguments"])
+        self.assertEqual(self.db.get_run(run["id"])["event_bytes_written"], before)
+        self.assertEqual(self.db._query_one("SELECT COUNT(*) AS n FROM tasks WHERE "
+                                            "creator_run_id=?", (run["id"],))["n"], 0)
+        self.assertEqual(self.db.get_run(run["id"])["status"], "running")
+
+    def test_child_result_uses_reserved_bytes_and_never_wakes_parent_retry(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker")
+        task = self.db.create_task(root["id"], "coordinate")
+        parent_run, _ = self.db.create_run(task["id"], "parent")
+        delegate = self._call("delegate-1", "delegate_task",
+                              {"assignee_agent_id": worker["id"], "goal": "child",
+                               "acceptance": []})
+        running = self._control_run(parent_run, [delegate])
+        running, tool_id = self._apply_control(running, delegate)
+        child_id = json.loads(self.db.get_message(tool_id)["content"])["task_id"]
+        child_run_id = self.db.get_latest_run_id(child_id)
+        self.assertEqual(json.loads(running["usage_json"])["p2_child_reserve"][child_id],
+                         CHILD_RECEIPT_RESERVE)
+        failed, _ = self.db.transition_run(
+            running["id"], running["version"], "failed", "run.failed",
+            {"code": "parent_failed"}, lease_owner="p2-test",
+            lease_epoch=running["lease_epoch"])
+        retry, created = self.db.create_run(task["id"], "parent-retry", {"retry": True})
+        self.assertTrue(created)
+        retry_last_event = self.db.get_last_event_id(retry["id"])
+        result = {"summary": "done", "acceptance_results": [], "artifacts": [],
+                  "evidence": [], "followups": []}
+        result_call = self._call("result-1", "send_agent_message",
+                                 {"to_agent_id": root["id"], "kind": "result",
+                                  "content": json.dumps(result)})
+        child = self._control_run(self.db.get_run(child_run_id), [result_call])
+        child, _ = self._apply_control(child, result_call)
+        self.assertEqual(child["status"], "completed")
+        self.assertEqual(self.db.get_run(retry["id"])["status"], "queued")
+        self.assertEqual(self.db.get_last_event_id(retry["id"]), retry_last_event)
+        received = self.db.list_agent_messages(root["id"])[0]
+        self.assertEqual(received["recipient_run_id"], failed["id"])
+        self.assertNotEqual(received["recipient_run_id"], retry["id"])
+
+    def test_child_failure_notifies_only_its_waiting_parent_atomically(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker")
+        task = self.db.create_task(root["id"], "coordinate")
+        parent, _ = self.db.create_run(task["id"], "parent")
+        parent = self.db.claim_next_run("parent-worker", 120)
+        with self.db._write() as conn:
+            child_task = self.db._insert_task_tx(
+                conn, worker["id"], "child", [], {},
+                creator_session_id=root["id"], creator_run_id=parent["id"],
+                parent_task_id=task["id"])
+            self.db._reserve_child_receipt_tx(conn, parent["id"], child_task["id"])
+            child, _ = self.db._insert_run_tx(
+                conn, child_task, "child-run", {}, None, None)
+        parent, _ = self.db.transition_run(
+            parent["id"], parent["version"], "waiting", "run.waiting",
+            {"reason": "children"}, checkpoint={"v": 1, "phase": "model_pending",
+                "round": 1, "awaited_child_task_ids": [child_task["id"]]},
+            wait_reason="children", lease_owner="parent-worker",
+            lease_epoch=parent["lease_epoch"])
+        child = self.db.claim_next_run("child-worker", 120)
+        self.assertEqual(child["task_id"], child_task["id"])
+        child, _ = self.db.transition_run(
+            child["id"], child["version"], "failed", "run.failed",
+            {"code": "worker_failed"}, error={"code": "worker_failed"},
+            lease_owner="child-worker", lease_epoch=child["lease_epoch"])
+        self.assertEqual(self.db.get_task(child_task["id"])["status"], "failed")
+        self.assertEqual(self.db.get_run(parent["id"])["status"], "queued")
+        inbox = self.db.list_agent_messages(root["id"])
+        self.assertEqual(len(inbox), 1)
+        self.assertEqual(json.loads(inbox[0]["content"]),
+                         {"task_id": child_task["id"], "status": "failed"})
+        self.assertEqual(inbox[0]["recipient_run_id"], parent["id"])
+        self.assertEqual(self.db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_agent_reply_cannot_answer_stale_question_from_same_child_run(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker")
+        parent_task = self.db.create_task(root["id"], "parent")
+        parent, _ = self.db.create_run(parent_task["id"], "parent-run")
+        parent = self.db.claim_next_run("parent-worker", 120)
+        child_task, child = self.db.host_delegate_task(root["id"], worker["id"], "child")
+        child = self.db.claim_next_run("child-worker", 120)
+        child, _ = self.db.transition_run(
+            child["id"], child["version"], "waiting", "run.waiting",
+            {"reason": "input"}, wait_reason="input", lease_owner="child-worker",
+            lease_epoch=child["lease_epoch"])
+        with self.db._write() as conn:
+            q1 = self.db._insert_message_tx(
+                conn, root["id"], "user", "Q1", sender_session_id=worker["id"],
+                source_run_id=child["id"], related_task_id=child_task["id"],
+                kind="question", hop=1)
+        self.db.host_reply(root["id"], q1, "A1")
+        child = self.db.claim_next_run("child-worker", 120)
+        child, _ = self.db.transition_run(
+            child["id"], child["version"], "waiting", "run.waiting",
+            {"reason": "input"}, wait_reason="input", lease_owner="child-worker",
+            lease_epoch=child["lease_epoch"])
+        with self.db._write() as conn:
+            q2 = self.db._insert_message_tx(
+                conn, root["id"], "user", "Q2", sender_session_id=worker["id"],
+                source_run_id=child["id"], related_task_id=child_task["id"],
+                kind="question", hop=1)
+        self.assertTrue(self.db.list_agent_messages(root["id"])[1]["needs_reply"])
+        stale = self._call("stale-reply", "send_agent_message",
+                           {"to_agent_id": worker["id"], "kind": "reply",
+                            "content": "wrong", "reply_to_message_id": q1})
+        parent, _ = self.db.transition_run(
+            parent["id"], parent["version"], "running", "model.completed",
+            {"round": 1, "tool_count": 1},
+            checkpoint={"v": 1, "phase": "tool_pending", "round": 1,
+                        "assistant_message_id": None, "next_tool_index": 0},
+            message={"role": "assistant", "content": None, "tool_calls": [stale]},
+            lease_owner="parent-worker", lease_epoch=parent["lease_epoch"])
+        parent = self.db.start_tool_call(
+            parent["id"], parent["version"], "parent-worker", parent["lease_epoch"],
+            stale["id"], "send_agent_message", "effectful", "a" * 64, 8192)
+        before = self.db._query_one("SELECT COUNT(*) AS n FROM messages WHERE "
+                                    "recipient_run_id=? AND kind='reply'",
+                                    (child["id"],))["n"]
+        with self.assertRaises(InvalidRunTransition):
+            self.db.apply_control_tool(parent["id"], parent["version"],
+                "parent-worker", parent["lease_epoch"], stale["id"],
+                "send_agent_message", stale["function"]["arguments"])
+        self.assertEqual(self.db.get_run(child["id"])["status"], "waiting")
+        self.assertEqual(self.db._query_one("SELECT COUNT(*) AS n FROM messages WHERE "
+                                            "recipient_run_id=? AND kind='reply'",
+                                            (child["id"],))["n"], before)
+        self.assertEqual(self.db.list_agent_messages(root["id"])[1]["id"], q2)
 
 
 if __name__ == "__main__":
