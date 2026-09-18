@@ -253,6 +253,10 @@ class P2AgentApiTest(unittest.TestCase):
     def test_message_list_and_exact_question_reply(self):
         with patch.object(api, "db", self.database):
             listed = self.client.get("/api/agents/root-1/agent-messages?after_id=4&limit=5")
+            worker_inbox = self.client.post("/api/agents/worker-1/replies", json={
+                "reply_to_message_id": 7, "content": "Forbidden",
+            })
+            self.database.host_reply.assert_not_called()
             replied = self.client.post("/api/agents/root-1/replies", json={
                 "reply_to_message_id": 7, "content": "Proceed",
             })
@@ -261,16 +265,24 @@ class P2AgentApiTest(unittest.TestCase):
                 "reply_to_message_id": 7, "content": "Again",
             })
             hidden = self.client.get("/api/agents/other-tree/agent-messages")
+            cross_tree_reply = self.client.post("/api/agents/other-tree/replies", json={
+                "reply_to_message_id": 7, "content": "No",
+            })
         self.assertEqual(listed.status_code, 200)
         self.assertEqual(listed.json()["messages"][0]["kind"], "question")
         self.assertNotIn("private-marker", listed.text)
         self.database.list_agent_messages.assert_called_once_with("root-1", 4, 5)
         self.assertEqual(replied.status_code, 202)
         self.assertEqual(replied.json()["message"]["agent_id"], "worker-1")
+        self.assertEqual((worker_inbox.status_code, worker_inbox.json()["code"]),
+                         (404, "not_found"))
         self.database.host_reply.assert_any_call("root-1", 7, "Proceed")
+        self.assertEqual(self.database.host_reply.call_count, 2)
         self.assertEqual((duplicate.status_code, duplicate.json()["code"]),
                          (409, "invalid_run_transition"))
         self.assertEqual((hidden.status_code, hidden.json()["code"]), (404, "not_found"))
+        self.assertEqual((cross_tree_reply.status_code, cross_tree_reply.json()["code"]),
+                         (404, "not_found"))
 
     def test_delegation_and_reply_reject_client_identity_and_paths(self):
         bad_payloads = [
@@ -383,7 +395,9 @@ function node() {
     replaceChildren() { this.children = []; }, querySelectorAll() { return []; } };
 }
 const tree = [{agent_id:'root', title:'Supervisor', agent_role:'supervisor', depth:0,
-  can_delegate:true, capability_grants:['read_only'], status:{state:'idle'}}];
+  can_delegate:true, capability_grants:['read_only'], status:{state:'idle'}},
+  {agent_id:'worker', title:'Worker', agent_role:'worker', depth:1,
+  can_delegate:false, capability_grants:['read_only'], status:{state:'idle'}}];
 const context = {
   document: { getElementById(id) { if (!nodes.has(id)) nodes.set(id, node()); return nodes.get(id); },
     createElement: node, querySelectorAll() { return []; } },
@@ -401,10 +415,11 @@ const context = {
     return {ok:true,json:async()=>data};
   },
   console: {log() {}},
+  tree,
 };
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
-vm.runInContext("activeSessionId='root'; agentTree=[{agent_id:'root',title:'Supervisor'}]", context);
+vm.runInContext("activeSessionId='root'; agentTree=tree", context);
 (async () => {
   await vm.runInContext('loadAgentMessages', context)();
   assert.strictEqual(nodes.get('agentMessageList').children.length, 1);
@@ -414,6 +429,11 @@ vm.runInContext("activeSessionId='root'; agentTree=[{agent_id:'root',title:'Supe
   assert.strictEqual(reply.url, '/api/agents/root/replies');
   assert.deepStrictEqual(JSON.parse(reply.options.body),
     {reply_to_message_id:7,content:'Answer'});
+  vm.runInContext("activeSessionId='worker'; agentTree=tree", context);
+  await vm.runInContext('loadAgentMessages', context)();
+  assert.strictEqual(nodes.get('agentMessageList').children[0].children.length, 1);
+  await vm.runInContext('replyToAgent', context)('worker', 7);
+  assert.strictEqual(calls.filter((call) => call.url.endsWith('/replies')).length, 1);
 })().catch((error) => { process.stderr.write(String(error)); process.exitCode = 1; });
 """
         result = subprocess.run(

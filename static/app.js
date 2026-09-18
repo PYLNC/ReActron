@@ -867,6 +867,8 @@ async function showDelegation(taskId) {
 
 async function loadAgentMessages() {
   const agentId = activeSessionId;
+  const root = agentTree.find((agent) => agent.agent_role === "supervisor" && !agent.archived_at);
+  const hostInbox = root && root.agent_id === agentId;
   agentMessageList.replaceChildren();
   if (!agentId || !agentTree.some((agent) => agent.agent_id === agentId)) return;
   try {
@@ -880,9 +882,10 @@ async function loadAgentMessages() {
          message.sender_agent_id) : "宿主";
       const label = document.createElement("span");
       label.textContent = source + " · " + message.kind +
-        (message.needs_reply ? " · 等待宿主答复" : "") + " · " + message.content;
+        (message.needs_reply ? (hostInbox ? " · 等待宿主答复" : " · 等待 Agent 答复") : "") +
+        " · " + message.content;
       item.appendChild(label);
-      if (message.kind === "question" && message.needs_reply) {
+      if (hostInbox && message.kind === "question" && message.needs_reply) {
         const reply = document.createElement("button");
         reply.type = "button";
         reply.textContent = "答复";
@@ -898,6 +901,8 @@ async function loadAgentMessages() {
 
 
 async function replyToAgent(agentId, messageId) {
+  if (!agentTree.some((agent) => agent.agent_role === "supervisor" &&
+      !agent.archived_at && agent.agent_id === agentId)) return;
   const content = window.prompt("回复 Worker 问题");
   if (!content || !content.trim()) return;
   try {

@@ -668,8 +668,8 @@ async def list_agent_messages(agent_id: str, after_id: int = Query(0, ge=0),
 @router.post("/agents/{agent_id}/replies", status_code=202)
 async def host_reply(agent_id: str, payload: HumanReplyRequest):
     try:
-        _root, visible = await _host_tree_ids()
-        if agent_id not in visible:
+        root = await asyncio.to_thread(db.get_supervisor)
+        if not root or agent_id != root["id"]:
             return _error_response(404, "not_found", "资源不存在")
         message, run = await asyncio.to_thread(
             db.host_reply, agent_id, payload.reply_to_message_id, payload.content
