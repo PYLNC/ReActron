@@ -21,6 +21,7 @@ SCHEMA_VERSION = 4
 MAX_EVENT_BYTES = 64 * 1024
 MAX_RUN_EVENT_BYTES = 4 * 1024 * 1024
 TERMINAL_EVENT_RESERVE = 8 * 1024
+CHILD_RECEIPT_RESERVE = 4096
 TERMINAL_EVENTS = frozenset({"run.completed", "run.failed", "run.cancelled"})
 
 
@@ -1367,7 +1368,10 @@ class Database:
     # P1 persistent Run kernel. agent_id is the existing sessions.id.
     @staticmethod
     def _insert_message_tx(conn, session_id, role, content=None, *, task_id=None,
-                           run_id=None, tool_calls=None, tool_call_id=None):
+                           run_id=None, tool_calls=None, tool_call_id=None,
+                           sender_session_id=None, related_task_id=None,
+                           source_run_id=None, recipient_run_id=None,
+                           kind="chat", hop=0):
         session = conn.execute(
             "SELECT archived_at FROM sessions WHERE id=?", (session_id,)
         ).fetchone()
@@ -1381,11 +1385,13 @@ class Database:
         cursor = conn.execute("""
             INSERT INTO messages
                 (session_id,task_id,run_id,role,content,tool_calls_json,
-                 tool_call_id,sequence,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?)
+                 tool_call_id,sequence,created_at,sender_session_id,
+                 related_task_id,source_run_id,recipient_run_id,kind,hop)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (session_id, task_id, run_id, role, content,
               _json(tool_calls) if tool_calls is not None else None,
-              tool_call_id, sequence, now))
+              tool_call_id, sequence, now, sender_session_id,
+              related_task_id, source_run_id, recipient_run_id, kind, hop))
         conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (now, session_id))
         return cursor.lastrowid
 
@@ -1401,21 +1407,57 @@ class Database:
             raise ValueError("acceptance 必须为数组，context 必须为对象")
         return goal.strip(), _json(acceptance), _json(context)
 
-    def _insert_task_tx(self, conn, agent_id, goal, acceptance, context):
+    @staticmethod
+    def _limits(value):
+        if value is None:
+            return {}
+        if not isinstance(value, dict) or set(value) - {"max_rounds", "max_tool_calls"}:
+            raise ValueError("无效 Task limits")
+        for name, maximum in (("max_rounds", 20), ("max_tool_calls", 32)):
+            if name in value and (not isinstance(value[name], int) or
+                                  isinstance(value[name], bool) or
+                                  not 1 <= value[name] <= maximum):
+                raise ValueError("无效 Task limits")
+        return value
+
+    @staticmethod
+    def _refs_context(value):
+        value = {} if value is None else value
+        if not isinstance(value, dict) or set(value) - {"message_refs", "artifact_refs"}:
+            raise ValueError("context 仅接受 message_refs/artifact_refs")
+        for refs in value.values():
+            if (not isinstance(refs, list) or len(refs) > 16 or
+                    any(not isinstance(item, str) or not 1 <= len(item) <= 200
+                        for item in refs)):
+                raise ValueError("context refs 无效")
+        return {"message_refs": value.get("message_refs", []),
+                "artifact_refs": value.get("artifact_refs", [])}
+
+    def _insert_task_tx(self, conn, agent_id, goal, acceptance, context, *,
+                        creator_session_id=None, creator_run_id=None,
+                        parent_task_id=None, requested_grant=None, limits=None):
         goal, acceptance_json, context_json = self._task_values(
             goal, acceptance, context
         )
-        if not conn.execute(
-            "SELECT 1 FROM sessions WHERE id=? AND archived_at IS NULL", (agent_id,)
-        ).fetchone():
+        agent = conn.execute(
+            "SELECT * FROM sessions WHERE id=? AND archived_at IS NULL", (agent_id,)
+        ).fetchone()
+        if not agent:
             raise ResourceNotFound("Agent 不存在")
+        default_grants = (set(json.loads(agent["capabilities_json"])["grants"])
+                          if agent["agent_role"] else {"read_only"})
+        requested = self._capabilities(requested_grant, default_grants)
+        task_limits = self._limits(limits)
         task_id, now = str(uuid.uuid4()), _utc_now()
         conn.execute("""
             INSERT INTO tasks
                 (id,session_id,goal,acceptance_json,context_json,status,
-                 created_at,updated_at)
-            VALUES (?,?,?,?,?,'open',?,?)
-        """, (task_id, agent_id, goal, acceptance_json, context_json, now, now))
+                 created_at,updated_at,creator_session_id,creator_run_id,
+                 parent_task_id,requested_grant_json,limits_json)
+            VALUES (?,?,?,?,?,'open',?,?,?,?,?,?,?)
+        """, (task_id, agent_id, goal, acceptance_json, context_json, now, now,
+              creator_session_id, creator_run_id, parent_task_id,
+              _json({"grants": sorted(requested)}), _json(task_limits)))
         self._insert_message_tx(conn, agent_id, "user", goal, task_id=task_id)
         return dict(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
 
@@ -1437,6 +1479,229 @@ class Database:
             ORDER BY created_at DESC,id DESC LIMIT ?
         """, (agent_id, agent_id, status, status, limit))
 
+    def list_tree_tasks(self, root_id, limit=50):
+        if not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit 必须为 1..100")
+        root = self.get_session(root_id)
+        if not root or root["agent_role"] != "supervisor" or root["archived_at"]:
+            raise ResourceNotFound("根 Supervisor 不存在")
+        return self._query_all("""
+            SELECT tasks.* FROM tasks JOIN sessions ON sessions.id=tasks.session_id
+            WHERE sessions.root_session_id=?
+            ORDER BY tasks.created_at DESC,tasks.id DESC LIMIT ?
+        """, (root_id, limit))
+
+    def host_delegate_task(self, creator_agent_id, assignee_agent_id, goal,
+                           acceptance=None, context=None, requested_grant=None,
+                           limits=None):
+        context = self._refs_context(context)
+        if (acceptance is not None and (not isinstance(acceptance, list) or
+                len(acceptance) > 32 or any(not isinstance(item, str) or
+                                           not 1 <= len(item) <= 500
+                                           for item in acceptance))):
+            raise ValueError("无效验收条件")
+        with self._write() as conn:
+            creator = conn.execute("SELECT * FROM sessions WHERE id=?",
+                                   (creator_agent_id,)).fetchone()
+            assignee = conn.execute("SELECT * FROM sessions WHERE id=?",
+                                    (assignee_agent_id,)).fetchone()
+            if (not creator or creator["agent_role"] != "supervisor" or
+                    creator["archived_at"] is not None or not assignee or
+                    assignee["agent_role"] != "worker" or
+                    assignee["archived_at"] is not None or
+                    assignee["root_session_id"] != creator_agent_id):
+                raise ResourceNotFound("委派目标不存在或跨树")
+            task = self._insert_task_tx(
+                conn, assignee_agent_id, goal, acceptance, context,
+                creator_session_id=creator_agent_id,
+                requested_grant=requested_grant, limits=limits)
+            busy = conn.execute("""
+                SELECT 1 FROM runs WHERE session_id=? AND
+                    status IN ('queued','running','waiting','paused') LIMIT 1
+            """, (assignee_agent_id,)).fetchone()
+            run = None
+            if not busy:
+                run, _ = self._insert_run_tx(conn, task, f"delegate:{task['id']}:1",
+                                             {}, None, None)
+            return task, run
+
+    def schedule_pending_tasks(self):
+        """Give each idle Worker its oldest Task; SQLite remains the queue."""
+        scheduled = []
+        with self._write() as conn:
+            agents = conn.execute("""
+                SELECT id FROM sessions WHERE agent_role='worker' AND archived_at IS NULL
+                ORDER BY created_at,id
+            """).fetchall()
+            for agent in agents:
+                if conn.execute("""
+                    SELECT 1 FROM runs WHERE session_id=? AND
+                        status IN ('queued','running','waiting','paused') LIMIT 1
+                """, (agent["id"],)).fetchone():
+                    continue
+                task = conn.execute("""
+                    SELECT * FROM tasks WHERE session_id=? AND status='open'
+                        AND NOT EXISTS (SELECT 1 FROM runs WHERE task_id=tasks.id)
+                    ORDER BY created_at,id LIMIT 1
+                """, (agent["id"],)).fetchone()
+                if task:
+                    run, _ = self._insert_run_tx(conn, task, f"delegate:{task['id']}:1",
+                                                 {}, None, None)
+                    scheduled.append(run)
+        return scheduled
+
+    @staticmethod
+    def _validated_result(value):
+        if isinstance(value, str):
+            if len(value) > 8000:
+                raise ValueError("结果过长")
+            value = json.loads(value)
+        fields = {"summary", "acceptance_results", "artifacts", "evidence", "followups"}
+        if not isinstance(value, dict) or set(value) != fields:
+            raise ValueError("结果必须为固定结构")
+        if not isinstance(value["summary"], str) or len(value["summary"]) > 2000:
+            raise ValueError("无效结果摘要")
+        for field in fields - {"summary"}:
+            if not isinstance(value[field], list) or len(value[field]) > 32:
+                raise ValueError("结果数组过长")
+        if any(not isinstance(item, dict) or set(item) != {"criterion", "ok"} or
+               not isinstance(item["criterion"], str) or
+               not isinstance(item["ok"], bool)
+               for item in value["acceptance_results"]):
+            raise ValueError("无效验收结果")
+        if any(not isinstance(item, dict) or set(item) != {"artifact_id", "kind"} or
+               any(not isinstance(v, str) or len(v) > 200 for v in item.values())
+               for item in value["artifacts"]):
+            raise ValueError("无效产物引用")
+        if any(not isinstance(item, dict) or set(item) != {"kind", "command", "exit_code"} or
+               not isinstance(item["kind"], str) or not isinstance(item["command"], str) or
+               len(item["command"]) > 1000 or not isinstance(item["exit_code"], int)
+               for item in value["evidence"]):
+            raise ValueError("无效验证证据")
+        if any(not isinstance(item, str) or len(item) > 1000
+               for item in value["followups"]):
+            raise ValueError("无效后续项")
+        return value
+
+    def get_task_result(self, task_id):
+        task = self.get_task(task_id)
+        if not task:
+            raise ResourceNotFound("Task 不存在")
+        return self._validated_result(task["result_json"]) if task["result_json"] else None
+
+    def list_agent_messages(self, agent_id, after_id=0, limit=100):
+        if (not isinstance(after_id, int) or after_id < 0 or
+                not isinstance(limit, int) or not 1 <= limit <= 100):
+            raise ValueError("无效 Message cursor/limit")
+        agent = self.get_session(agent_id)
+        if not agent or agent["agent_role"] is None:
+            raise ResourceNotFound("Agent 不存在")
+        rows = self._query_all("""
+            SELECT messages.*, CASE WHEN messages.kind='question' AND
+                runs.status='waiting' AND runs.wait_reason='input' AND
+                messages.id=(SELECT MAX(newer.id) FROM messages AS newer
+                    WHERE newer.source_run_id=messages.source_run_id
+                        AND newer.kind='question') AND
+                NOT EXISTS (SELECT 1 FROM messages AS reply
+                    WHERE reply.kind='reply' AND reply.related_task_id=messages.related_task_id
+                        AND reply.recipient_run_id=messages.source_run_id
+                        AND reply.content IS NOT NULL
+                        AND reply.id>messages.id)
+                THEN 1 ELSE 0 END AS needs_reply
+            FROM messages LEFT JOIN runs ON runs.id=messages.source_run_id
+            WHERE messages.session_id=? AND messages.kind<>'chat' AND messages.id>?
+            ORDER BY messages.id LIMIT ?
+        """, (agent_id, after_id, limit))
+        return [{**row, "needs_reply": bool(row["needs_reply"])} for row in rows]
+
+    def host_reply(self, agent_id, reply_to_message_id, content):
+        if not isinstance(content, str) or not 1 <= len(content.strip()) <= 8000:
+            raise ValueError("回复必须为 1..8000 字符")
+        with self._write() as conn:
+            agent = conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone()
+            question = conn.execute("SELECT * FROM messages WHERE id=?", (reply_to_message_id,)).fetchone()
+            if (not agent or agent["agent_role"] != "supervisor" or
+                    agent["archived_at"] is not None or not question or
+                    question["kind"] != "question" or question["session_id"] != agent_id):
+                raise ResourceNotFound("待回复问题不存在")
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (question["source_run_id"],)).fetchone()
+            latest = conn.execute("""
+                SELECT MAX(id) FROM messages WHERE source_run_id=? AND kind='question'
+            """, (question["source_run_id"],)).fetchone()[0]
+            if (not run or run["session_id"] != question["sender_session_id"] or
+                    run["status"] != "waiting" or run["wait_reason"] != "input" or
+                    latest != question["id"]):
+                raise InvalidRunTransition("问题已回复或 Run 不再等待输入")
+            recipient = conn.execute("SELECT root_session_id,archived_at FROM sessions WHERE id=?",
+                                     (run["session_id"],)).fetchone()
+            if not recipient or recipient["root_session_id"] != agent_id or recipient["archived_at"]:
+                raise ResourceNotFound("发问 Agent 不在当前树")
+            message_id = self._insert_message_tx(
+                conn, run["session_id"], "user", content.strip(),
+                sender_session_id=None, related_task_id=run["task_id"],
+                recipient_run_id=run["id"], kind="reply", hop=question["hop"])
+            now = _utc_now()
+            conn.execute("""
+                UPDATE runs SET status='queued',wait_reason=NULL,version=version+1,
+                    updated_at=? WHERE id=? AND status='waiting' AND wait_reason='input'
+            """, (now, run["id"]))
+            self._append_event_tx(conn, run["id"], "run.resumed",
+                                  {"message_id": message_id, "reason": "host_reply"})
+            return (dict(conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()),
+                    dict(conn.execute("SELECT * FROM runs WHERE id=?", (run["id"],)).fetchone()))
+
+    def control_scope(self, run_id):
+        """Trusted, advisory Gateway scope. Mutations recheck it in the write txn."""
+        with self._lock:
+            conn = self._conn
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise ResourceNotFound("Run 不存在")
+            agent = conn.execute("SELECT * FROM sessions WHERE id=?", (run["session_id"],)).fetchone()
+            empty = {"agent_id": run["session_id"], "role": None,
+                     "parent_agent_id": None, "root_agent_id": None,
+                     "can_delegate": False, "delegate_agent_ids": frozenset(),
+                     "message_agent_ids": frozenset(), "status_task_ids": frozenset(),
+                     "wait_child_task_ids": frozenset(), "cancel_task_ids": frozenset(),
+                     "remaining_depth": 0, "remaining_children": 0,
+                     "remaining_hops": 0}
+            if not agent or agent["agent_role"] is None or agent["archived_at"]:
+                return empty
+            root_id = agent["root_session_id"]
+            peers = conn.execute("""
+                SELECT id,parent_session_id FROM sessions
+                WHERE root_session_id=? AND archived_at IS NULL
+            """, (root_id,)).fetchall()
+            children = {row["id"] for row in peers if row["parent_session_id"] == agent["id"]}
+            messages = set(children)
+            if agent["parent_session_id"]:
+                messages.add(agent["parent_session_id"])
+            tasks = conn.execute("""
+                SELECT tasks.id,tasks.creator_run_id,tasks.status FROM tasks
+                JOIN sessions ON sessions.id=tasks.session_id
+                WHERE sessions.root_session_id=?
+            """, (root_id,)).fetchall()
+            child_ids = {row["id"] for row in tasks if row["creator_run_id"] == run_id}
+            child_count = conn.execute("""
+                SELECT COUNT(*) FROM tasks WHERE creator_run_id=?
+            """, (run_id,)).fetchone()[0]
+            allowed_delegate = bool(agent["can_delegate"] and agent["depth"] < 2 and
+                                    "control.delegate_task" in
+                                    json.loads(run["effective_grant_json"])["grants"])
+            return {"agent_id": agent["id"], "role": agent["agent_role"],
+                    "parent_agent_id": agent["parent_session_id"],
+                    "root_agent_id": root_id,
+                    "can_delegate": allowed_delegate,
+                    "delegate_agent_ids": frozenset(children if allowed_delegate else ()),
+                    "message_agent_ids": frozenset(messages),
+                    "status_task_ids": frozenset(row["id"] for row in tasks),
+                    "wait_child_task_ids": frozenset(child_ids),
+                    "cancel_task_ids": frozenset(row["id"] for row in tasks
+                                                 if row["id"] in child_ids and row["status"] == "open"),
+                    "remaining_depth": 2 - agent["depth"] if allowed_delegate else 0,
+                    "remaining_children": max(0, 4 - child_count) if allowed_delegate else 0,
+                    "remaining_hops": max(0, 2 - agent["depth"])}
+
     def get_latest_run_id(self, task_id):
         row = self._query_one(
             "SELECT id FROM runs WHERE task_id=? ORDER BY attempt DESC LIMIT 1", (task_id,)
@@ -1451,10 +1716,10 @@ class Database:
             "session_id": session_id, "task_id": task_id, "options": options
         }).encode("utf-8")).hexdigest()
 
-    def _default_run_snapshots_tx(self, conn):
+    def _default_run_snapshots_tx(self, conn, grants=frozenset({"read_only"})):
         """Freeze safe metadata, never a Provider key or executable handler."""
         from backend.config import load_config
-        from backend.tool_gateway import snapshot_builtin_tools
+        from backend import tool_gateway
 
         cfg = load_config()
         settings = conn.execute("SELECT * FROM settings WHERE id=1").fetchone()
@@ -1469,7 +1734,9 @@ class Database:
             "credential_fingerprint": hashlib.sha256(credential.encode()).hexdigest()
                 if credential else None,
         }
-        specs = snapshot_builtin_tools()
+        specs = dict(tool_gateway.snapshot_builtin_tools())
+        if hasattr(tool_gateway, "snapshot_internal_tools"):
+            specs.update(tool_gateway.snapshot_internal_tools())
         tools = {name: {
             "schema": spec.schema,
             "effects": sorted(spec.effects),
@@ -1479,7 +1746,30 @@ class Database:
             "timeout_seconds": spec.timeout_seconds,
             "origin": spec.origin,
         } for name, spec in specs.items()}
-        return config, {"v": 1, "specs": tools, "grants": ["read_only"]}
+        return config, {"v": 1, "specs": tools, "grants": sorted(grants)}
+
+    @staticmethod
+    def _effective_grants_tx(conn, task):
+        assignee = conn.execute("SELECT * FROM sessions WHERE id=?",
+                                (task["session_id"],)).fetchone()
+        if assignee["agent_role"] is None:
+            return {"read_only"}
+        parents = HOST_GRANTS
+        if task["creator_run_id"]:
+            parent = conn.execute("SELECT effective_grant_json FROM runs WHERE id=?",
+                                  (task["creator_run_id"],)).fetchone()
+            if not parent:
+                raise ResourceNotFound("创建 Run 不存在")
+            parents = set(json.loads(parent["effective_grant_json"])["grants"])
+        elif task["creator_session_id"]:
+            creator = conn.execute("SELECT capabilities_json FROM sessions WHERE id=?",
+                                   (task["creator_session_id"],)).fetchone()
+            parents = set(json.loads(creator["capabilities_json"])["grants"])
+        grants = (set(parents) & set(json.loads(assignee["capabilities_json"])["grants"])
+                  & set(json.loads(task["requested_grant_json"])["grants"]) & HOST_GRANTS)
+        if not assignee["can_delegate"]:
+            grants.discard("control.delegate_task")
+        return grants
 
     def _insert_run_tx(self, conn, task, idempotency_key, options,
                        config_snapshot, tool_snapshot, *, request_hash=None):
@@ -1516,10 +1806,14 @@ class Database:
                 UPDATE tasks SET status='open',finished_at=NULL,result_json=NULL,
                     updated_at=? WHERE id=?
             """, (_utc_now(), task["id"]))
+        grants = self._effective_grants_tx(conn, task)
         if config_snapshot is None or tool_snapshot is None:
-            frozen_config, frozen_tools = self._default_run_snapshots_tx(conn)
+            frozen_config, frozen_tools = self._default_run_snapshots_tx(conn, grants)
             config_snapshot = frozen_config if config_snapshot is None else config_snapshot
             tool_snapshot = frozen_tools if tool_snapshot is None else tool_snapshot
+        if isinstance(tool_snapshot, dict) and "grants" in tool_snapshot:
+            tool_snapshot = {**tool_snapshot,
+                             "grants": sorted(set(tool_snapshot["grants"]) & grants)}
         cutoff = conn.execute(
             "SELECT COALESCE(MAX(sequence),0) FROM messages WHERE session_id=?",
             (task["session_id"],),
@@ -1532,10 +1826,11 @@ class Database:
             INSERT INTO runs
                 (id,task_id,session_id,attempt,idempotency_key,request_hash,status,
                  config_snapshot_json,tool_snapshot_json,context_max_sequence,
-                 created_at,updated_at)
-            VALUES (?,?,?,?,?,?,'queued',?,?,?,?,?)
+                 created_at,updated_at,effective_grant_json)
+            VALUES (?,?,?,?,?,?,'queued',?,?,?,?,?,?)
         """, (run_id, task["id"], task["session_id"], attempt, key, fingerprint,
-              _json(config_snapshot), _json(tool_snapshot), cutoff, now, now))
+              _json(config_snapshot), _json(tool_snapshot), cutoff, now, now,
+              _json({"grants": sorted(grants)})))
         self._append_event_tx(conn, run_id, "run.queued", {"attempt": attempt},
                               dedupe_key=f"{run_id}:run.queued")
         return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), True
@@ -1582,7 +1877,8 @@ class Database:
 
     @staticmethod
     def _append_event_tx(conn, run_id, event_type, payload=None, dedupe_key=None,
-                         *, terminal_reserve=False):
+                         *, terminal_reserve=False, child_receipt_task_id=None,
+                         actor_session_id=None, recipient_session_id=None):
         if not isinstance(event_type, str) or not 1 <= len(event_type) <= 80:
             raise ValueError("无效 Event type")
         if payload is None:
@@ -1590,7 +1886,7 @@ class Database:
         if not isinstance(payload, dict):
             raise ValueError("Event payload 必须为对象")
         run = conn.execute(
-            "SELECT task_id,session_id,status,event_bytes_written FROM runs WHERE id=?",
+            "SELECT task_id,session_id,status,event_bytes_written,usage_json FROM runs WHERE id=?",
             (run_id,),
         ).fetchone()
         if not run:
@@ -1610,9 +1906,11 @@ class Database:
         now = _utc_now()
         payload_json = _json(payload)
         cursor = conn.execute("""
-            INSERT INTO events (task_id,run_id,type,dedupe_key,payload_json,created_at)
-            VALUES (?,?,?,?,?,?)
-        """, (run["task_id"], run_id, event_type, dedupe_key, payload_json, now))
+            INSERT INTO events (task_id,run_id,type,dedupe_key,payload_json,created_at,
+                                actor_session_id,recipient_session_id)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (run["task_id"], run_id, event_type, dedupe_key, payload_json, now,
+              actor_session_id, recipient_session_id))
         envelope = {
             "v": 1,
             "event_id": cursor.lastrowid,
@@ -1624,15 +1922,40 @@ class Database:
             "data": payload,
         }
         size = len(_json(envelope).encode("utf-8"))
+        usage = json.loads(run["usage_json"] or "{}")
+        reserved = usage.get("p2_child_reserve", {})
+        if child_receipt_task_id is not None and child_receipt_task_id not in reserved:
+            raise InvalidRunTransition("子 Task 无 Event 收件预留")
+        held = sum(reserved.values()) - reserved.get(child_receipt_task_id, 0)
         limit = (MAX_RUN_EVENT_BYTES if event_type in TERMINAL_EVENTS or terminal_reserve
-                 else MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE)
+                 else MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE - held)
         if size > MAX_EVENT_BYTES or run["event_bytes_written"] + size > limit:
             raise EventLimitExceeded("Event 超出持久化字节额度")
         conn.execute(
             "UPDATE runs SET event_bytes_written=event_bytes_written+? WHERE id=?",
             (size, run_id),
         )
+        if child_receipt_task_id is not None:
+            del reserved[child_receipt_task_id]
+            usage["p2_child_reserve"] = reserved
+            conn.execute("UPDATE runs SET usage_json=? WHERE id=?", (_json(usage), run_id))
         return dict(conn.execute("SELECT * FROM events WHERE id=?", (cursor.lastrowid,)).fetchone())
+
+    @staticmethod
+    def _reserve_child_receipt_tx(conn, run_id, task_id):
+        run = conn.execute("SELECT event_bytes_written,usage_json FROM runs WHERE id=?",
+                           (run_id,)).fetchone()
+        usage = json.loads(run["usage_json"] or "{}")
+        reserved = usage.setdefault("p2_child_reserve", {})
+        if task_id not in reserved:
+            if len(reserved) >= 4:
+                raise AgentHierarchyError("单 Run 最多等待 4 个子 Task")
+            reserved[task_id] = CHILD_RECEIPT_RESERVE
+        # Leave another 4 KiB for the parent's own tool message/checkpoint Event.
+        if (run["event_bytes_written"] + sum(reserved.values()) + 4096 >
+                MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE):
+            raise EventLimitExceeded("父 Run 的子结果 Event 预留空间不足")
+        conn.execute("UPDATE runs SET usage_json=? WHERE id=?", (_json(usage), run_id))
 
     def append_event(self, run_id, event_type, payload=None, dedupe_key=None):
         if isinstance(event_type, str) and event_type.startswith("run."):
@@ -1826,6 +2149,279 @@ class Database:
                     WHERE id=? AND status='open'
                 """, (status, now, now, run["task_id"]))
             return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), message_id
+
+    def apply_control_tool(self, run_id, expected_version, lease_owner, lease_epoch,
+                           call_id, tool_name, arguments, model_text=None):
+        """Apply a Gateway-approved internal tool, including its checkpoint, once."""
+        if isinstance(arguments, str):
+            arguments = json.loads(arguments)
+        if not isinstance(arguments, dict) or tool_name not in {
+            "delegate_task", "send_agent_message", "get_task_status",
+            "wait_for_tasks", "cancel_task", "request_human_approval",
+        }:
+            raise ValueError("无效内部控制工具")
+        with self._write() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise ResourceNotFound("Run 不存在")
+            if (run["status"] != "running" or run["version"] != expected_version or
+                    run["lease_owner"] != lease_owner or run["lease_epoch"] != lease_epoch or
+                    run["lease_until"] <= _utc_now() or run["control_requested"]):
+                raise InvalidRunTransition("Run lease/version/control 已变化")
+            agent = conn.execute("SELECT * FROM sessions WHERE id=?", (run["session_id"],)).fetchone()
+            if (not agent or agent["agent_role"] is None or agent["archived_at"] or
+                    f"control.{tool_name}" not in json.loads(run["effective_grant_json"])["grants"]):
+                raise AgentHierarchyError("Agent 无此控制权限")
+            checkpoint = json.loads(run["checkpoint_json"] or "{}")
+            if checkpoint.get("phase") != "tool_pending":
+                raise InvalidRunTransition("Run 不在工具检查点")
+            assistant = conn.execute("SELECT * FROM messages WHERE id=?",
+                                     (checkpoint.get("assistant_message_id"),)).fetchone()
+            if not assistant or assistant["run_id"] != run_id:
+                raise InvalidRunTransition("工具调用缺少已提交 assistant 消息")
+            calls = json.loads(assistant["tool_calls_json"] or "[]")
+            index = checkpoint.get("next_tool_index")
+            if not isinstance(index, int) or not 0 <= index < len(calls):
+                raise InvalidRunTransition("工具调用检查点无效")
+            call = calls[index]
+            stored = call["function"]["arguments"]
+            stored = json.loads(stored) if isinstance(stored, str) else stored
+            if (call.get("id") != call_id or call["function"].get("name") != tool_name or
+                    _json(stored) != _json(arguments)):
+                raise InvalidRunTransition("控制参数与已提交调用不一致")
+            started = conn.execute("""
+                SELECT 1 FROM events WHERE run_id=? AND type='tool.started'
+                    AND json_extract(payload_json,'$.call_id')=?
+            """, (run_id, call_id)).fetchone()
+            result = conn.execute("""
+                SELECT 1 FROM messages WHERE run_id=? AND role='tool' AND tool_call_id=?
+            """, (run_id, call_id)).fetchone()
+            if not started or result:
+                raise InvalidRunTransition("工具未启动或已经完成")
+            task = conn.execute("SELECT * FROM tasks WHERE id=?", (run["task_id"],)).fetchone()
+            now = _utc_now()
+            status, wait_reason = "running", None
+            payload = {"call_id": call_id, "name": tool_name, "status": "ok"}
+            text = ""
+            recipient = None
+            if tool_name == "delegate_task":
+                if (set(arguments) - {"assignee_agent_id", "goal", "acceptance", "context", "limits"} or
+                        not agent["can_delegate"] or agent["depth"] >= 2):
+                    raise AgentHierarchyError("委派参数或层级无效")
+                assignee = conn.execute("SELECT * FROM sessions WHERE id=?",
+                                        (arguments.get("assignee_agent_id"),)).fetchone()
+                if (not assignee or assignee["parent_session_id"] != agent["id"] or
+                        assignee["archived_at"] or
+                        assignee["root_session_id"] != agent["root_session_id"]):
+                    raise ResourceNotFound("委派目标不在当前树")
+                count = conn.execute("SELECT COUNT(*) FROM tasks WHERE creator_run_id=?",
+                                     (run_id,)).fetchone()[0]
+                if count >= 4:
+                    raise AgentHierarchyError("单 Run 子 Task 数量已满")
+                context = self._refs_context(arguments.get("context"))
+                acceptance = arguments.get("acceptance")
+                if (not isinstance(acceptance, list) or len(acceptance) > 16 or
+                        any(not isinstance(item, str) or len(item) > 1000 for item in acceptance)):
+                    raise ValueError("无效委派验收条件")
+                child = self._insert_task_tx(
+                    conn, assignee["id"], arguments.get("goal"), acceptance, context,
+                    creator_session_id=agent["id"], creator_run_id=run_id,
+                    parent_task_id=run["task_id"],
+                    requested_grant=json.loads(run["effective_grant_json"]),
+                    limits=arguments.get("limits"))
+                self._reserve_child_receipt_tx(conn, run_id, child["id"])
+                busy = conn.execute("""
+                    SELECT 1 FROM runs WHERE session_id=? AND
+                        status IN ('queued','running','waiting','paused') LIMIT 1
+                """, (assignee["id"],)).fetchone()
+                child_run = None
+                if not busy:
+                    child_run, _ = self._insert_run_tx(conn, child,
+                        f"delegate:{child['id']}:1", {}, None, None)
+                text = _json({"task_id": child["id"],
+                              "run_id": child_run["id"] if child_run else None,
+                              "status": "queued"})
+                payload["related_task_id"] = child["id"]
+            elif tool_name == "send_agent_message":
+                if set(arguments) - {"to_agent_id", "kind", "content", "related_task_id", "reply_to_message_id"}:
+                    raise ValueError("消息参数无效")
+                kind, content = arguments.get("kind"), arguments.get("content")
+                recipient = conn.execute("SELECT * FROM sessions WHERE id=?",
+                                         (arguments.get("to_agent_id"),)).fetchone()
+                if (kind not in {"question", "progress", "result", "reply"} or
+                        not isinstance(content, str) or not 1 <= len(content) <= 8000 or
+                        not recipient or recipient["archived_at"] or
+                        recipient["root_session_id"] != agent["root_session_id"]):
+                    raise ResourceNotFound("消息收件方不存在或参数无效")
+                if kind in {"question", "progress", "result"}:
+                    if recipient["id"] != agent["parent_session_id"]:
+                        raise ResourceNotFound("只能向直属父 Agent 报告")
+                    if arguments.get("related_task_id", run["task_id"]) != run["task_id"]:
+                        raise AgentHierarchyError("消息 Task 不属于发方 Run")
+                    parent_run_id = task["creator_run_id"]
+                    message_id = self._insert_message_tx(
+                        conn, recipient["id"], "user", content,
+                        sender_session_id=agent["id"], related_task_id=run["task_id"],
+                        source_run_id=run_id, recipient_run_id=parent_run_id,
+                        kind=kind, hop=agent["depth"])
+                    payload["message_id"] = message_id
+                    if kind == "question":
+                        status, wait_reason = "waiting", "input"
+                    elif kind == "result":
+                        validated = self._validated_result(content)
+                        status = "completed"
+                        conn.execute("""
+                            UPDATE tasks SET status='completed',result_json=?,
+                                finished_at=?,updated_at=? WHERE id=? AND status='open'
+                        """, (_json(validated), now, now, run["task_id"]))
+                    if parent_run_id:
+                        parent = conn.execute("SELECT * FROM runs WHERE id=?",
+                                              (parent_run_id,)).fetchone()
+                        if parent and parent["status"] not in {"completed", "failed", "cancelled"}:
+                            if kind in {"question", "result"}:
+                                self._append_event_tx(
+                                    conn, parent_run_id, f"agent.{kind}",
+                                    {"message_id": message_id, "task_id": run["task_id"]},
+                                    child_receipt_task_id=(run["task_id"] if kind == "result" else None),
+                                    actor_session_id=agent["id"],
+                                    recipient_session_id=recipient["id"])
+                            if parent["status"] == "waiting" and parent["wait_reason"] == "children":
+                                awaited = json.loads(parent["checkpoint_json"] or "{}").get(
+                                    "awaited_child_task_ids", [])
+                                if run["task_id"] in awaited:
+                                    conn.execute("""
+                                        UPDATE runs SET status='queued',wait_reason=NULL,
+                                            version=version+1,updated_at=? WHERE id=?
+                                    """, (now, parent_run_id))
+                    text = _json({"message_id": message_id, "kind": kind})
+                else:
+                    question = conn.execute("SELECT * FROM messages WHERE id=?",
+                                            (arguments.get("reply_to_message_id"),)).fetchone()
+                    child_run = conn.execute("SELECT * FROM runs WHERE id=?",
+                                             (question["source_run_id"],)).fetchone() if question else None
+                    if (not question or question["kind"] != "question" or
+                            question["session_id"] != agent["id"] or
+                            question["sender_session_id"] != recipient["id"] or
+                            not child_run or child_run["status"] != "waiting" or
+                            child_run["wait_reason"] != "input" or
+                            child_run["session_id"] != recipient["id"]):
+                        raise InvalidRunTransition("回复目标不再等待输入")
+                    message_id = self._insert_message_tx(
+                        conn, recipient["id"], "user", content,
+                        sender_session_id=agent["id"], related_task_id=child_run["task_id"],
+                        source_run_id=run_id, recipient_run_id=child_run["id"],
+                        kind="reply", hop=agent["depth"])
+                    conn.execute("""
+                        UPDATE runs SET status='queued',wait_reason=NULL,version=version+1,
+                            updated_at=? WHERE id=?
+                    """, (now, child_run["id"]))
+                    self._append_event_tx(conn, child_run["id"], "run.resumed",
+                                          {"message_id": message_id, "reason": "agent_reply"})
+                    text = _json({"message_id": message_id, "kind": "reply"})
+            elif tool_name == "get_task_status":
+                if set(arguments) != {"task_id"}:
+                    raise ValueError("任务状态参数无效")
+                target = conn.execute("""
+                    SELECT tasks.* FROM tasks JOIN sessions ON sessions.id=tasks.session_id
+                    WHERE tasks.id=? AND sessions.root_session_id=?
+                """, (arguments["task_id"], agent["root_session_id"])).fetchone()
+                if not target:
+                    raise ResourceNotFound("Task 不在当前树")
+                text = _json({"task_id": target["id"], "status": target["status"],
+                              "assignee_agent_id": target["session_id"]})
+            elif tool_name == "wait_for_tasks":
+                ids = arguments.get("task_ids")
+                if (set(arguments) != {"task_ids"} or not isinstance(ids, list) or
+                        not 1 <= len(ids) <= 4 or len(set(ids)) != len(ids)):
+                    raise ValueError("无效等待 Task 列表")
+                rows = conn.execute("SELECT id,status FROM tasks WHERE creator_run_id=?",
+                                    (run_id,)).fetchall()
+                owned = {row["id"]: row["status"] for row in rows}
+                if any(task_id not in owned for task_id in ids):
+                    raise ResourceNotFound("子 Task 不属于此 Run")
+                outstanding = [task_id for task_id in ids if owned[task_id] == "open"]
+                for child_id in outstanding:
+                    reserved = json.loads(run["usage_json"] or "{}").get("p2_child_reserve", {})
+                    if child_id not in reserved:
+                        raise EventLimitExceeded("子结果未预留 Event 空间")
+                if outstanding:
+                    status, wait_reason = "waiting", "children"
+                checkpoint["awaited_child_task_ids"] = ids
+                text = _json({"task_ids": ids, "outstanding_task_ids": outstanding})
+            elif tool_name == "cancel_task":
+                if set(arguments) != {"task_id"}:
+                    raise ValueError("取消参数无效")
+                child = conn.execute("SELECT * FROM tasks WHERE id=? AND creator_run_id=?",
+                                     (arguments["task_id"], run_id)).fetchone()
+                if not child or child["status"] != "open":
+                    raise ResourceNotFound("可取消的子 Task 不存在")
+                child_run = conn.execute("""
+                    SELECT * FROM runs WHERE task_id=? ORDER BY attempt DESC LIMIT 1
+                """, (child["id"],)).fetchone()
+                if child_run and child_run["status"] != "queued":
+                    raise InvalidRunTransition("运行或未知结果的子 Task 不可由此工具直接取消")
+                if child_run:
+                    conn.execute("""
+                        UPDATE runs SET status='cancelled',finished_at=?,updated_at=?,
+                            version=version+1 WHERE id=?
+                    """, (now, now, child_run["id"]))
+                    self._append_event_tx(conn, child_run["id"], "run.cancelled",
+                                          {"reason": "parent_cancel"})
+                conn.execute("""
+                    UPDATE tasks SET status='cancelled',finished_at=?,updated_at=? WHERE id=?
+                """, (now, now, child["id"]))
+                self._append_event_tx(conn, run_id, "agent.child_cancelled",
+                                      {"task_id": child["id"]},
+                                      child_receipt_task_id=child["id"])
+                text = _json({"task_id": child["id"], "status": "cancelled"})
+            else:
+                if set(arguments) != {"reason"} or not isinstance(arguments["reason"], str):
+                    raise ValueError("审批参数无效")
+                reason = arguments["reason"]
+                if not 1 <= len(reason) <= 2000:
+                    raise ValueError("审批理由无效")
+                approval_id = str(uuid.uuid4())
+                expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+                conn.execute("""
+                    INSERT INTO approvals
+                        (id,run_id,tool_call_id,kind,action_hash,request_summary_json,
+                         status,expires_at,created_at)
+                    VALUES (?,?,?,'pre_execution',?,?,'pending',?,?)
+                """, (approval_id, run_id, call_id,
+                      hashlib.sha256(reason.encode()).hexdigest(),
+                      _json({"reason": reason}), expires, now))
+                status, wait_reason = "waiting", "approval"
+                text = _json({"approval_id": approval_id, "status": "pending"})
+            if len(text) > 8000:
+                raise ValueError("控制工具结果过长")
+            checkpoint = {**checkpoint, "next_tool_index": index + 1}
+            if status != "waiting":
+                checkpoint.pop("awaited_child_task_ids", None)
+            terminal = status == "completed"
+            conn.execute("""
+                UPDATE runs SET status=?,wait_reason=?,version=version+1,
+                    lease_owner=?,lease_until=?,checkpoint_json=?,updated_at=?,
+                    finished_at=CASE WHEN ? THEN ? ELSE finished_at END
+                WHERE id=? AND version=?
+            """, (status, wait_reason, lease_owner if status == "running" else None,
+                  run["lease_until"] if status == "running" else None,
+                  _json(checkpoint), now, terminal, now, run_id, expected_version))
+            tool_message_id = self._insert_message_tx(
+                conn, run["session_id"], "tool", text,
+                task_id=run["task_id"], run_id=run_id, tool_call_id=call_id)
+            self._append_event_tx(conn, run_id, "message.completed",
+                                  {"message_id": tool_message_id,
+                                   "hash": hashlib.sha256(text.encode()).hexdigest(),
+                                   "length": len(text)},
+                                  f"{run_id}:message.completed:{tool_message_id}",
+                                  terminal_reserve=terminal)
+            self._append_event_tx(conn, run_id,
+                                  "run.completed" if terminal else "tool.completed",
+                                  {"call_id": call_id, "name": tool_name,
+                                   "status": "ok"} if not terminal else
+                                  {"reason": "child_result", "call_id": call_id},
+                                  f"{run_id}:run.completed" if terminal else None)
+            return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), tool_message_id
 
     def start_tool_call(self, run_id, expected_version, lease_owner, lease_epoch,
                         call_id, name, effect, action_hash, min_result_bytes=4096):

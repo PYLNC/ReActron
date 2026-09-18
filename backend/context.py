@@ -81,9 +81,9 @@ def build_context(database, run_id, system_prompt="", max_messages=128, max_char
         ORDER BY sequence
     """, (run["session_id"], run["context_max_sequence"]))
     own_rows = database._query_all("""
-        SELECT * FROM messages WHERE run_id=? AND sequence>?
+        SELECT * FROM messages WHERE (run_id=? OR recipient_run_id=?) AND sequence>?
         ORDER BY sequence
-    """, (run_id, run["context_max_sequence"]))
+    """, (run_id, run_id, run["context_max_sequence"]))
     own = [message for group in _complete_groups(own_rows) for message in group]
     core = [*prefix, current, *own]
     if len(core) > max_messages or len(_json(core)) + snapshot_chars > max_chars:

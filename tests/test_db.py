@@ -12,8 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from backend.db import (AgentHierarchyError, Database, ResourceNotFound,
-                        SupervisorAlreadyExists)
+from backend.db import (AgentHierarchyError, Database, InvalidRunTransition,
+                        ResourceNotFound, SupervisorAlreadyExists)
 
 
 NOW = "2026-01-01 00:00:00"
@@ -513,18 +513,173 @@ class P2AgentSchemaTest(unittest.TestCase):
                 INSERT INTO sessions(id,title,created_at,updated_at,project_id)
                 VALUES (?,?,?,?,?)
             """, (session_id, "historical", NOW, NOW, project_id))
-            task = old.create_task(session_id, "old task")
-            run, _ = old.create_run(task["id"], "old-key",
-                                    config_snapshot={}, tool_snapshot={})
+            # Seed the v3 format directly: P2 repository methods run only after migration.
+            old._execute("""
+                INSERT INTO tasks(id,session_id,goal,created_at,updated_at)
+                VALUES ('historical-task',?,'old task',?,?)
+            """, (session_id, NOW, NOW))
+            old._execute("""
+                INSERT INTO runs(id,task_id,session_id,attempt,idempotency_key,
+                    request_hash,status,config_snapshot_json,tool_snapshot_json,
+                    context_max_sequence,created_at,updated_at)
+                VALUES ('historical-run','historical-task',?,1,'old-key','hash',
+                    'queued','{}','{}',0,?,?)
+            """, (session_id, NOW, NOW))
             old.close()
         upgraded = Database(Path(self.tmp.name) / "v3.db")
         self.addCleanup(upgraded.close)
         self.assertEqual(upgraded._conn.execute("PRAGMA user_version").fetchone()[0], 4)
         self.assertIsNone(upgraded.get_session(session_id)["agent_role"])
-        self.assertEqual(upgraded.get_run(run["id"])["effective_grant_json"],
+        self.assertEqual(upgraded.get_run("historical-run")["effective_grant_json"],
                          '{"grants":["read_only"]}')
         self.assertEqual(upgraded._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.assertEqual(upgraded._conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    def test_host_delegation_freezes_intersection_and_busy_worker_queues_task(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker")
+        first, run = self.db.host_delegate_task(
+            root["id"], worker["id"], "first", ["done"],
+            {"message_refs": [], "artifact_refs": []},
+            {"grants": ["read_only", "control.delegate_task", "control.send_agent_message"]},
+            {"max_rounds": 4, "max_tool_calls": 2})
+        self.assertEqual(first["session_id"], worker["id"])
+        self.assertEqual(first["creator_session_id"], root["id"])
+        self.assertIsNotNone(run)
+        effective = set(json.loads(run["effective_grant_json"])["grants"])
+        self.assertEqual(effective, {"read_only", "control.send_agent_message"})
+        self.assertEqual(json.loads(first["limits_json"])["max_tool_calls"], 2)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db._execute("UPDATE tasks SET goal='changed' WHERE id=?", (first["id"],))
+        second, queued = self.db.host_delegate_task(root["id"], worker["id"], "second")
+        self.assertIsNone(queued)
+        self.assertEqual(self.db.get_latest_run_id(second["id"]), None)
+        self.db.request_control(run["id"], "cancel")
+        scheduled = self.db.schedule_pending_tasks()
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(scheduled[0]["task_id"], second["id"])
+        self.assertEqual(self.db.schedule_pending_tasks(), [])
+        self.assertEqual([task["id"] for task in self.db.list_tree_tasks(root["id"])],
+                         [second["id"], first["id"]])
+        with self.assertRaises(ValueError):
+            self.db.host_delegate_task(root["id"], worker["id"], "invalid",
+                                       requested_grant={"grants": ["filesystem.write"]})
+        legacy = self.db.create_session("outside")
+        with self.assertRaises(ResourceNotFound):
+            self.db.host_delegate_task(legacy["id"], worker["id"], "cross tree")
+
+    def _control_run(self, run, calls, owner="p2-test"):
+        claimed = self.db.claim_next_run(owner, 120)
+        self.assertEqual(claimed["id"], run["id"])
+        checkpoint = {"v": 1, "phase": "tool_pending", "round": 1,
+                      "assistant_message_id": None, "next_tool_index": 0}
+        claimed, _ = self.db.transition_run(
+            claimed["id"], claimed["version"], "running", "model.completed",
+            {"round": 1, "tool_count": len(calls)}, checkpoint=checkpoint,
+            message={"role": "assistant", "content": None, "tool_calls": calls},
+            lease_owner=owner, lease_epoch=claimed["lease_epoch"])
+        return claimed
+
+    def _apply_control(self, run, call, owner="p2-test"):
+        run = self.db.start_tool_call(
+            run["id"], run["version"], owner, run["lease_epoch"], call["id"],
+            call["function"]["name"], "effectful", "a" * 64, 8192)
+        return self.db.apply_control_tool(
+            run["id"], run["version"], owner, run["lease_epoch"],
+            call["id"], call["function"]["name"], call["function"]["arguments"])
+
+    @staticmethod
+    def _call(call_id, name, arguments):
+        return {"id": call_id, "type": "function", "function":
+                {"name": name, "arguments": json.dumps(arguments)}}
+
+    def test_question_host_reply_is_atomic_and_does_not_accept_spoofed_target(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker")
+        outsider = self.db.create_session("outsider")
+        task, run = self.db.host_delegate_task(root["id"], worker["id"], "ask")
+        call = self._call("ask-1", "send_agent_message",
+                          {"to_agent_id": root["id"], "kind": "question",
+                           "content": "Need input"})
+        running = self._control_run(run, [call])
+        running = self.db.start_tool_call(
+            running["id"], running["version"], "p2-test", running["lease_epoch"],
+            call["id"], "send_agent_message", "effectful", "a" * 64, 8192)
+        with self.assertRaises(InvalidRunTransition):
+            self.db.apply_control_tool(running["id"], running["version"], "p2-test",
+                running["lease_epoch"], call["id"], "send_agent_message",
+                {"to_agent_id": outsider["id"], "kind": "question", "content": "Need input"})
+        self.assertEqual(self.db.get_run(run["id"])["status"], "running")
+        self.assertEqual(self.db.list_agent_messages(root["id"]), [])
+        running, _ = self.db.apply_control_tool(
+            running["id"], running["version"], "p2-test", running["lease_epoch"],
+            call["id"], "send_agent_message", call["function"]["arguments"])
+        self.assertEqual((running["status"], running["wait_reason"]), ("waiting", "input"))
+        question = self.db.list_agent_messages(root["id"])[0]
+        self.assertEqual((question["session_id"], question["sender_session_id"],
+                          question["source_run_id"], question["needs_reply"]),
+                         (root["id"], worker["id"], run["id"], True))
+        with self.assertRaises(ResourceNotFound):
+            self.db.host_reply(worker["id"], question["id"], "wrong recipient")
+        reply, resumed = self.db.host_reply(root["id"], question["id"], "answer")
+        self.assertEqual((reply["recipient_run_id"], resumed["status"]),
+                         (run["id"], "queued"))
+        self.assertFalse(self.db.list_agent_messages(root["id"])[0]["needs_reply"])
+        with self.assertRaises(InvalidRunTransition):
+            self.db.host_reply(root["id"], question["id"], "again")
+        self.assertEqual(self.db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_delegate_wait_child_result_wakes_exact_parent_run(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker")
+        parent_task = self.db.create_task(root["id"], "coordinate")
+        parent_run, _ = self.db.create_run(parent_task["id"], "parent")
+        delegate = self._call("delegate-1", "delegate_task",
+                              {"assignee_agent_id": worker["id"], "goal": "child",
+                               "acceptance": []})
+        running = self._control_run(parent_run, [delegate])
+        running, message_id = self._apply_control(running, delegate)
+        child_id = json.loads(self.db.get_message(message_id)["content"])["task_id"]
+        child_run_id = self.db.get_latest_run_id(child_id)
+        self.assertEqual(self.db.get_task(child_id)["creator_run_id"], parent_run["id"])
+        self.assertEqual(set(json.loads(self.db.get_run(child_run_id)["effective_grant_json"])["grants"]),
+                         {"read_only", "control.send_agent_message",
+                          "control.get_task_status", "control.wait_for_tasks",
+                          "control.request_human_approval"})
+        running, _ = self.db.transition_run(
+            running["id"], running["version"], "running", "tool.batch_completed",
+            {"round": 1}, checkpoint={"v": 1, "phase": "model_pending", "round": 2},
+            lease_owner="p2-test", lease_epoch=running["lease_epoch"])
+        wait = self._call("wait-1", "wait_for_tasks", {"task_ids": [child_id]})
+        running, _ = self.db.transition_run(
+            running["id"], running["version"], "running", "model.completed",
+            {"round": 2, "tool_count": 1},
+            checkpoint={"v": 1, "phase": "tool_pending", "round": 2,
+                        "assistant_message_id": None, "next_tool_index": 0},
+            message={"role": "assistant", "content": None, "tool_calls": [wait]},
+            lease_owner="p2-test", lease_epoch=running["lease_epoch"])
+        running, _ = self._apply_control(running, wait)
+        self.assertEqual((running["status"], running["wait_reason"]), ("waiting", "children"))
+        self.assertEqual(self.db.control_scope(parent_run["id"])["wait_child_task_ids"],
+                         frozenset({child_id}))
+        self.assertGreater(json.loads(self.db.get_run(parent_run["id"])["usage_json"])
+                           ["p2_child_reserve"][child_id], 0)
+        result = {"summary": "done", "acceptance_results": [], "artifacts": [],
+                  "evidence": [], "followups": []}
+        result_call = self._call("result-1", "send_agent_message",
+                                 {"to_agent_id": root["id"], "kind": "result",
+                                  "content": json.dumps(result)})
+        child_run = self._control_run(self.db.get_run(child_run_id), [result_call])
+        child_run, _ = self._apply_control(child_run, result_call)
+        self.assertEqual(child_run["status"], "completed")
+        self.assertEqual(self.db.get_task_result(child_id), result)
+        self.assertEqual(self.db.get_run(parent_run["id"])["status"], "queued")
+        self.assertNotIn(child_id, json.loads(self.db.get_run(parent_run["id"])["usage_json"])
+                         ["p2_child_reserve"])
+        received = self.db.list_agent_messages(root["id"])
+        self.assertEqual((received[0]["kind"], received[0]["recipient_run_id"]),
+                         ("result", parent_run["id"]))
+        self.assertEqual(self.db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
 
 
 if __name__ == "__main__":
