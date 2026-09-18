@@ -17,7 +17,7 @@ from backend.config import BASE_DIR
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "countboter.db"
 logger = logging.getLogger("agent.db")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_EVENT_BYTES = 64 * 1024
 MAX_RUN_EVENT_BYTES = 4 * 1024 * 1024
 TERMINAL_EVENT_RESERVE = 8 * 1024
@@ -50,6 +50,21 @@ class InvalidRunTransition(RepositoryError):
 
 class EventLimitExceeded(RepositoryError):
     code = "event_limit_exceeded"
+
+
+class SupervisorAlreadyExists(RepositoryError):
+    code = "supervisor_exists"
+
+
+class AgentHierarchyError(RepositoryError):
+    code = "invalid_agent_hierarchy"
+
+
+HOST_GRANTS = frozenset({
+    "read_only", "control.delegate_task", "control.send_agent_message",
+    "control.get_task_status", "control.wait_for_tasks", "control.cancel_task",
+    "control.request_human_approval",
+})
 
 
 def _json(value):
@@ -119,7 +134,7 @@ class Database:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version < SCHEMA_VERSION and self._existing_file:
                 backup_path = self.db_path.with_name(
-                    f"{self.db_path.name}.pre-v3-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}.bak"
+                    f"{self.db_path.name}.pre-v4-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}.bak"
                 )
                 backup = sqlite3.connect(str(backup_path))
                 try:
@@ -135,6 +150,9 @@ class Database:
             if version == 2:
                 self._migrate_2_to_3()
                 version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == 3 and SCHEMA_VERSION >= 4:
+                self._migrate_3_to_4()
+                version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
                 raise RuntimeError(f"不支持的数据库版本：{version}")
             self._verify_integrity()
@@ -147,7 +165,7 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             # 另一个进程可能已在等待 writer lock 时完成同一迁移。
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version in (1, 2, SCHEMA_VERSION):
+            if version in (1, 2, 3, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 0:
@@ -373,7 +391,7 @@ class Database:
         try:
             conn.execute("BEGIN IMMEDIATE")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version in (2, SCHEMA_VERSION):
+            if version in (2, 3, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 1:
@@ -395,7 +413,7 @@ class Database:
         try:
             conn.execute("BEGIN IMMEDIATE")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version == SCHEMA_VERSION:
+            if version in (3, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 2:
@@ -565,6 +583,118 @@ class Database:
         finally:
             conn.execute("PRAGMA foreign_keys = ON")
 
+    def _migrate_3_to_4(self):
+        """P2 identity, delegation provenance, and immutable grant snapshots."""
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == 4:
+                conn.commit()
+                return
+            if version != 3:
+                raise RuntimeError(f"不支持的数据库版本：{version}")
+            for sql in (
+                "ALTER TABLE sessions ADD COLUMN agent_role TEXT CHECK (agent_role IN ('supervisor','worker'))",
+                "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT REFERENCES sessions(id) ON DELETE RESTRICT",
+                "ALTER TABLE sessions ADD COLUMN root_session_id TEXT REFERENCES sessions(id) ON DELETE RESTRICT",
+                "ALTER TABLE sessions ADD COLUMN depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 2)",
+                "ALTER TABLE sessions ADD COLUMN system_prompt TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE sessions ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '{\"grants\":[]}'",
+                "ALTER TABLE sessions ADD COLUMN can_delegate INTEGER NOT NULL DEFAULT 0 CHECK (can_delegate IN (0,1))",
+                "ALTER TABLE tasks ADD COLUMN creator_session_id TEXT REFERENCES sessions(id) ON DELETE RESTRICT",
+                "ALTER TABLE tasks ADD COLUMN creator_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT",
+                "ALTER TABLE tasks ADD COLUMN parent_task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT",
+                "ALTER TABLE tasks ADD COLUMN requested_grant_json TEXT NOT NULL DEFAULT '{\"grants\":[\"read_only\"]}'",
+                "ALTER TABLE tasks ADD COLUMN limits_json TEXT NOT NULL DEFAULT '{}'",
+                "ALTER TABLE runs ADD COLUMN effective_grant_json TEXT NOT NULL DEFAULT '{\"grants\":[\"read_only\"]}'",
+                "ALTER TABLE messages ADD COLUMN sender_session_id TEXT REFERENCES sessions(id) ON DELETE RESTRICT",
+                "ALTER TABLE messages ADD COLUMN related_task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT",
+                "ALTER TABLE messages ADD COLUMN source_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT",
+                "ALTER TABLE messages ADD COLUMN recipient_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT",
+                "ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat' CHECK (kind IN ('chat','delegation','question','progress','result','reply'))",
+                "ALTER TABLE messages ADD COLUMN hop INTEGER NOT NULL DEFAULT 0 CHECK (hop BETWEEN 0 AND 2)",
+                "ALTER TABLE events ADD COLUMN actor_session_id TEXT REFERENCES sessions(id) ON DELETE RESTRICT",
+                "ALTER TABLE events ADD COLUMN recipient_session_id TEXT REFERENCES sessions(id) ON DELETE RESTRICT",
+            ):
+                conn.execute(sql)
+            conn.execute("""
+                CREATE UNIQUE INDEX uq_one_active_supervisor ON sessions(agent_role)
+                WHERE agent_role='supervisor' AND archived_at IS NULL
+            """)
+            conn.execute("CREATE INDEX idx_agent_parent ON sessions(parent_session_id,archived_at)")
+            conn.execute("CREATE INDEX idx_tasks_parent ON tasks(parent_task_id,created_at)")
+            conn.execute("CREATE INDEX idx_messages_recipient_run ON messages(recipient_run_id,id)")
+            conn.execute("""
+                CREATE TRIGGER trg_supervisor_no_archive BEFORE UPDATE OF archived_at ON sessions
+                WHEN OLD.agent_role='supervisor' AND NEW.archived_at IS NOT NULL
+                BEGIN SELECT RAISE(ABORT,'supervisor cannot be archived'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_supervisor_no_delete BEFORE DELETE ON sessions
+                WHEN OLD.agent_role='supervisor'
+                BEGIN SELECT RAISE(ABORT,'supervisor cannot be deleted'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_agent_identity_immutable
+                BEFORE UPDATE OF agent_role,parent_session_id,root_session_id,depth ON sessions
+                WHEN OLD.agent_role IS NOT NULL AND (
+                    NEW.agent_role IS NOT OLD.agent_role OR
+                    NEW.parent_session_id IS NOT OLD.parent_session_id OR
+                    NEW.root_session_id IS NOT OLD.root_session_id OR
+                    NEW.depth != OLD.depth)
+                BEGIN SELECT RAISE(ABORT,'agent lineage is immutable'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_worker_parent_insert BEFORE INSERT ON sessions
+                WHEN NEW.agent_role='worker' AND (
+                    NEW.parent_session_id IS NULL OR NEW.depth NOT BETWEEN 1 AND 2 OR
+                    (SELECT archived_at FROM sessions WHERE id=NEW.parent_session_id) IS NOT NULL OR
+                    (SELECT agent_role FROM sessions WHERE id=NEW.parent_session_id)
+                        NOT IN ('supervisor','worker') OR
+                    (SELECT can_delegate FROM sessions WHERE id=NEW.parent_session_id) != 1 OR
+                    NEW.depth != (SELECT depth+1 FROM sessions WHERE id=NEW.parent_session_id) OR
+                    NEW.root_session_id IS NOT (SELECT CASE WHEN agent_role='supervisor' THEN id
+                        ELSE root_session_id END FROM sessions WHERE id=NEW.parent_session_id) OR
+                    (SELECT COUNT(*) FROM sessions WHERE parent_session_id=NEW.parent_session_id
+                        AND archived_at IS NULL) >= 4)
+                BEGIN SELECT RAISE(ABORT,'invalid worker parent or budget'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_task_contract_immutable
+                BEFORE UPDATE OF goal,acceptance_json,context_json,creator_session_id,
+                    creator_run_id,parent_task_id,requested_grant_json,limits_json ON tasks
+                WHEN NEW.goal IS NOT OLD.goal OR NEW.acceptance_json IS NOT OLD.acceptance_json OR
+                    NEW.context_json IS NOT OLD.context_json OR
+                    NEW.creator_session_id IS NOT OLD.creator_session_id OR
+                    NEW.creator_run_id IS NOT OLD.creator_run_id OR
+                    NEW.parent_task_id IS NOT OLD.parent_task_id OR
+                    NEW.requested_grant_json IS NOT OLD.requested_grant_json OR
+                    NEW.limits_json IS NOT OLD.limits_json
+                BEGIN SELECT RAISE(ABORT,'task contract is immutable'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_run_grant_immutable BEFORE UPDATE OF effective_grant_json ON runs
+                WHEN NEW.effective_grant_json IS NOT OLD.effective_grant_json
+                BEGIN SELECT RAISE(ABORT,'run grant is immutable'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_agent_message_provenance BEFORE INSERT ON messages
+                WHEN (NEW.sender_session_id IS NOT NULL AND
+                      (NEW.source_run_id IS NULL OR
+                       (SELECT session_id FROM runs WHERE id=NEW.source_run_id)
+                           IS NOT NEW.sender_session_id)) OR
+                     (NEW.recipient_run_id IS NOT NULL AND
+                      (SELECT session_id FROM runs WHERE id=NEW.recipient_run_id)
+                          IS NOT NEW.session_id)
+                BEGIN SELECT RAISE(ABORT,'invalid agent message provenance'); END
+            """)
+            conn.execute("PRAGMA user_version = 4")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
     def _verify_integrity(self):
         violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
@@ -696,12 +826,175 @@ class Database:
     def get_session(self, session_id):
         return self._query_one(
             """
-            SELECT id, title, created_at, updated_at, project_id, archived_at
+            SELECT id, title, created_at, updated_at, project_id, archived_at,
+                agent_role,parent_session_id,root_session_id,depth,system_prompt,
+                capabilities_json,can_delegate
             FROM sessions
             WHERE id = ?
             """,
             (session_id,),
         )
+
+    @staticmethod
+    def _capabilities(value, default):
+        if value is None:
+            value = {"grants": sorted(default)}
+        if (not isinstance(value, dict) or set(value) != {"grants"} or
+                not isinstance(value["grants"], list) or len(value["grants"]) > 32 or
+                any(not isinstance(grant, str) or grant not in HOST_GRANTS
+                    for grant in value["grants"])):
+            raise ValueError("capabilities 只接受固定 P2 grants")
+        return set(value["grants"]) & HOST_GRANTS
+
+    def get_supervisor(self):
+        return self._query_one("""
+            SELECT * FROM sessions WHERE agent_role='supervisor' AND archived_at IS NULL
+        """)
+
+    def create_supervisor(self, title="Supervisor", system_prompt="", capabilities=None):
+        if not isinstance(title, str) or not title.strip() or not isinstance(system_prompt, str):
+            raise ValueError("无效 Supervisor 标题/说明")
+        grants = self._capabilities(capabilities, HOST_GRANTS)
+        project_id = self._get_or_create_default_project()["id"]
+        with self._write() as conn:
+            if conn.execute("""
+                SELECT 1 FROM sessions WHERE agent_role='supervisor' AND archived_at IS NULL
+            """).fetchone():
+                raise SupervisorAlreadyExists("活动根 Supervisor 已存在")
+            agent_id, now = str(uuid.uuid4()), _utc_now()
+            conn.execute("""
+                INSERT INTO sessions(id,title,created_at,updated_at,project_id,
+                    agent_role,root_session_id,depth,system_prompt,capabilities_json,can_delegate)
+                VALUES (?,?,?,?,?,'supervisor',?,0,?,?,1)
+            """, (agent_id, title.strip(), now, now, project_id, agent_id,
+                  system_prompt, _json({"grants": sorted(grants)})))
+            return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone())
+
+    def select_supervisor(self, agent_id):
+        with self._write() as conn:
+            row = conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone()
+            if not row or row["archived_at"] is not None:
+                raise ResourceNotFound("Agent 不存在或已归档")
+            existing = conn.execute("""
+                SELECT id FROM sessions WHERE agent_role='supervisor' AND archived_at IS NULL
+            """).fetchone()
+            if existing:
+                if existing["id"] == agent_id:
+                    return dict(row)
+                raise SupervisorAlreadyExists("活动根 Supervisor 已存在")
+            if row["agent_role"] is not None:
+                raise AgentHierarchyError("只能显式选择旧会话为根 Supervisor")
+            conn.execute("""
+                UPDATE sessions SET agent_role='supervisor',root_session_id=id,
+                    depth=0,can_delegate=1,capabilities_json=?,updated_at=? WHERE id=?
+            """, (_json({"grants": sorted(HOST_GRANTS)}), _utc_now(), agent_id))
+            return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone())
+
+    def create_worker(self, parent_agent_id, title, system_prompt="",
+                      capabilities=None, can_delegate=False):
+        if (not isinstance(title, str) or not title.strip() or
+                not isinstance(system_prompt, str) or not isinstance(can_delegate, bool)):
+            raise ValueError("无效 Worker 标题/说明")
+        default = {"read_only", "control.send_agent_message", "control.get_task_status",
+                   "control.wait_for_tasks", "control.request_human_approval"}
+        if can_delegate:
+            default |= {"control.delegate_task", "control.cancel_task"}
+        requested = self._capabilities(capabilities, default)
+        with self._write() as conn:
+            parent = conn.execute("SELECT * FROM sessions WHERE id=?", (parent_agent_id,)).fetchone()
+            if not parent or parent["archived_at"] is not None:
+                raise ResourceNotFound("父 Agent 不存在或已归档")
+            if (parent["agent_role"] not in {"supervisor", "worker"} or
+                    not parent["can_delegate"] or parent["depth"] >= 2 or
+                    (can_delegate and "control.delegate_task" not in
+                     json.loads(parent["capabilities_json"])["grants"])):
+                raise AgentHierarchyError("父 Agent 无委派能力或深度已满")
+            children = conn.execute("""
+                SELECT COUNT(*) FROM sessions WHERE parent_session_id=? AND archived_at IS NULL
+            """, (parent_agent_id,)).fetchone()[0]
+            if children >= 4:
+                raise AgentHierarchyError("Worker 子数已满")
+            grants = requested & set(json.loads(parent["capabilities_json"])["grants"])
+            if not can_delegate:
+                grants.discard("control.delegate_task")
+            agent_id, now = str(uuid.uuid4()), _utc_now()
+            root_id = (parent["id"] if parent["agent_role"] == "supervisor"
+                       else parent["root_session_id"])
+            conn.execute("""
+                INSERT INTO sessions(id,title,created_at,updated_at,project_id,
+                    agent_role,parent_session_id,root_session_id,depth,system_prompt,
+                    capabilities_json,can_delegate)
+                VALUES (?,?,?,?,?,'worker',?,?,?,?,?,?)
+            """, (agent_id, title.strip(), now, now, parent["project_id"],
+                  parent_agent_id, root_id, parent["depth"] + 1, system_prompt,
+                  _json({"grants": sorted(grants)}), int(can_delegate)))
+            return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone())
+
+    def list_agent_tree(self, root_agent_id=None, include_archived=False):
+        root = self.get_supervisor() if root_agent_id is None else self.get_session(root_agent_id)
+        if not root or root["agent_role"] != "supervisor":
+            return []
+        return self._query_all("""
+            SELECT * FROM sessions WHERE root_session_id=?
+                AND (? OR archived_at IS NULL)
+            ORDER BY depth,created_at,id
+        """, (root["id"], int(include_archived)))
+
+    def get_agent_status(self, agent_id):
+        agent = self.get_session(agent_id)
+        if not agent or agent["agent_role"] is None:
+            raise ResourceNotFound("Agent 不存在")
+        active = self._query_one("""
+            SELECT id,status FROM runs WHERE session_id=? AND
+                status IN ('queued','running','waiting','paused') LIMIT 1
+        """, (agent_id,))
+        queued = self._query_one("""
+            SELECT COUNT(*) AS n FROM tasks AS task WHERE task.session_id=?
+                AND task.status='open' AND NOT EXISTS (
+                    SELECT 1 FROM runs WHERE task_id=task.id)
+        """, (agent_id,))["n"]
+        return {"agent_id": agent_id,
+                "state": "archived" if agent["archived_at"] else
+                         active["status"] if active else "queued" if queued else "idle",
+                "active_run_id": active["id"] if active else None,
+                "queued_task_count": queued}
+
+    def rename_agent(self, agent_id, title):
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("标题不能为空")
+        with self._write() as conn:
+            row = conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone()
+            if not row or row["agent_role"] is None or row["archived_at"]:
+                raise ResourceNotFound("Agent 不存在或已归档")
+            conn.execute("UPDATE sessions SET title=?,updated_at=? WHERE id=?",
+                         (title.strip(), _utc_now(), agent_id))
+            return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone())
+
+    def archive_worker(self, agent_id):
+        with self._write() as conn:
+            row = conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone()
+            if not row or row["archived_at"]:
+                raise ResourceNotFound("Worker 不存在或已归档")
+            if row["agent_role"] != "worker":
+                raise AgentHierarchyError("根 Supervisor/旧会话不可按 Worker 归档")
+            if conn.execute("""
+                SELECT 1 FROM sessions WHERE parent_session_id=? AND archived_at IS NULL
+            """, (agent_id,)).fetchone():
+                raise AgentHierarchyError("先归档子 Worker")
+            active = conn.execute("""
+                SELECT id FROM runs WHERE session_id=? AND
+                    status IN ('queued','running','waiting','paused') LIMIT 1
+            """, (agent_id,)).fetchone()
+            if active:
+                raise RunAlreadyActive(active["id"])
+            if conn.execute("""
+                SELECT 1 FROM tasks WHERE session_id=? AND status='open' LIMIT 1
+            """, (agent_id,)).fetchone():
+                raise AgentHierarchyError("Worker 尚有排队或未完成 Task")
+            now = _utc_now()
+            conn.execute("UPDATE sessions SET archived_at=?,updated_at=? WHERE id=?",
+                         (now, now, agent_id))
+            return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone())
 
     def create_session(self, title="新会话", project_id=None):
         if not project_id:
@@ -734,6 +1027,12 @@ class Database:
         logger.debug("DB 更新会话时间：session_id=%s", session_id)
 
     def delete_session(self, session_id):
+        agent = self.get_session(session_id)
+        if agent and agent["agent_role"] == "supervisor":
+            raise AgentHierarchyError("根 Supervisor 不可普通删除或归档")
+        if agent and agent["agent_role"] == "worker":
+            self.archive_worker(session_id)
+            return
         with self._write() as conn:
             active = conn.execute("""
                 SELECT id FROM runs WHERE session_id=?

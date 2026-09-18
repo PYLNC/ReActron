@@ -67,7 +67,7 @@ class RunRepositoryTest(unittest.TestCase):
                 INSERT INTO messages (session_id,task_id,role,sequence,created_at)
                 VALUES (?,'missing','user',99,'now')
             """, (self.agent_id,))
-        self.assertEqual(self.db._conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(self.db._conn.execute("PRAGMA user_version").fetchone()[0], 4)
         self.assertEqual(self.db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.assertEqual(self.db._conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
         self.db._init_tables()

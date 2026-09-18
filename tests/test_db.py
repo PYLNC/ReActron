@@ -1,5 +1,6 @@
 """P0 SQLite 迁移与并发一致性测试。"""
 
+import json
 import sqlite3
 import subprocess
 import sys
@@ -9,8 +10,10 @@ import unittest
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
-from backend.db import Database
+from backend.db import (AgentHierarchyError, Database, ResourceNotFound,
+                        SupervisorAlreadyExists)
 
 
 NOW = "2026-01-01 00:00:00"
@@ -144,7 +147,7 @@ class MigrationTest(unittest.TestCase):
             create_v0_database(path)
 
             db = Database(path)
-            self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 4)
             defaults = db._query_all(
                 "SELECT id FROM projects WHERE is_default = 1"
             )
@@ -184,7 +187,7 @@ class MigrationTest(unittest.TestCase):
                 )
 
             first_snapshot = snapshot(db)
-            backups = list(path.parent.glob("legacy.db.pre-v3-*.bak"))
+            backups = list(path.parent.glob("legacy.db.pre-v4-*.bak"))
             self.assertEqual(len(backups), 1)
             with closing(sqlite3.connect(backups[0])) as backup:
                 self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 0)
@@ -197,9 +200,9 @@ class MigrationTest(unittest.TestCase):
             try:
                 self.assertEqual(snapshot(reopened), first_snapshot)
                 self.assertEqual(
-                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 3
+                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 4
                 )
-                self.assertEqual(len(list(path.parent.glob("legacy.db.pre-v3-*.bak"))), 1)
+                self.assertEqual(len(list(path.parent.glob("legacy.db.pre-v4-*.bak"))), 1)
             finally:
                 reopened.close()
 
@@ -214,12 +217,12 @@ class MigrationTest(unittest.TestCase):
                 conn.commit()
             db = Database(path)
             try:
-                self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 4)
                 self.assertEqual(db.get_settings()["credential_base_url"],
                                  "https://api.example/v1")
                 self.assertEqual(db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
                 self.assertEqual(db._conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
-                backups = list(path.parent.glob("v2.db.pre-v3-*.bak"))
+                backups = list(path.parent.glob("v2.db.pre-v4-*.bak"))
                 self.assertEqual(len(backups), 1)
                 with closing(sqlite3.connect(backups[0])) as backup:
                     self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 2)
@@ -234,7 +237,7 @@ class MigrationTest(unittest.TestCase):
             db = Database(path)
             try:
                 self.assertEqual(
-                    db._conn.execute("PRAGMA user_version").fetchone()[0], 3
+                    db._conn.execute("PRAGMA user_version").fetchone()[0], 4
                 )
                 settings = db.get_settings()
                 self.assertEqual(settings["api_key_encrypted"], "legacy-ciphertext")
@@ -245,7 +248,7 @@ class MigrationTest(unittest.TestCase):
             reopened = Database(path)
             try:
                 self.assertEqual(
-                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 3
+                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 4
                 )
                 self.assertIsNone(reopened.get_settings()["credential_base_url"])
             finally:
@@ -430,6 +433,98 @@ class DatabaseConsistencyTest(unittest.TestCase):
                 )
             finally:
                 reopened.close()
+
+
+class P2AgentSchemaTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "agents.db"
+        self.db = Database(self.path)
+        self.addCleanup(self.db.close)
+
+    def test_legacy_session_never_becomes_root_without_selection(self):
+        legacy = self.db.create_session("legacy")
+        self.assertIsNone(self.db.get_supervisor())
+        self.assertIsNone(self.db.get_session(legacy["id"])["agent_role"])
+        root = self.db.select_supervisor(legacy["id"])
+        self.assertEqual((root["agent_role"], root["root_session_id"], root["depth"]),
+                         ("supervisor", legacy["id"], 0))
+        self.assertEqual(self.db.select_supervisor(legacy["id"])["id"], legacy["id"])
+        with self.assertRaises(SupervisorAlreadyExists):
+            self.db.create_supervisor("another")
+        with self.assertRaises(AgentHierarchyError):
+            self.db.delete_session(root["id"])
+        self.assertEqual(self.db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_two_connections_cannot_create_two_active_roots(self):
+        other = Database(self.path)
+        self.addCleanup(other.close)
+        barrier = threading.Barrier(2)
+
+        def create(database, title):
+            barrier.wait()
+            try:
+                return database.create_supervisor(title)["id"]
+            except SupervisorAlreadyExists:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            left = pool.submit(create, self.db, "left")
+            right = pool.submit(create, other, "right")
+            results = [left.result(), right.result()]
+        self.assertEqual(sum(result is not None for result in results), 1)
+        self.assertEqual(self.db._query_one("SELECT COUNT(*) AS n FROM sessions WHERE "
+                                            "agent_role='supervisor' AND archived_at IS NULL")["n"], 1)
+        self.assertEqual(self.db._conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    def test_worker_parent_depth_child_budget_and_archive(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker")
+        self.assertEqual((worker["parent_session_id"], worker["depth"], worker["can_delegate"]),
+                         (root["id"], 1, 0))
+        with self.assertRaises(AgentHierarchyError):
+            self.db.create_worker(worker["id"], "grandchild")
+        delegating = self.db.create_worker(root["id"], "delegating", can_delegate=True)
+        grandchild = self.db.create_worker(delegating["id"], "grandchild")
+        self.assertEqual((grandchild["depth"], grandchild["root_session_id"]),
+                         (2, root["id"]))
+        with self.assertRaises(AgentHierarchyError):
+            self.db.create_worker(grandchild["id"], "too-deep")
+        self.db.create_worker(root["id"], "three")
+        self.db.create_worker(root["id"], "four")
+        with self.assertRaises(AgentHierarchyError):
+            self.db.create_worker(root["id"], "five")
+        with self.assertRaises(AgentHierarchyError):
+            self.db.archive_worker(delegating["id"])
+        self.db.archive_worker(grandchild["id"])
+        self.db.archive_worker(delegating["id"])
+        with self.assertRaises(ResourceNotFound):
+            self.db.rename_agent(delegating["id"], "archived")
+        self.assertEqual(len(self.db.list_agent_tree()), 4)
+        self.assertEqual(len(self.db.list_agent_tree(include_archived=True)), 6)
+
+    def test_v3_to_v4_preserves_history_and_foreign_keys(self):
+        with patch("backend.db.SCHEMA_VERSION", 3):
+            old = Database(Path(self.tmp.name) / "v3.db")
+            session_id = "historical-v3"
+            project_id = old._get_or_create_default_project()["id"]
+            old._execute("""
+                INSERT INTO sessions(id,title,created_at,updated_at,project_id)
+                VALUES (?,?,?,?,?)
+            """, (session_id, "historical", NOW, NOW, project_id))
+            task = old.create_task(session_id, "old task")
+            run, _ = old.create_run(task["id"], "old-key",
+                                    config_snapshot={}, tool_snapshot={})
+            old.close()
+        upgraded = Database(Path(self.tmp.name) / "v3.db")
+        self.addCleanup(upgraded.close)
+        self.assertEqual(upgraded._conn.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertIsNone(upgraded.get_session(session_id)["agent_role"])
+        self.assertEqual(upgraded.get_run(run["id"])["effective_grant_json"],
+                         '{"grants":["read_only"]}')
+        self.assertEqual(upgraded._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(upgraded._conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
 
 
 if __name__ == "__main__":
