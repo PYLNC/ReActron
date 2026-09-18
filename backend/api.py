@@ -22,6 +22,8 @@ from backend.schemas import (
     BootstrapRequest,
     ConfigResponse,
     HealthResponse,
+    HostDelegateRequest,
+    HumanReplyRequest,
     MCPServerCreateRequest,
     ProjectCreateRequest,
     ProjectRenameRequest,
@@ -112,6 +114,8 @@ def _repository_error(exc: Exception):
         return _error_response(409, code, "已有活动 Supervisor")
     if code == "invalid_agent_hierarchy":
         return _error_response(409, code, "Agent 树结构不允许此操作")
+    if code == "event_limit_exceeded":
+        return _error_response(409, code, "Run 事件容量已达上限")
     if isinstance(exc, ValueError):
         return _error_response(422, "invalid_request", "请求参数无效")
     raise exc
@@ -166,7 +170,55 @@ def _agent_tree_response(row: dict, status: dict | None = None) -> dict:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "archived_at": row.get("archived_at"),
-        "status": status,
+        "status": _agent_status_response(status) if status else None,
+    }
+
+
+def _agent_status_response(row: dict) -> dict:
+    return {key: row[key] for key in
+            ("agent_id", "state", "active_run_id", "queued_task_count")}
+
+
+def _delegation_task_response(row: dict) -> dict:
+    return {
+        **_task_response(row),
+        "creator_agent_id": row.get("creator_session_id"),
+        "parent_task_id": row.get("parent_task_id"),
+    }
+
+
+def _task_result_response(result: dict | None) -> dict | None:
+    if result is None:
+        return None
+    return {
+        "summary": result["summary"],
+        "acceptance_results": [
+            {"criterion": item["criterion"], "ok": item["ok"]}
+            for item in result["acceptance_results"]
+        ],
+        "artifacts": [
+            {"artifact_id": item["artifact_id"], "kind": item["kind"]}
+            for item in result["artifacts"]
+        ],
+        "evidence": [
+            {"kind": item["kind"], "command": item["command"],
+             "exit_code": item["exit_code"]}
+            for item in result["evidence"]
+        ],
+        "followups": result["followups"],
+    }
+
+
+def _agent_message_response(row: dict) -> dict:
+    return {
+        "message_id": row["id"], "agent_id": row["session_id"],
+        "sender_agent_id": row["sender_session_id"],
+        "source_run_id": row["source_run_id"],
+        "recipient_run_id": row["recipient_run_id"],
+        "related_task_id": row["related_task_id"],
+        "kind": row["kind"], "role": row["role"],
+        "content": row["content"], "created_at": row["created_at"],
+        "needs_reply": bool(row.get("needs_reply", False)),
     }
 
 
@@ -517,9 +569,10 @@ async def create_worker(payload: WorkerCreateRequest):
 @router.get("/agents/{agent_id}/status")
 async def get_agent_status(agent_id: str):
     try:
-        return await asyncio.to_thread(db.get_agent_status, agent_id)
+        row = await asyncio.to_thread(db.get_agent_status, agent_id)
     except Exception as exc:
         return _repository_error(exc)
+    return _agent_status_response(row)
 
 
 @router.patch("/agents/{agent_id}")
@@ -538,6 +591,96 @@ async def archive_worker(agent_id: str):
     except Exception as exc:
         return _repository_error(exc)
     return await _tree_agent(row)
+
+
+async def _host_tree_ids(include_archived: bool = False) -> tuple[dict | None, set[str]]:
+    root = await asyncio.to_thread(db.get_supervisor)
+    if not root:
+        return None, set()
+    rows = await asyncio.to_thread(db.list_agent_tree, root["id"], include_archived)
+    return root, {row["id"] for row in rows}
+
+
+@router.post("/delegations", status_code=201)
+async def host_delegate_task(payload: HostDelegateRequest, response: Response):
+    try:
+        root, visible = await _host_tree_ids()
+        if not root or payload.assignee_agent_id not in visible:
+            return _error_response(404, "not_found", "资源不存在")
+        task, run = await asyncio.to_thread(
+            db.host_delegate_task, root["id"], payload.assignee_agent_id,
+            payload.goal, payload.acceptance,
+            payload.context.model_dump() if payload.context else None,
+            payload.requested_grant.model_dump() if payload.requested_grant else None,
+            payload.limits.model_dump(exclude_none=True) if payload.limits else None,
+        )
+    except Exception as exc:
+        return _repository_error(exc)
+    _runner().wake()
+    response.headers["Location"] = f"/api/delegations/{task['id']}"
+    return {
+        "task": await asyncio.to_thread(_delegation_task_response, task),
+        "run": await asyncio.to_thread(_run_response, run) if run else None,
+    }
+
+
+@router.get("/delegations")
+async def list_delegations(limit: int = Query(50, ge=1, le=100)):
+    try:
+        root, _visible = await _host_tree_ids()
+        if not root:
+            return {"tasks": []}
+        rows = await asyncio.to_thread(db.list_tree_tasks, root["id"], limit)
+    except Exception as exc:
+        return _repository_error(exc)
+    return {"tasks": await asyncio.to_thread(lambda: [_delegation_task_response(row) for row in rows])}
+
+
+@router.get("/delegations/{task_id}")
+async def get_delegation(task_id: str):
+    try:
+        _root, visible = await _host_tree_ids(True)
+        task = await asyncio.to_thread(db.get_task, task_id)
+        if not task or task["session_id"] not in visible:
+            return _error_response(404, "not_found", "资源不存在")
+        result = await asyncio.to_thread(db.get_task_result, task_id)
+    except Exception as exc:
+        return _repository_error(exc)
+    return {
+        "task": await asyncio.to_thread(_delegation_task_response, task),
+        "result": _task_result_response(result),
+    }
+
+
+@router.get("/agents/{agent_id}/agent-messages")
+async def list_agent_messages(agent_id: str, after_id: int = Query(0, ge=0),
+                              limit: int = Query(100, ge=1, le=100)):
+    try:
+        _root, visible = await _host_tree_ids(True)
+        if agent_id not in visible:
+            return _error_response(404, "not_found", "资源不存在")
+        rows = await asyncio.to_thread(db.list_agent_messages, agent_id, after_id, limit)
+    except Exception as exc:
+        return _repository_error(exc)
+    return {"messages": [_agent_message_response(row) for row in rows]}
+
+
+@router.post("/agents/{agent_id}/replies", status_code=202)
+async def host_reply(agent_id: str, payload: HumanReplyRequest):
+    try:
+        _root, visible = await _host_tree_ids()
+        if agent_id not in visible:
+            return _error_response(404, "not_found", "资源不存在")
+        message, run = await asyncio.to_thread(
+            db.host_reply, agent_id, payload.reply_to_message_id, payload.content
+        )
+    except Exception as exc:
+        return _repository_error(exc)
+    _runner().wake()
+    return {
+        "message": _agent_message_response(message),
+        "run": await asyncio.to_thread(_run_response, run),
+    }
 
 
 @router.post("/upload")
@@ -789,7 +932,11 @@ async def get_session_messages(session_id: str):
         raise HTTPException(status_code=404, detail="会话不存在")
     messages = db.get_messages(session_id)
     logger.info("读取会话输出：session_id=%s，messages=%d", session_id, len(messages))
-    return {"session": session, "messages": messages}
+    return {
+        "session": {key: session.get(key) for key in
+                    ("id", "title", "project_id", "created_at", "updated_at", "archived_at")},
+        "messages": messages,
+    }
 
 
 @router.patch("/sessions/{session_id}", response_model=SessionSummary)

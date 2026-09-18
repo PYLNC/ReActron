@@ -41,6 +41,14 @@
         <select id="projectAssignSelect" class="project-select" title="将当前会话归入项目">
           <option value="">未分组</option>
         </select>
+        <section class="agent-tree-panel" aria-labelledby="agentTreeHeading">
+          <h3 id="agentTreeHeading">Supervisor / Worker</h3>
+          <div class="agent-tree-actions">
+            <button id="createSupervisorBtn" class="small-btn" type="button">创建根</button>
+            <button id="selectSupervisorBtn" class="small-btn" type="button">选当前为根</button>
+          </div>
+          <ul class="agent-tree-list" id="agentTreeList" aria-live="polite"></ul>
+        </section>
         <ul class="session-list" id="sessionList"></ul>
         <section class="task-panel" aria-labelledby="taskHeading">
           <h3 id="taskHeading">当前 Agent 的任务</h3>
@@ -64,6 +72,27 @@
           <h2>信息</h2>
           <button id="closeInfoBtn" class="panel-close" type="button">收起</button>
         </div>
+
+        <section class="info-section open" id="delegationsSection">
+          <button class="info-section-toggle" type="button">
+            <span>委派 Task / 结果</span><span class="chevron" aria-hidden="true">⌄</span>
+          </button>
+          <div class="info-section-body">
+            <button id="refreshDelegationsBtn" class="small-btn" type="button">刷新队列</button>
+            <ul id="delegationList" class="task-list" aria-live="polite"></ul>
+            <p id="delegationResult" aria-live="polite">选择 Task 查看结构化结果</p>
+          </div>
+        </section>
+
+        <section class="info-section open" id="agentMessagesSection">
+          <button class="info-section-toggle" type="button">
+            <span>Agent 消息 / 问题</span><span class="chevron" aria-hidden="true">⌄</span>
+          </button>
+          <div class="info-section-body">
+            <button id="refreshAgentMessagesBtn" class="small-btn" type="button">刷新消息</button>
+            <ul id="agentMessageList" class="task-list" aria-live="polite"></ul>
+          </div>
+        </section>
 
         <section class="info-section open" id="runSection">
           <button class="info-section-toggle" type="button">

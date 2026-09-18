@@ -13,7 +13,15 @@ const toolList = document.getElementById("toolList");
 const modelLabel = document.getElementById("modelLabel");
 const maxRoundsValue = document.getElementById("maxRoundsValue");
 const sessionList = document.getElementById("sessionList");
+const agentTreeList = document.getElementById("agentTreeList");
+const createSupervisorBtn = document.getElementById("createSupervisorBtn");
+const selectSupervisorBtn = document.getElementById("selectSupervisorBtn");
 const taskList = document.getElementById("taskList");
+const delegationList = document.getElementById("delegationList");
+const delegationResult = document.getElementById("delegationResult");
+const refreshDelegationsBtn = document.getElementById("refreshDelegationsBtn");
+const agentMessageList = document.getElementById("agentMessageList");
+const refreshAgentMessagesBtn = document.getElementById("refreshAgentMessagesBtn");
 const runBar = document.getElementById("runBar");
 const runStatus = document.getElementById("runStatus");
 const runActions = document.getElementById("runActions");
@@ -51,6 +59,7 @@ const mcpStatus = document.getElementById("mcpStatus");
 
 const ACTIVE_SESSION_KEY = "countboter_active_session";
 let sessions = [];
+let agentTree = [];
 let projects = [];
 let activeSessionId = null;
 let activeTaskId = null;
@@ -609,6 +618,7 @@ function renderSessions() {
     groupEl.appendChild(header);
 
     for (const session of group.sessions) {
+      const treeAgent = agentTree.find((agent) => agent.agent_id === session.id);
       const li = document.createElement("li");
       li.className = "session-item" + (session.id === activeSessionId ? " active" : "");
 
@@ -619,28 +629,287 @@ function renderSessions() {
       title.textContent = session.title || "新会话";
       title.title = session.title || "新会话";
       title.addEventListener("click", () => openSession(session.id));
-      title.addEventListener("dblclick", async () => {
+      if (!treeAgent) title.addEventListener("dblclick", async () => {
         const newTitle = window.prompt("会话标题", session.title || "新会话");
-        if (newTitle && newTitle.trim()) {
-          await renameSession(session.id, newTitle.trim());
-        }
+        if (newTitle && newTitle.trim()) await renameSession(session.id, newTitle.trim());
       });
 
       const removeBtn = document.createElement("button");
       removeBtn.className = "session-delete";
       removeBtn.type = "button";
       removeBtn.textContent = "删除";
-      removeBtn.addEventListener("click", (event) => {
+      if (!treeAgent) removeBtn.addEventListener("click", (event) => {
         event.stopPropagation();
         deleteSession(session.id);
       });
 
       li.appendChild(title);
-      li.appendChild(removeBtn);
+      if (!treeAgent) li.appendChild(removeBtn);
       groupEl.appendChild(li);
     }
 
     sessionList.appendChild(groupEl);
+  }
+}
+
+
+function renderAgentTree() {
+  agentTreeList.replaceChildren();
+  const hasRoot = agentTree.some((agent) => agent.agent_role === "supervisor" && !agent.archived_at);
+  createSupervisorBtn.disabled = hasRoot;
+  selectSupervisorBtn.disabled = hasRoot || !activeSessionId;
+  if (!hasRoot) {
+    const empty = document.createElement("li");
+    empty.textContent = "尚未显式选定 Supervisor；旧会话不会自动成为根。";
+    agentTreeList.appendChild(empty);
+  }
+  for (const agent of agentTree) {
+    const item = document.createElement("li");
+    item.className = "agent-tree-item" + (agent.agent_id === activeSessionId ? " active" : "");
+    item.style.paddingLeft = (8 + Math.min(agent.depth || 0, 2) * 14) + "px";
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "agent-tree-open";
+    open.textContent = agent.title + " · " + agent.agent_role + " · " +
+      ((agent.status && agent.status.state) || "idle");
+    open.addEventListener("click", () => openSession(agent.agent_id));
+    item.appendChild(open);
+    const info = document.createElement("small");
+    info.textContent = (agent.agent_role === "supervisor" ? "协调与委派" : "执行已委派任务") +
+      " · 能力上限: " + (agent.capability_grants || []).join(", ") +
+      (agent.can_delegate ? " · 可委派" : " · 不可委派");
+    item.appendChild(info);
+    if (!agent.archived_at && agent.can_delegate && agent.depth < 2 &&
+        (agent.capability_grants || []).includes("control.delegate_task")) {
+      const add = document.createElement("button");
+      add.type = "button";
+      add.textContent = "新建 Worker";
+      add.addEventListener("click", () => createWorker(agent.agent_id));
+      item.appendChild(add);
+    }
+    if (!agent.archived_at && agent.agent_role === "worker") {
+      const root = agentTree.find((item) => item.agent_role === "supervisor");
+      if (root && (root.capability_grants || []).includes("control.delegate_task")) {
+        const delegate = document.createElement("button");
+        delegate.type = "button";
+        delegate.textContent = "委派 Task";
+        delegate.addEventListener("click", () => delegateTask(agent.agent_id));
+        item.appendChild(delegate);
+      }
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.textContent = "重命名";
+      rename.addEventListener("click", () => renameTreeAgent(agent));
+      item.appendChild(rename);
+      const archive = document.createElement("button");
+      archive.type = "button";
+      archive.textContent = "归档";
+      archive.addEventListener("click", () => archiveTreeWorker(agent));
+      item.appendChild(archive);
+    }
+    agentTreeList.appendChild(item);
+  }
+}
+
+
+async function loadAgentTree() {
+  try {
+    const data = await apiJson("/api/agents/tree");
+    agentTree = data.agents || [];
+    renderAgentTree();
+    renderSessions();
+    if (activeSessionId) loadAgentMessages();
+  } catch (err) {
+    log("加载 Agent 树失败: " + err.message);
+  }
+}
+
+
+async function createSupervisor() {
+  const title = window.prompt("Supervisor 名称", "Supervisor");
+  if (!title || !title.trim()) return;
+  try {
+    const agent = await apiJson("/api/supervisor", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: title.trim() }),
+    });
+    await refreshSessions();
+    await loadAgentTree();
+    await openSession(agent.agent_id);
+  } catch (err) {
+    appendNote("创建 Supervisor 失败: " + err.message);
+  }
+}
+
+
+async function selectSupervisor() {
+  if (!activeSessionId) return;
+  try {
+    await apiJson("/api/supervisor/select", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_id: activeSessionId }),
+    });
+    await loadAgentTree();
+  } catch (err) {
+    appendNote("选择 Supervisor 失败: " + err.message);
+  }
+}
+
+
+async function createWorker(parentId) {
+  const title = window.prompt("Worker 名称 / 角色说明");
+  if (!title || !title.trim()) return;
+  try {
+    const agent = await apiJson("/api/agents/workers", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ parent_agent_id: parentId, title: title.trim() }),
+    });
+    await refreshSessions();
+    await loadAgentTree();
+    await openSession(agent.agent_id);
+  } catch (err) {
+    appendNote("创建 Worker 失败: " + err.message);
+  }
+}
+
+
+async function renameTreeAgent(agent) {
+  const title = window.prompt("Agent 名称", agent.title);
+  if (!title || !title.trim()) return;
+  try {
+    await apiJson("/api/agents/" + encodeURIComponent(agent.agent_id), {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: title.trim() }),
+    });
+    await refreshSessions();
+    await loadAgentTree();
+  } catch (err) {
+    appendNote("重命名 Worker 失败: " + err.message);
+  }
+}
+
+
+async function archiveTreeWorker(agent) {
+  if (!window.confirm("归档 Worker “" + agent.title + "”？")) return;
+  try {
+    await apiJson("/api/agents/" + encodeURIComponent(agent.agent_id), { method: "DELETE" });
+    if (activeSessionId === agent.agent_id) {
+      closeRunSubscription();
+      activeSessionId = null;
+      localStorage.removeItem(ACTIVE_SESSION_KEY);
+      clearChat();
+    }
+    await refreshSessions();
+    await loadAgentTree();
+  } catch (err) {
+    appendNote("归档 Worker 失败: " + err.message);
+  }
+}
+
+
+async function delegateTask(assigneeId) {
+  const goal = window.prompt("委派目标");
+  if (!goal || !goal.trim()) return;
+  try {
+    const data = await apiJson("/api/delegations", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ assignee_agent_id: assigneeId, goal: goal.trim() }),
+    });
+    appendNote(data.run ? "Task 已委派并排入 Run" : "Worker 正忙；Task 已持久排队");
+    await loadDelegations();
+    await loadAgentTree();
+  } catch (err) {
+    appendNote("委派失败: " + err.message);
+  }
+}
+
+
+async function loadDelegations() {
+  try {
+    const data = await apiJson("/api/delegations?limit=50");
+    delegationList.replaceChildren();
+    for (const task of data.tasks || []) {
+      const item = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      const creator = agentTree.find((agent) => agent.agent_id === task.creator_agent_id)?.title ||
+        (task.creator_agent_id ? task.creator_agent_id : "宿主");
+      const assignee = agentTree.find((agent) => agent.agent_id === task.agent_id)?.title ||
+        task.agent_id;
+      button.textContent = creator + " → " + assignee + " · " + task.goal + " · " + task.status;
+      button.addEventListener("click", () => showDelegation(task.task_id));
+      item.appendChild(button);
+      delegationList.appendChild(item);
+    }
+  } catch (err) {
+    log("加载委派 Task 失败: " + err.message);
+  }
+}
+
+
+async function showDelegation(taskId) {
+  try {
+    const data = await apiJson("/api/delegations/" + encodeURIComponent(taskId));
+    const result = data.result;
+    delegationResult.textContent = result ?
+      [result.summary,
+       "验收: " + result.acceptance_results.map((item) =>
+         (item.ok ? "✓ " : "✗ ") + item.criterion).join("；"),
+       "产物: " + result.artifacts.map((item) => item.artifact_id + " (" + item.kind + ")").join("，"),
+       "证据: " + result.evidence.map((item) => item.kind + " exit=" + item.exit_code).join("，"),
+       "后续: " + result.followups.join("；")].join("\n") :
+      "Task " + data.task.status + "，尚无结构化结果";
+  } catch (err) {
+    appendNote("读取 Task 结果失败: " + err.message);
+  }
+}
+
+
+async function loadAgentMessages() {
+  const agentId = activeSessionId;
+  agentMessageList.replaceChildren();
+  if (!agentId || !agentTree.some((agent) => agent.agent_id === agentId)) return;
+  try {
+    const data = await apiJson("/api/agents/" + encodeURIComponent(agentId) +
+      "/agent-messages?limit=100");
+    if (activeSessionId !== agentId) return;
+    for (const message of data.messages || []) {
+      const item = document.createElement("li");
+      const source = message.sender_agent_id ?
+        (agentTree.find((agent) => agent.agent_id === message.sender_agent_id)?.title ||
+         message.sender_agent_id) : "宿主";
+      const label = document.createElement("span");
+      label.textContent = source + " · " + message.kind +
+        (message.needs_reply ? " · 等待宿主答复" : "") + " · " + message.content;
+      item.appendChild(label);
+      if (message.kind === "question" && message.needs_reply) {
+        const reply = document.createElement("button");
+        reply.type = "button";
+        reply.textContent = "答复";
+        reply.addEventListener("click", () => replyToAgent(agentId, message.message_id));
+        item.appendChild(reply);
+      }
+      agentMessageList.appendChild(item);
+    }
+  } catch (err) {
+    log("加载 Agent 消息失败: " + err.message);
+  }
+}
+
+
+async function replyToAgent(agentId, messageId) {
+  const content = window.prompt("回复 Worker 问题");
+  if (!content || !content.trim()) return;
+  try {
+    await apiJson("/api/agents/" + encodeURIComponent(agentId) + "/replies", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reply_to_message_id: messageId, content: content.trim() }),
+    });
+    await loadAgentMessages();
+    await loadAgentTree();
+    await loadDelegations();
+  } catch (err) {
+    appendNote("答复失败: " + err.message);
   }
 }
 
@@ -653,6 +922,7 @@ async function loadSessions() {
     sessions = data.sessions || [];
     await loadProjects();
     renderSessions();
+    renderAgentTree();
 
     const savedId = localStorage.getItem(ACTIVE_SESSION_KEY);
     if (savedId && sessions.some((session) => session.id === savedId)) {
@@ -672,6 +942,7 @@ async function refreshSessions() {
     sessions = data.sessions || [];
     await loadProjects();
     renderSessions();
+    renderAgentTree();
   } catch (err) {
     log("刷新会话失败: " + err.message);
   }
@@ -690,6 +961,7 @@ async function openSession(sessionId) {
     if (!response.ok) return;
     const data = await response.json();
     activeSessionId = sessionId;
+    renderAgentTree();
     localStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
     clearChat();
     runBar.hidden = true;
@@ -715,6 +987,7 @@ async function openSession(sessionId) {
     renderSessions();
     await loadTasks(sessionId, true);
     await loadApprovals();
+    await loadAgentMessages();
   } catch (err) {
     log("打开会话失败: " + err.message);
   }
@@ -746,6 +1019,7 @@ async function createNewSession() {
     const session = await response.json();
     sessions.unshift(session);
     activeSessionId = session.id;
+    renderAgentTree();
     localStorage.setItem(ACTIVE_SESSION_KEY, session.id);
     currentSessionHasMessages = false;
     projectAssignSelect.value = session.project_id || "";
@@ -786,6 +1060,7 @@ async function deleteSession(sessionId) {
     if (activeSessionId === sessionId) {
       closeRunSubscription();
       activeSessionId = null;
+      renderAgentTree();
       activeRunId = null;
       activeTaskId = null;
       streaming = false;
@@ -1346,6 +1621,8 @@ input.addEventListener("input", autoResize);
 uploadBtn.addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", uploadFile);
 newSessionBtn.addEventListener("click", createNewSession);
+createSupervisorBtn.addEventListener("click", createSupervisor);
+selectSupervisorBtn.addEventListener("click", selectSupervisor);
 newProjectBtn.addEventListener("click", createProject);
 projectAssignSelect.addEventListener("change", assignActiveSessionProject);
 settingsBtn.addEventListener("click", openSettings);
@@ -1353,6 +1630,8 @@ closeSettingsBtn.addEventListener("click", closeSettings);
 settingsForm.addEventListener("submit", saveSettings);
 addMcpBtn.addEventListener("click", addMcpServer);
 refreshMcpBtn.addEventListener("click", refreshMcp);
+refreshDelegationsBtn.addEventListener("click", loadDelegations);
+refreshAgentMessagesBtn.addEventListener("click", loadAgentMessages);
 settingsModal.addEventListener("click", (event) => {
   if (event.target === settingsModal) closeSettings();
 });
@@ -1378,5 +1657,7 @@ bootstrapIfNeeded().then((ready) => {
   if (ready) {
     loadRuntimeInfo();
     loadSessions();
+    loadAgentTree();
+    loadDelegations();
   }
 }).catch(() => { statusText.textContent = "连接失败"; });

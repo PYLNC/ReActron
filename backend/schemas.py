@@ -153,6 +153,41 @@ class AgentRenameRequest(BaseModel):
     title: AgentTitle
 
 
+RefId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+
+
+class DelegationContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message_refs: List[RefId] = Field(default_factory=list, max_length=16)
+    artifact_refs: List[RefId] = Field(default_factory=list, max_length=16)
+
+
+class DelegationLimits(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_rounds: int | None = Field(default=None, ge=1, le=20)
+    max_tool_calls: int | None = Field(default=None, ge=1, le=32)
+
+
+class HostDelegateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assignee_agent_id: NonEmptyText
+    goal: NonEmptyText
+    acceptance: List[NonEmptyText] = Field(default_factory=list, max_length=32)
+    context: DelegationContext | None = None
+    requested_grant: AgentCapabilitiesRequest | None = None
+    limits: DelegationLimits | None = None
+
+
+class HumanReplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reply_to_message_id: int = Field(ge=1)
+    content: NonEmptyText = Field(max_length=4000)
+
+
 class SettingsRequest(BaseModel):
     """PUT /api/settings 请求体。"""
 
