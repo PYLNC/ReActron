@@ -151,6 +151,14 @@ function setStatus(mode) {
 
 
 function setSendButton() {
+  const workerSelected = agentTree.some((agent) =>
+    agent.agent_id === activeSessionId && agent.agent_role === "worker");
+  input.readOnly = workerSelected;
+  if (workerSelected) {
+    sendBtn.textContent = "Worker 仅接受委派";
+    sendBtn.disabled = true;
+    return;
+  }
   sendBtn.textContent = streaming ? (runAllowedActions.includes("cancel") ? "取消 Run" : "运行中") : "发送";
   sendBtn.disabled = streaming && !runAllowedActions.includes("cancel");
 }
@@ -709,6 +717,7 @@ function renderAgentTree() {
     }
     agentTreeList.appendChild(item);
   }
+  setSendButton();
 }
 
 
@@ -1575,7 +1584,8 @@ async function openRun(runId, restore = false) {
 
 async function sendMessage() {
   const text = input.value.trim();
-  if (!text || streaming) return;
+  if (!text || streaming || agentTree.some((agent) =>
+      agent.agent_id === activeSessionId && agent.agent_role === "worker")) return;
   streaming = true;
   runAllowedActions = [];
   setStatus("thinking");

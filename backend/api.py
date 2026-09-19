@@ -136,6 +136,17 @@ def _task_response(row: dict) -> dict:
     }
 
 
+async def _host_task_agent(agent_id: str) -> dict | None:
+    """宿主可直接对话 legacy 会话或当前根；Worker 只能接受委派。"""
+    agent = await asyncio.to_thread(db.get_session, agent_id)
+    if not agent or agent.get("archived_at"):
+        return None
+    if not agent.get("agent_role"):
+        return agent
+    root = await asyncio.to_thread(db.get_supervisor)
+    return agent if agent.get("agent_role") == "supervisor" and root and root["id"] == agent["id"] else None
+
+
 def _run_response(row: dict) -> dict:
     from backend.runtime import allowed_actions
 
@@ -352,8 +363,11 @@ async def skills():
 @router.post("/tasks", status_code=201, response_model=TaskResponse)
 async def create_task(payload: TaskCreateRequest):
     try:
+        if not await _host_task_agent(payload.agent_id):
+            return _error_response(404, "not_found", "资源不存在")
         row = await asyncio.to_thread(
-            db.create_task, payload.agent_id, payload.goal, payload.acceptance, payload.context
+            db.create_task, payload.agent_id, payload.goal, payload.acceptance,
+            payload.context.model_dump() if payload.context else None,
         )
     except Exception as exc:
         return _repository_error(exc)
@@ -976,8 +990,8 @@ async def chat(payload: ChatRequest, request: Request,
 
     session_id = (payload.session_id or "").strip() or None
     if session_id:
-        session = db.get_session(session_id)
-        if not session or session.get("archived_at"):
+        session = await _host_task_agent(session_id)
+        if not session:
             return _error_response(404, "not_found", "资源不存在")
     else:
         if not payload.project_id:

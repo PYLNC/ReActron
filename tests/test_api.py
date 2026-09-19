@@ -328,7 +328,7 @@ class Wave3SchemaTest(unittest.TestCase):
         payload = TaskCreateRequest(agent_id=" agent-1 ", goal=" goal ")
         self.assertEqual((payload.agent_id, payload.goal), ("agent-1", "goal"))
         self.assertEqual(payload.acceptance, [])
-        self.assertEqual(payload.context, {})
+        self.assertIsNone(payload.context)
         with self.assertRaises(ValidationError):
             TaskCreateRequest(agent_id="agent-1", session_id="agent-1", goal="goal")
         with self.assertRaises(ValidationError):
@@ -374,6 +374,9 @@ class Wave3RouteTest(unittest.TestCase):
             "finished_at": None, "idempotency_key": "private-key", "lease_owner": "private",
         }
         self.database.create_task.return_value = self.task
+        self.database.get_session.return_value = {
+            "id": "agent-1", "agent_role": None, "archived_at": None,
+        }
         self.database.get_task.return_value = self.task
         self.database.list_tasks.return_value = [self.task]
         self.database.get_latest_run_id.return_value = None

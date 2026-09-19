@@ -18,6 +18,8 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     """POST /api/chat 请求体。"""
 
+    model_config = ConfigDict(extra="forbid")
+
     session_id: Optional[str] = None
     project_id: Optional[str] = None
     message: str = Field(min_length=1, description="用户发送的消息")
@@ -30,6 +32,14 @@ class BootstrapRequest(BaseModel):
 
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+RefId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+
+
+class DelegationContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message_refs: List[RefId] = Field(default_factory=list, max_length=16)
+    artifact_refs: List[RefId] = Field(default_factory=list, max_length=16)
 
 
 class TaskCreateRequest(BaseModel):
@@ -40,7 +50,7 @@ class TaskCreateRequest(BaseModel):
     agent_id: NonEmptyText
     goal: NonEmptyText
     acceptance: List[str] = Field(default_factory=list)
-    context: Dict[str, Any] = Field(default_factory=dict)
+    context: DelegationContext | None = None
 
 
 class RunCreateRequest(BaseModel):
@@ -153,16 +163,6 @@ class AgentRenameRequest(BaseModel):
     title: AgentTitle
 
 
-RefId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
-
-
-class DelegationContext(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    message_refs: List[RefId] = Field(default_factory=list, max_length=16)
-    artifact_refs: List[RefId] = Field(default_factory=list, max_length=16)
-
-
 class DelegationLimits(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -227,12 +227,16 @@ class SessionListResponse(BaseModel):
 class SessionCreateRequest(BaseModel):
     """创建会话请求体。"""
 
+    model_config = ConfigDict(extra="forbid")
+
     title: Optional[str] = "新会话"
     project_id: Optional[str] = None
 
 
 class SessionRenameRequest(BaseModel):
     """重命名会话请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
 
     title: str = Field(min_length=1)
 
@@ -251,6 +255,8 @@ class ProjectRenameRequest(BaseModel):
 
 class SessionProjectRequest(BaseModel):
     """把会话归入项目的请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
 
     project_id: Optional[str] = None
 

@@ -166,12 +166,20 @@ class P2AgentApiTest(unittest.TestCase):
                     "parent_agent_id": "root-1", "title": "X",
                     "capabilities": {"grants": ["read_only"], "workspace_roots": ["private-marker"]},
                 }),
+                self.client.post("/api/sessions", json={
+                    "title": "X", "project_id": "project-1", "agent_role": "supervisor",
+                }),
+                self.client.post("/api/chat", json={
+                    "session_id": "root-1", "message": "X", "sender_session_id": "worker-1",
+                }),
             ]
         self.assertTrue(all(response.status_code == 422 for response in bad))
         self.assertTrue(all(set(response.json()) ==
                             {"code", "message", "details", "trace_id"} for response in bad))
         self.assertNotIn("private-marker", " ".join(response.text for response in bad))
         self.database.create_worker.assert_not_called()
+        self.database.create_session.assert_not_called()
+        self.database.create_legacy_chat_run.assert_not_called()
 
     def test_repository_conflict_and_hidden_resource_mapping(self):
         class RepoError(ValueError):
@@ -235,6 +243,60 @@ class P2AgentApiTest(unittest.TestCase):
             self.assertEqual(set(response.json()),
                              {"code", "message", "details", "trace_id"})
         self.database.host_delegate_task.assert_not_called()
+
+    def test_public_task_entries_allow_only_legacy_or_active_root_with_safe_context(self):
+        inactive_root = {**self.root, "id": "root-old"}
+        legacy = {
+            "id": "legacy-1", "agent_role": None, "archived_at": None,
+        }
+        agents = {row["id"]: row for row in
+                  (self.root, self.worker, inactive_root, legacy)}
+        self.database.get_session.side_effect = agents.get
+        self.database.create_task.side_effect = lambda agent_id, goal, acceptance, context: {
+            **self.task, "session_id": agent_id, "goal": goal,
+            "acceptance_json": "[]", "context_json": "{}",
+        }
+        with patch.object(api, "db", self.database):
+            worker = self.client.post("/api/tasks", json={
+                "agent_id": "worker-1", "goal": "Direct bypass",
+            })
+            inactive = self.client.post("/api/tasks", json={
+                "agent_id": "root-old", "goal": "Wrong root",
+            })
+            injected = self.client.post("/api/tasks", json={
+                "agent_id": "root-1", "goal": "Forged context", "context": {
+                    "sender_session_id": "worker-1",
+                    "workspace_roots": ["private-marker"],
+                    "grant": ["filesystem.write"],
+                },
+            })
+            worker_chat = self.client.post("/api/chat", json={
+                "session_id": "worker-1", "message": "Direct bypass",
+            })
+            self.database.create_task.assert_not_called()
+            self.database.create_legacy_chat_run.assert_not_called()
+            root = self.client.post("/api/tasks", json={
+                "agent_id": "root-1", "goal": "Host task",
+                "context": {"message_refs": ["message-1"]},
+            })
+            old = self.client.post("/api/tasks", json={
+                "agent_id": "legacy-1", "goal": "Legacy task",
+            })
+        self.assertEqual([(item.status_code, item.json()["code"])
+                          for item in (worker, inactive)], [
+                              (404, "not_found"), (404, "not_found"),
+                          ])
+        self.assertEqual(injected.status_code, 422)
+        self.assertNotIn("private-marker", injected.text)
+        self.assertEqual((worker_chat.status_code, worker_chat.json()["code"]),
+                         (404, "not_found"))
+        self.assertEqual((root.status_code, old.status_code), (201, 201))
+        self.assertEqual(self.database.create_task.call_args_list[0].args, (
+            "root-1", "Host task", [],
+            {"message_refs": ["message-1"], "artifact_refs": []},
+        ))
+        self.assertEqual(self.database.create_task.call_args_list[1].args,
+                         ("legacy-1", "Legacy task", [], None))
 
     def test_tree_tasks_and_result_are_scoped_and_safely_projected(self):
         with patch.object(api, "db", self.database):
@@ -434,6 +496,14 @@ vm.runInContext("activeSessionId='root'; agentTree=tree", context);
   assert.strictEqual(nodes.get('agentMessageList').children[0].children.length, 1);
   await vm.runInContext('replyToAgent', context)('worker', 7);
   assert.strictEqual(calls.filter((call) => call.url.endsWith('/replies')).length, 1);
+  vm.runInContext('setSendButton()', context);
+  assert.strictEqual(nodes.get('input').readOnly, true);
+  assert.strictEqual(nodes.get('sendBtn').disabled, true);
+  nodes.get('input').value = 'Direct Worker task';
+  await vm.runInContext('sendMessage', context)();
+  assert.strictEqual(calls.filter((call) => call.url === '/api/tasks').length, 0);
+  vm.runInContext("activeSessionId='root'; setSendButton()", context);
+  assert.strictEqual(nodes.get('input').readOnly, false);
 })().catch((error) => { process.stderr.write(String(error)); process.exitCode = 1; });
 """
         result = subprocess.run(
