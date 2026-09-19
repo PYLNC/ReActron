@@ -565,6 +565,54 @@ class RunnerCoreTest(unittest.IsolatedAsyncioTestCase):
                                              (self.run["id"],))["content"], "answer")
         self.assertGreater(self.db.get_run(self.run["id"])["event_bytes_written"], 0)
 
+    async def test_blocking_model_renews_lease_and_heartbeat_always_stops(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        def factory(*_):
+            async def step(*_args, **_kwargs):
+                entered.set()
+                await release.wait()
+                return {"content": "done", "tool_calls": []}
+            return step
+
+        runner = TaskRunner(
+            self.db, model_factory=factory,
+            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+            tool_context_factory=lambda run: make_run_context(run["id"]),
+        )
+        with (patch("backend.runtime.RUN_LEASE_SECONDS", 1),
+              patch("backend.runtime.HEARTBEAT_INTERVAL_SECONDS", 0.05)):
+            work = asyncio.create_task(runner.run_once())
+            await asyncio.wait_for(entered.wait(), 2)
+            await asyncio.sleep(1.1)
+            self.assertEqual(self.db.recover_expired_leases(), [])
+            self.assertEqual(self.db.get_run(self.run["id"])["status"], "running")
+            release.set()
+            await work
+        self.assertEqual(self.db.get_run(self.run["id"])["status"], "completed")
+        self.assertFalse(any(task.get_name().startswith("reactron-heartbeat:")
+                             for task in asyncio.all_tasks() if not task.done()))
+
+        failed_task = self.db.create_task(self.agent_id, "fail")
+        failed_run, _ = self.db.create_run(
+            failed_task["id"], "failed-run",
+            config_snapshot={"model": "fake", "max_rounds": 1}, tool_snapshot={})
+
+        def failing_factory(*_):
+            async def step(*_args, **_kwargs):
+                raise RuntimeError("boom")
+            return step
+
+        failed_runner = TaskRunner(
+            self.db, model_factory=failing_factory,
+            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+            tool_context_factory=lambda run: make_run_context(run["id"]),
+        )
+        await failed_runner.run_once()
+        self.assertEqual(self.db.get_run(failed_run["id"])["status"], "failed")
+        self.assertFalse(any(task.get_name().startswith("reactron-heartbeat:")
+                             for task in asyncio.all_tasks() if not task.done()))
+
     async def test_p2_control_results_and_wakeups_survive_runner_restarts(self):
         self.db.request_control(self.run["id"], "cancel")
         root = self.db.create_supervisor()

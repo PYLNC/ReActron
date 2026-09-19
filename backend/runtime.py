@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import uuid
+from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +17,8 @@ from backend.tool_gateway import ToolOutcome, execute_tool
 
 logger = logging.getLogger("agent.runner")
 MAX_CONCURRENT_RUNS = 4
+RUN_LEASE_SECONDS = 120
+HEARTBEAT_INTERVAL_SECONDS = 30
 
 
 class RunnerUnavailable(RuntimeError):
@@ -95,7 +98,7 @@ class TaskRunner:
 
     async def run_once(self):
         self.database.schedule_pending_tasks()
-        run = self.database.claim_next_run(self._owner, lease_seconds=120)
+        run = self.database.claim_next_run(self._owner, lease_seconds=RUN_LEASE_SECONDS)
         if not run:
             return False
         try:
@@ -150,6 +153,35 @@ class TaskRunner:
             outcome, started["name"], started["action_hash"], expires)
 
     async def _process(self, run):
+        heartbeat = asyncio.create_task(
+            self._heartbeat(run["id"], run["lease_epoch"]),
+            name=f"reactron-heartbeat:{run['id']}",
+        )
+        try:
+            await self._process_claimed(run)
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
+
+    async def _heartbeat(self, run_id, lease_epoch):
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            latest = self.database.get_run(run_id)
+            if (not latest or latest["status"] != "running" or
+                    latest["lease_owner"] != self._owner or
+                    latest["lease_epoch"] != lease_epoch):
+                return
+            try:
+                self.database.heartbeat_run(
+                    run_id, self._owner, lease_epoch, latest["version"],
+                    lease_seconds=RUN_LEASE_SECONDS,
+                )
+            except InvalidRunTransition:
+                # Another CAS won; the main loop reloads state at every safe point.
+                return
+
+    async def _process_claimed(self, run):
         run_id = run["id"]
         try:
             snapshot = json.loads(run["config_snapshot_json"])
