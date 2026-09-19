@@ -15,6 +15,7 @@ from backend.tool_gateway import ToolOutcome, execute_tool
 
 
 logger = logging.getLogger("agent.runner")
+MAX_CONCURRENT_RUNS = 4
 
 
 class RunnerUnavailable(RuntimeError):
@@ -75,6 +76,10 @@ class TaskRunner:
         self._wake.set()
 
     async def _loop(self):
+        # ponytail: four slots match P2 fan-out; add a scheduler only if polling gets hot.
+        await asyncio.gather(*(self._worker_loop() for _ in range(MAX_CONCURRENT_RUNS)))
+
+    async def _worker_loop(self):
         while not self._closing:
             try:
                 self.database.recover_expired_leases()
@@ -89,10 +94,14 @@ class TaskRunner:
                 pass
 
     async def run_once(self):
+        self.database.schedule_pending_tasks()
         run = self.database.claim_next_run(self._owner, lease_seconds=120)
         if not run:
             return False
-        await self._process(run)
+        try:
+            await self._process(run)
+        finally:
+            self.database.schedule_pending_tasks()
         return True
 
     async def _fail(self, run, code):
@@ -145,7 +154,9 @@ class TaskRunner:
         try:
             snapshot = json.loads(run["config_snapshot_json"])
             max_rounds = max(1, min(20, int(snapshot["max_rounds"])))
-            context = self.tool_context_factory(run)
+            context = replace(
+                self.tool_context_factory(run), **self.database.control_scope(run_id)
+            )
             started = self.database._query_all(
                 "SELECT payload_json FROM events WHERE run_id=? AND type='tool.started'",
                 (run_id,))
@@ -166,6 +177,7 @@ class TaskRunner:
                         checkpoint["round"] < 1):
                     raise ValueError("invalid_checkpoint")
                 if checkpoint["phase"] == "tool_pending":
+                    context = replace(context, **self.database.control_scope(run_id))
                     run = await self._tool_step(run, checkpoint, context)
                     continue
                 round_index = checkpoint["round"]
@@ -275,8 +287,9 @@ class TaskRunner:
         if duplicate_result:
             await self._fail(run, "duplicate_tool_call_id")
             return self.database.get_run(run["id"])
+        spec = context.tool_specs.get(name)
         started = self.database.get_tool_start(run["id"], call_id)
-        if started:
+        if started and (not spec or spec.origin != "internal"):
             # Crash after the invocation marker: no approval decision is a replay grant.
             effect = json.loads(started["payload_json"])["effect"]
             if effect == "effectful":
@@ -289,13 +302,13 @@ class TaskRunner:
             else:
                 await self._fail(run, "incomplete_tool_call")
             return self.database.get_run(run["id"])
-        spec = context.tool_specs.get(name)
         effect = "effectful" if spec and spec.effects - {"read_only", "filesystem.read"} else "read_only"
         cfg = self.provider_config(run)
         context = replace(context, secrets=(cfg.api_key,))
-        run = self.database.start_tool_call(
-            run["id"], run["version"], self._owner, run["lease_epoch"],
-            call_id, name, effect, action_hash)
+        if not started:
+            run = self.database.start_tool_call(
+                run["id"], run["version"], self._owner, run["lease_epoch"],
+                call_id, name, effect, action_hash)
         outcome = await self.tool_executor(replace(context, call_id=call_id), name, arguments)
         if outcome.call_id != call_id:
             raise ValueError("ToolOutcome call_id mismatch")
@@ -310,6 +323,11 @@ class TaskRunner:
                 run["id"], run["version"], self._owner, run["lease_epoch"],
                 outcome, name, action_hash, expires)
             return self.database.get_run(run["id"])
+        if spec and spec.origin == "internal" and outcome.status == "ok":
+            return self.database.apply_control_tool(
+                run["id"], run["version"], self._owner, run["lease_epoch"],
+                call_id, name, arguments, model_text=outcome.model_text,
+            )[0]
         next_checkpoint = {**checkpoint, "next_tool_index": index + 1}
         run, _ = self.database.transition_run(
             run["id"], run["version"], "running", "tool.completed",

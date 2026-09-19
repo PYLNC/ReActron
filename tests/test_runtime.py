@@ -565,6 +565,144 @@ class RunnerCoreTest(unittest.IsolatedAsyncioTestCase):
                                              (self.run["id"],))["content"], "answer")
         self.assertGreater(self.db.get_run(self.run["id"])["event_bytes_written"], 0)
 
+    async def test_p2_control_results_and_wakeups_survive_runner_restarts(self):
+        self.db.request_control(self.run["id"], "cancel")
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "Worker")
+        task = self.db.create_task(root["id"], "coordinate")
+        parent, _ = self.db.create_run(task["id"], "parent-run")
+        child_task_id = None
+        observed_delegate_result = None
+
+        def tool_call(call_id, name, arguments):
+            return {"id": call_id, "type": "function", "function": {
+                "name": name, "arguments": _json(arguments)}}
+
+        def factory(*_):
+            async def step(messages, *, run_id, round_index, **_kwargs):
+                nonlocal child_task_id, observed_delegate_result
+                run = self.db.get_run(run_id)
+                if run["session_id"] == root["id"]:
+                    if round_index == 1:
+                        return {"content": None, "tool_calls": [tool_call(
+                            "delegate-1", "delegate_task", {
+                                "assignee_agent_id": worker["id"],
+                                "goal": "answer child task", "acceptance": [],
+                            })]}
+                    if round_index == 2:
+                        payloads = [json.loads(message["content"])
+                                    for message in messages if message["role"] == "tool"]
+                        observed_delegate_result = next(
+                            payload for payload in payloads if "run_id" in payload)
+                        child_task_id = observed_delegate_result["task_id"]
+                    if self.db.get_task(child_task_id)["status"] == "open":
+                        return {"content": None, "tool_calls": [tool_call(
+                            f"wait-{round_index}", "wait_for_tasks",
+                            {"task_ids": [child_task_id]})]}
+                    self.assertTrue(any("child done" in (message.get("content") or "")
+                                        for message in messages))
+                    return {"content": "parent done", "tool_calls": []}
+                if round_index == 1:
+                    return {"content": None, "tool_calls": [tool_call(
+                        "question-1", "send_agent_message", {
+                            "to_agent_id": root["id"], "kind": "question",
+                            "content": "need input",
+                        })]}
+                self.assertTrue(any(message.get("content") == "approved"
+                                    for message in messages))
+                result = {"summary": "child done", "acceptance_results": [],
+                          "artifacts": [], "evidence": [], "followups": []}
+                return {"content": None, "tool_calls": [tool_call(
+                    "result-1", "send_agent_message", {
+                        "to_agent_id": root["id"], "kind": "result",
+                        "content": _json(result),
+                    })]}
+            return step
+
+        def restarted_runner():
+            return TaskRunner(
+                self.db, model_factory=factory,
+                provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"))
+
+        await restarted_runner().run_once()
+        waiting_parent = self.db.get_run(parent["id"])
+        self.assertEqual((waiting_parent["status"], waiting_parent["lease_owner"]),
+                         ("waiting", None))
+        self.assertEqual(set(observed_delegate_result), {"task_id", "run_id", "status"})
+        self.assertEqual(observed_delegate_result["status"], "queued")
+        self.assertIsNotNone(observed_delegate_result["run_id"])
+        await restarted_runner().run_once()
+        question = self.db.list_agent_messages(root["id"])[0]
+        self.assertEqual((question["kind"], question["needs_reply"]), ("question", True))
+        waiting_child = self.db.get_run(observed_delegate_result["run_id"])
+        self.assertEqual((waiting_child["status"], waiting_child["lease_owner"]),
+                         ("waiting", None))
+        self.db.host_reply(root["id"], question["id"], "approved")
+        await restarted_runner().run_once()  # Parent observes the question, then waits again.
+        waiting_parent = self.db.get_run(parent["id"])
+        self.assertEqual((waiting_parent["status"], waiting_parent["lease_owner"]),
+                         ("waiting", None))
+        await restarted_runner().run_once()  # Child observes the reply and sends its result.
+        self.assertEqual(self.db.get_task(child_task_id)["status"], "completed")
+        self.assertEqual(self.db.get_run(parent["id"])["status"], "queued")
+        await restarted_runner().run_once()
+        self.assertEqual(self.db.get_run(parent["id"])["status"], "completed")
+        self.assertNotEqual(observed_delegate_result, {"accepted": True})
+
+    async def test_background_runner_bounds_parallel_workers_and_drains_queue(self):
+        self.db.request_control(self.run["id"], "cancel")
+        root = self.db.create_supervisor()
+        first_worker = self.db.create_worker(root["id"], "First")
+        second_worker = self.db.create_worker(root["id"], "Second")
+        first, first_run = self.db.host_delegate_task(root["id"], first_worker["id"], "one")
+        queued, queued_run = self.db.host_delegate_task(root["id"], first_worker["id"], "two")
+        second, second_run = self.db.host_delegate_task(root["id"], second_worker["id"], "three")
+        self.assertIsNotNone(first_run)
+        self.assertIsNone(queued_run)
+        self.assertIsNotNone(second_run)
+        active = {}
+        max_by_agent = {}
+        max_parallel = 0
+        two_entered, release = asyncio.Event(), asyncio.Event()
+
+        def factory(*_):
+            async def step(_messages, *, run_id, **_kwargs):
+                nonlocal max_parallel
+                agent_id = self.db.get_run(run_id)["session_id"]
+                active[agent_id] = active.get(agent_id, 0) + 1
+                max_by_agent[agent_id] = max(max_by_agent.get(agent_id, 0),
+                                              active[agent_id])
+                max_parallel = max(max_parallel, sum(active.values()))
+                if len([count for count in active.values() if count]) >= 2:
+                    two_entered.set()
+                try:
+                    await release.wait()
+                finally:
+                    active[agent_id] -= 1
+                return {"content": "done", "tool_calls": []}
+            return step
+
+        runner = TaskRunner(
+            self.db, model_factory=factory,
+            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"))
+        await runner.start()
+        try:
+            await asyncio.wait_for(two_entered.wait(), 2)
+            release.set()
+            for _ in range(200):
+                if all(self.db.get_task(item["id"])["status"] == "completed"
+                       for item in (first, queued, second)):
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            release.set()
+            await runner.close()
+        queued_run = self.db.get_run(self.db.get_latest_run_id(queued["id"]))
+        self.assertEqual(queued_run["status"], "completed")
+        self.assertGreaterEqual(max_parallel, 2)
+        self.assertEqual(max_by_agent[first_worker["id"]], 1)
+        self.assertEqual(max_by_agent[second_worker["id"]], 1)
+
     async def test_provider_denial_never_constructs_model_client(self):
         calls = []
 
