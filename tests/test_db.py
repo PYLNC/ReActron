@@ -715,6 +715,41 @@ class P2AgentSchemaTest(unittest.TestCase):
         self.assertEqual(self.db.list_agent_messages(root["id"]), [])
         self.assertEqual(self.db.get_run(run["id"])["status"], "running")
 
+    def test_progress_persists_without_waking_waiting_parent(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker")
+        task = self.db.create_task(root["id"], "coordinate")
+        parent, _ = self.db.create_run(task["id"], "parent")
+        delegate = self._call("delegate-1", "delegate_task", {
+            "assignee_agent_id": worker["id"], "goal": "child", "acceptance": [],
+        })
+        parent = self._control_run(parent, [delegate])
+        parent, tool_message_id = self._apply_control(parent, delegate)
+        child_task_id = json.loads(self.db.get_message(tool_message_id)["content"])["task_id"]
+        child_run_id = self.db.get_latest_run_id(child_task_id)
+        parent, _ = self.db.transition_run(
+            parent["id"], parent["version"], "waiting", "run.waiting",
+            {"reason": "children"}, checkpoint={
+                "v": 1, "phase": "model_pending", "round": 2,
+                "awaited_child_task_ids": [child_task_id],
+            }, wait_reason="children", lease_owner="p2-test",
+            lease_epoch=parent["lease_epoch"])
+        before = self.db.get_run(parent["id"])
+        before_event = self.db.get_last_event_id(parent["id"])
+
+        progress = self._call("progress-1", "send_agent_message", {
+            "to_agent_id": root["id"], "kind": "progress", "content": "halfway",
+        })
+        child = self._control_run(self.db.get_run(child_run_id), [progress], "child-test")
+        self._apply_control(child, progress, "child-test")
+
+        messages = self.db.list_agent_messages(root["id"])
+        self.assertEqual((messages[0]["kind"], messages[0]["content"],
+                          messages[0]["recipient_run_id"]),
+                         ("progress", "halfway", parent["id"]))
+        self.assertEqual(self.db.get_run(parent["id"]), before)
+        self.assertEqual(self.db.get_last_event_id(parent["id"]), before_event)
+
     def test_delegate_event_reserve_rejects_before_write_and_rolls_back(self):
         root = self.db.create_supervisor()
         worker = self.db.create_worker(root["id"], "worker")

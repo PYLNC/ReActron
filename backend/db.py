@@ -2324,14 +2324,15 @@ class Database:
                                     child_receipt_task_id=(run["task_id"] if kind == "result" else None),
                                     actor_session_id=agent["id"],
                                     recipient_session_id=recipient["id"])
-                            if parent["status"] == "waiting" and parent["wait_reason"] == "children":
-                                awaited = json.loads(parent["checkpoint_json"] or "{}").get(
-                                    "awaited_child_task_ids", [])
-                                if run["task_id"] in awaited:
-                                    conn.execute("""
-                                        UPDATE runs SET status='queued',wait_reason=NULL,
-                                            version=version+1,updated_at=? WHERE id=?
-                                    """, (now, parent_run_id))
+                                if (parent["status"] == "waiting" and
+                                        parent["wait_reason"] == "children"):
+                                    awaited = json.loads(parent["checkpoint_json"] or "{}").get(
+                                        "awaited_child_task_ids", [])
+                                    if run["task_id"] in awaited:
+                                        conn.execute("""
+                                            UPDATE runs SET status='queued',wait_reason=NULL,
+                                                version=version+1,updated_at=? WHERE id=?
+                                        """, (now, parent_run_id))
                     text = _json({"message_id": message_id, "kind": kind})
                 else:
                     question = conn.execute("SELECT * FROM messages WHERE id=?",
