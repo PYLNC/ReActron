@@ -22,7 +22,7 @@ from backend.db import (
 )
 from backend.context import ContextTooLarge, build_context
 from backend.runtime import TaskRunner
-from backend.tool_gateway import ToolOutcome, ToolSpec, make_run_context
+from backend.tool_gateway import ToolOutcome, ToolSpec, execute_tool, make_run_context
 
 
 class RunRepositoryTest(unittest.TestCase):
@@ -612,6 +612,72 @@ class RunnerCoreTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.get_run(failed_run["id"])["status"], "failed")
         self.assertFalse(any(task.get_name().startswith("reactron-heartbeat:")
                              for task in asyncio.all_tasks() if not task.done()))
+
+    async def test_internal_control_replay_uses_last_budget_slot_once(self):
+        self.db.request_control(self.run["id"], "cancel")
+        root = self.db.create_supervisor()
+        task = self.db.create_task(root["id"], "inspect")
+        run, _ = self.db.create_run(task["id"], "budget-run")
+        calls = [{
+            "id": f"status-{index}", "type": "function", "function": {
+                "name": "get_task_status", "arguments": _json({"task_id": task["id"]}),
+            },
+        } for index in range(1, 34)]
+
+        def first_factory(*_):
+            async def step(*_args, **_kwargs):
+                return {"content": None, "tool_calls": calls}
+            return step
+
+        async def crash_on_last_slot(context, name, arguments):
+            if context.call_id == "status-32":
+                raise asyncio.CancelledError
+            return await execute_tool(context, name, arguments)
+
+        first = TaskRunner(
+            self.db, model_factory=first_factory, tool_executor=crash_on_last_slot,
+            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await first.run_once()
+        self.assertEqual(self.db._query_one(
+            "SELECT COUNT(*) AS n FROM events WHERE run_id=? AND type='tool.started'",
+            (run["id"],))["n"], 32)
+        self.assertEqual(self.db._query_one(
+            "SELECT COUNT(*) AS n FROM messages WHERE run_id=? AND role='tool'",
+            (run["id"],))["n"], 31)
+
+        self.db._execute(
+            "UPDATE runs SET lease_until='2000-01-01T00:00:00.000Z' WHERE id=?",
+            (run["id"],))
+        self.assertEqual(self.db.recover_expired_leases(), [run["id"]])
+        self.db.request_control(run["id"], "resume")
+        replayed = []
+
+        def finish_factory(*_):
+            async def step(*_args, **_kwargs):
+                return {"content": "done", "tool_calls": []}
+            return step
+
+        async def recording_executor(context, name, arguments):
+            replayed.append(context.call_id)
+            return await execute_tool(context, name, arguments)
+
+        resumed = TaskRunner(
+            self.db, model_factory=finish_factory, tool_executor=recording_executor,
+            provider_config=lambda _: SimpleNamespace(api_key="k", base_url="u"),
+        )
+        await resumed.run_once()
+        results = {row["tool_call_id"]: row["content"] for row in self.db._query_all(
+            "SELECT tool_call_id,content FROM messages WHERE run_id=? AND role='tool'",
+            (run["id"],))}
+        self.assertEqual(replayed, ["status-32", "status-33"])
+        self.assertEqual(json.loads(results["status-32"]), {
+            "task_id": task["id"], "status": "open", "assignee_agent_id": root["id"],
+        })
+        self.assertNotEqual(json.loads(results["status-32"]), {"accepted": True})
+        self.assertEqual(results["status-33"], "Tool unavailable: limit_exceeded")
+        self.assertEqual(self.db.get_run(run["id"])["status"], "completed")
 
     async def test_p2_control_results_and_wakeups_survive_runner_restarts(self):
         self.db.request_control(self.run["id"], "cancel")

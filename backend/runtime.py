@@ -334,6 +334,9 @@ class TaskRunner:
             else:
                 await self._fail(run, "incomplete_tool_call")
             return self.database.get_run(run["id"])
+        if started and spec and spec.origin == "internal":
+            # Startup accounting includes this persisted start; replay reserves it once.
+            context.budget.tool_calls = max(0, context.budget.tool_calls - 1)
         effect = "effectful" if spec and spec.effects - {"read_only", "filesystem.read"} else "read_only"
         cfg = self.provider_config(run)
         context = replace(context, secrets=(cfg.api_key,))
