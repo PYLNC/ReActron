@@ -165,7 +165,7 @@ class Database:
                 raise RuntimeError(f"不支持的数据库版本：{version}")
             if version >= 5:
                 self._conn.execute("""
-                    CREATE TRIGGER IF NOT EXISTS trg_task_terminal_retain_checkout
+                    CREATE TRIGGER IF NOT EXISTS trg_task_terminal_retain_worktree
                     AFTER UPDATE OF status ON tasks
                     WHEN OLD.status='open' AND NEW.status<>'open'
                     BEGIN

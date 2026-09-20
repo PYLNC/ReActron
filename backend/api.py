@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from backend.db import DATA_DIR, db
+from backend.db import DATA_DIR, WorkspaceUnavailable, db
 from backend.file_parser import parse_uploaded_file
 from backend.harness import get_harness, run_self_tests
 from backend.mcp.manager import get_manager
@@ -518,7 +518,12 @@ async def create_run(
     if not key:
         return _error_response(400, "idempotency_key_required", "缺少 Idempotency-Key")
     try:
-        row, _created = await asyncio.to_thread(db.create_run, task_id, key)
+        try:
+            row, _created = await asyncio.to_thread(db.create_run, task_id, key)
+        except WorkspaceUnavailable:
+            # A Git write Task persists its checkout identity before any Run exists.
+            await asyncio.to_thread(_workspace_service().coordinate_git_worktrees, db)
+            row, _created = await asyncio.to_thread(db.create_run, task_id, key)
     except Exception as exc:
         return _repository_error(exc)
     _runner().wake()

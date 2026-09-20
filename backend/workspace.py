@@ -617,8 +617,11 @@ def get_task_diff(database, task_id: str,
 
 def cleanup_task_workspace(database, task_id: str) -> dict:
     """API-facing cleanup; the removing transition must atomically reject active Runs."""
+    task = database.get_task(task_id)
+    if not isinstance(task, dict) or task.get("status") == "open":
+        raise WorkspaceError("workspace_in_use")
     root, _ = _task_checkout(
-        database, task_id, frozenset({"active", "retained", "failed"})
+        database, task_id, frozenset({"retained", "failed"})
     )
     if database.task_has_active_run(task_id):
         raise WorkspaceError("workspace_in_use")

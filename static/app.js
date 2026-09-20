@@ -1060,7 +1060,7 @@ async function showTaskWorkspace(task) {
         " · 写操作仍需审批且当前失败关闭" : "") :
     "Task 未绑定 Workspace";
   viewTaskDiffBtn.disabled = !hasCheckout;
-  cleanupTaskBtn.disabled = !hasCheckout;
+  cleanupTaskBtn.disabled = !hasCheckout || task.status === "open";
   try {
     const data = await apiJson("/api/tasks/" + encodeURIComponent(task.task_id) + "/artifacts");
     if (!activeTask || activeTask.task_id !== task.task_id) return;

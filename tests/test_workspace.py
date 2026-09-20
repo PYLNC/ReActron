@@ -288,12 +288,13 @@ class GitWorktreeTest(unittest.TestCase):
                     self.checkout = {
                         "task_id": "task_2", "workspace_id": "workspace-1",
                         "path": str(checkout_path), "branch": "reactron/task_2",
-                        "state": "active",
+                        "state": "retained",
                     }
                     self.transitions = []
 
                 def get_task(self, task_id):
-                    return {"id": task_id, "workspace_id": "workspace-1"}
+                    return {"id": task_id, "workspace_id": "workspace-1",
+                            "status": "completed"}
 
                 def get_workspace(self, workspace_id):
                     return {"id": workspace_id, "kind": "git",
