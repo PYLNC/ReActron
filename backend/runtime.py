@@ -8,6 +8,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from types import MappingProxyType
 
 from backend.agent import AgentStep
 from backend.context import build_context
@@ -59,6 +60,40 @@ class TaskRunner:
     def _frozen_tool_context(run):
         from backend.tool_gateway import make_frozen_run_context
         return make_frozen_run_context(run)
+
+    def _trusted_context(self, run, context):
+        """Refresh mutable tree/workspace facts from storage at each safe boundary."""
+        from backend.tool_gateway import snapshot_builtin_tools
+        from backend.workspace import workspace_tool_specs
+
+        scope = self.database.run_workspace_scope(run["id"])
+        filesystem = {"filesystem.read", "filesystem.write"}
+        legacy_path_tools = {
+            name for name, spec in snapshot_builtin_tools().items()
+            if spec.effects & filesystem
+        }
+        specs = {
+            name: spec for name, spec in context.tool_specs.items()
+            if name not in legacy_path_tools and not name.startswith("workspace_")
+        }
+        specs.update(workspace_tool_specs(scope))
+        grants = set(context.grants) - filesystem
+        if scope:
+            frozen = set(json.loads(run["effective_grant_json"])["grants"])
+            grants |= frozen & filesystem
+            if scope["mode"] == "read_only":
+                grants.discard("filesystem.write")
+        return replace(
+            context,
+            run_id=run["id"],
+            task_id=run["task_id"],
+            tool_specs=MappingProxyType(specs),
+            grants=frozenset(grants),
+            # Workspace handlers receive canonical paths from backend.workspace;
+            # never grant legacy/arbitrary path handlers a root.
+            workspace_roots=(),
+            **self.database.control_scope(run["id"]),
+        )
 
     async def start(self):
         if self._task and not self._task.done():
@@ -186,9 +221,7 @@ class TaskRunner:
         try:
             snapshot = json.loads(run["config_snapshot_json"])
             max_rounds = max(1, min(20, int(snapshot["max_rounds"])))
-            context = replace(
-                self.tool_context_factory(run), **self.database.control_scope(run_id)
-            )
+            context = self.tool_context_factory(run)
             started = self.database._query_all(
                 "SELECT payload_json FROM events WHERE run_id=? AND type='tool.started'",
                 (run_id,))
@@ -209,7 +242,7 @@ class TaskRunner:
                         checkpoint["round"] < 1):
                     raise ValueError("invalid_checkpoint")
                 if checkpoint["phase"] == "tool_pending":
-                    context = replace(context, **self.database.control_scope(run_id))
+                    context = self._trusted_context(run, context)
                     run = await self._tool_step(run, checkpoint, context)
                     continue
                 round_index = checkpoint["round"]
@@ -218,7 +251,7 @@ class TaskRunner:
                     return
                 cfg = self.provider_config(run)  # Must precede client construction.
                 model = self.model_factory(cfg.api_key, cfg.base_url, snapshot["model"])
-                context = replace(context, secrets=(cfg.api_key,))
+                context = replace(self._trusted_context(run, context), secrets=(cfg.api_key,))
                 messages = build_context(self.database, run_id)
 
                 async def on_delta(text):
@@ -226,11 +259,14 @@ class TaskRunner:
                         self.database.append_event(run_id, "model.output.delta", {
                             "round": round_index, "text": text[offset:offset + 4096]})
 
+                visible_tools = {
+                    name: spec for name, spec in context.tool_specs.items()
+                    if spec.effects <= context.grants and
+                    (spec.approval == "never" or name == "workspace_write_text")
+                }
                 result = await asyncio.wait_for(model(
                     messages, run_id=run_id, round_index=round_index,
-                    tool_names=tuple(name for name, spec in context.tool_specs.items()
-                                     if spec.effects <= context.grants and
-                                     spec.approval == "never"),
+                    tool_names=tuple(visible_tools), tool_specs=visible_tools,
                     on_delta=on_delta), timeout=90)
                 run = self.database.get_run(run_id)
                 if run["status"] != "running" or self._apply_control(run):

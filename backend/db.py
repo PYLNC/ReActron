@@ -163,6 +163,17 @@ class Database:
                 version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
                 raise RuntimeError(f"不支持的数据库版本：{version}")
+            if version >= 5:
+                self._conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS trg_task_terminal_retain_checkout
+                    AFTER UPDATE OF status ON tasks
+                    WHEN OLD.status='open' AND NEW.status<>'open'
+                    BEGIN
+                        UPDATE worktree_checkouts SET state='retained',updated_at=NEW.updated_at
+                        WHERE task_id=NEW.id AND state='active';
+                    END
+                """)
+                self._conn.commit()
             self._verify_integrity()
 
     def _migrate_0_to_1(self):

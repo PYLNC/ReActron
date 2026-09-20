@@ -75,8 +75,10 @@ async def lifespan(application: FastAPI):
     # 密钥验证成功后才允许导入会打开 DB/MCP 的现有模块。
     from backend import api as api_module
     from backend.db import DB_PATH, db
+    from backend.workspace import initialize_workspace_state
 
     db.initialize()
+    initialize_workspace_state()
 
     if not _api_router_loaded:
         application.include_router(api_module.public_router)

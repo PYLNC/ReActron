@@ -258,9 +258,16 @@ class AgentStep:
         self.client = _get_shared_client(api_key, base_url)
         self.model = model
 
-    async def __call__(self, messages, *, run_id, round_index, tool_names=(), on_delta=None):
+    async def __call__(self, messages, *, run_id, round_index, tool_names=(),
+                       tool_specs=None, on_delta=None):
         definitions = [item for item in TOOL_DEFINITIONS
                        if item["function"]["name"] in tool_names]
+        known = {item["function"]["name"] for item in definitions}
+        if tool_specs:
+            definitions.extend({
+                "type": "function",
+                "function": {"name": name, "parameters": tool_specs[name].schema},
+            } for name in tool_names if name not in known and name in tool_specs)
         kwargs = {"model": self.model, "messages": messages, "stream": True}
         if definitions:
             kwargs["tools"] = definitions
