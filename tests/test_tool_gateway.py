@@ -57,6 +57,11 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
                          frozenset({"read_only"}))
         self.assertEqual(intersect_effective_grants(parent, worker, task, {"filesystem.write"}),
                          frozenset())
+        self.assertEqual(intersect_effective_grants(
+            {"filesystem.read", "filesystem.write"},
+            {"filesystem.read", "filesystem.write"},
+            {"filesystem.read", "filesystem.write"}),
+            frozenset({"filesystem.read", "filesystem.write"}))
         self.assertEqual(intersect_effective_grants("read_only", worker, task), frozenset())
         self.assertEqual(intersect_effective_grants(parent, {"read_only", 1}, task), frozenset())
 
@@ -186,7 +191,8 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
                    "specs": {"delegate_task": frozen},
                    "grants": ["control.delegate_task", "filesystem.write"]})}
         context = make_frozen_run_context(row)
-        self.assertEqual(context.grants, frozenset({"control.delegate_task"}))
+        self.assertEqual(context.grants,
+                         frozenset({"control.delegate_task", "filesystem.write"}))
         self.assertEqual(context.agent_id, "")
         args = {"assignee_agent_id": "child", "goal": "Review", "acceptance": []}
         self.assertEqual((await execute_tool(context, "delegate_task", args)).error_code,
@@ -237,7 +243,8 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
                    "get_current_time": frozen, "unreviewed_tool": frozen},
                    "grants": ["read_only", "filesystem.write"]})}
         context = make_frozen_run_context(row)
-        self.assertEqual(context.grants, frozenset({"read_only"}))
+        self.assertEqual(context.grants,
+                         frozenset({"read_only", "filesystem.write"}))
         self.assertEqual(set(context.tool_specs), {"get_current_time"})
         self.assertEqual((await execute_tool(context, "get_current_time", "{}")).status, "ok")
         self.assertEqual((await execute_tool(context, "unreviewed_tool", "{}")).error_code,

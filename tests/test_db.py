@@ -149,7 +149,7 @@ class MigrationTest(unittest.TestCase):
             create_v0_database(path)
 
             db = Database(path)
-            self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 5)
             defaults = db._query_all(
                 "SELECT id FROM projects WHERE is_default = 1"
             )
@@ -189,7 +189,7 @@ class MigrationTest(unittest.TestCase):
                 )
 
             first_snapshot = snapshot(db)
-            backups = list(path.parent.glob("legacy.db.pre-v4-*.bak"))
+            backups = list(path.parent.glob("legacy.db.pre-v5-*.bak"))
             self.assertEqual(len(backups), 1)
             with closing(sqlite3.connect(backups[0])) as backup:
                 self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 0)
@@ -202,9 +202,9 @@ class MigrationTest(unittest.TestCase):
             try:
                 self.assertEqual(snapshot(reopened), first_snapshot)
                 self.assertEqual(
-                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 4
+                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 5
                 )
-                self.assertEqual(len(list(path.parent.glob("legacy.db.pre-v4-*.bak"))), 1)
+                self.assertEqual(len(list(path.parent.glob("legacy.db.pre-v5-*.bak"))), 1)
             finally:
                 reopened.close()
 
@@ -219,12 +219,12 @@ class MigrationTest(unittest.TestCase):
                 conn.commit()
             db = Database(path)
             try:
-                self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 5)
                 self.assertEqual(db.get_settings()["credential_base_url"],
                                  "https://api.example/v1")
                 self.assertEqual(db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
                 self.assertEqual(db._conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
-                backups = list(path.parent.glob("v2.db.pre-v4-*.bak"))
+                backups = list(path.parent.glob("v2.db.pre-v5-*.bak"))
                 self.assertEqual(len(backups), 1)
                 with closing(sqlite3.connect(backups[0])) as backup:
                     self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 2)
@@ -239,7 +239,7 @@ class MigrationTest(unittest.TestCase):
             db = Database(path)
             try:
                 self.assertEqual(
-                    db._conn.execute("PRAGMA user_version").fetchone()[0], 4
+                    db._conn.execute("PRAGMA user_version").fetchone()[0], 5
                 )
                 settings = db.get_settings()
                 self.assertEqual(settings["api_key_encrypted"], "legacy-ciphertext")
@@ -250,7 +250,7 @@ class MigrationTest(unittest.TestCase):
             reopened = Database(path)
             try:
                 self.assertEqual(
-                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 4
+                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 5
                 )
                 self.assertIsNone(reopened.get_settings()["credential_base_url"])
             finally:
@@ -506,7 +506,7 @@ class P2AgentSchemaTest(unittest.TestCase):
         self.assertEqual(len(self.db.list_agent_tree()), 4)
         self.assertEqual(len(self.db.list_agent_tree(include_archived=True)), 6)
 
-    def test_v3_to_v4_preserves_history_and_foreign_keys(self):
+    def test_v3_to_v5_preserves_history_and_foreign_keys(self):
         with patch("backend.db.SCHEMA_VERSION", 3):
             old = Database(Path(self.tmp.name) / "v3.db")
             session_id = "historical-v3"
@@ -530,7 +530,7 @@ class P2AgentSchemaTest(unittest.TestCase):
             old.close()
         upgraded = Database(Path(self.tmp.name) / "v3.db")
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded._conn.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(upgraded._conn.execute("PRAGMA user_version").fetchone()[0], 5)
         self.assertIsNone(upgraded.get_session(session_id)["agent_role"])
         self.assertEqual(upgraded.get_run("historical-run")["effective_grant_json"],
                          '{"grants":["read_only"]}')
@@ -565,7 +565,7 @@ class P2AgentSchemaTest(unittest.TestCase):
                          [second["id"], first["id"]])
         with self.assertRaises(ValueError):
             self.db.host_delegate_task(root["id"], worker["id"], "invalid",
-                                       requested_grant={"grants": ["filesystem.write"]})
+                                       requested_grant={"grants": ["network.external"]})
         legacy = self.db.create_session("outside")
         with self.assertRaises(ResourceNotFound):
             self.db.host_delegate_task(legacy["id"], worker["id"], "cross tree")
@@ -910,6 +910,338 @@ class P2AgentSchemaTest(unittest.TestCase):
                                             "recipient_run_id=? AND kind='reply'",
                                             (child["id"],))["n"], before)
         self.assertEqual(self.db.list_agent_messages(root["id"])[1]["id"], q2)
+
+
+class P3WorkspaceStorageTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "workspace.db"
+        self.db = Database(self.path)
+        self.addCleanup(self.db.close)
+
+    def _root_worker(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker", capabilities={"grants": [
+            "read_only", "control.send_agent_message", "control.get_task_status",
+            "control.wait_for_tasks", "control.request_human_approval",
+            "filesystem.read", "filesystem.write",
+        ]})
+        return root, worker
+
+    @staticmethod
+    def _delegate_call(worker_id):
+        return {"id": "delegate-p3", "type": "function", "function": {
+            "name": "delegate_task", "arguments": json.dumps({
+                "assignee_agent_id": worker_id, "goal": "child", "acceptance": [],
+            })}}
+
+    def _apply_delegate(self, run, worker_id):
+        call = self._delegate_call(worker_id)
+        running = self.db.claim_next_run("p3-test", 120)
+        self.assertEqual(running["id"], run["id"])
+        running, _ = self.db.transition_run(
+            running["id"], running["version"], "running", "model.completed",
+            {"round": 1, "tool_count": 1},
+            checkpoint={"v": 1, "phase": "tool_pending", "round": 1,
+                        "assistant_message_id": None, "next_tool_index": 0},
+            message={"role": "assistant", "content": None, "tool_calls": [call]},
+            lease_owner="p3-test", lease_epoch=running["lease_epoch"])
+        running = self.db.start_tool_call(
+            running["id"], running["version"], "p3-test", running["lease_epoch"],
+            call["id"], "delegate_task", "effectful", "a" * 64, 8192)
+        running, _ = self.db.apply_control_tool(
+            running["id"], running["version"], "p3-test", running["lease_epoch"],
+            call["id"], "delegate_task", call["function"]["arguments"])
+        return running, json.loads(self.db._query_one("""
+            SELECT content FROM messages WHERE run_id=? AND role='tool'
+        """, (running["id"],))["content"])
+
+    def test_v4_to_v5_keeps_legacy_tasks_and_uploads_unbound(self):
+        legacy_path = Path(self.tmp.name) / "v4.db"
+        with patch("backend.db.SCHEMA_VERSION", 4):
+            old = Database(legacy_path)
+            session = old.create_session("legacy")
+            old._execute("""
+                INSERT INTO tasks(id,session_id,goal,created_at,updated_at)
+                VALUES ('legacy-task',?,'old task',?,?)
+            """, (session["id"], NOW, NOW))
+            old.register_upload("upload-1", "old.txt", "old/path", 3,
+                                "text/plain", {"text": "old"})
+            old.close()
+        upgraded = Database(legacy_path)
+        self.addCleanup(upgraded.close)
+        self.assertEqual(upgraded._conn.execute("PRAGMA user_version").fetchone()[0], 5)
+        legacy = upgraded.get_task("legacy-task")
+        self.assertEqual((legacy["workspace_id"], legacy["workspace_mode"]), (None, None))
+        self.assertIsNotNone(upgraded.get_upload("upload-1"))
+        self.assertEqual(upgraded._query_one("SELECT COUNT(*) AS n FROM artifacts")["n"], 0)
+        self.assertEqual(len(list(legacy_path.parent.glob("v4.db.pre-v5-*.bak"))), 1)
+        self.assertEqual(upgraded._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_workspace_contract_grants_and_internal_delegation_inherit(self):
+        root, worker = self._root_worker()
+        workspace = self.db.create_workspace(
+            "repo", "C:/registered/repo", "git", "read_write")
+        task = self.db.create_task(root["id"], "parent", workspace_id=workspace["id"],
+                                   workspace_mode="read_only")
+        run, _ = self.db.create_run(task["id"], "parent")
+        effective = set(json.loads(run["effective_grant_json"])["grants"])
+        self.assertIn("filesystem.read", effective)
+        self.assertNotIn("filesystem.write", effective)
+        _, delegated = self._apply_delegate(run, worker["id"])
+        child = self.db.get_task(delegated["task_id"])
+        self.assertEqual((child["workspace_id"], child["workspace_mode"]),
+                         (workspace["id"], "read_only"))
+        child_grants = set(json.loads(
+            self.db.get_run(delegated["run_id"])["effective_grant_json"])["grants"])
+        self.assertIn("filesystem.read", child_grants)
+        self.assertNotIn("filesystem.write", child_grants)
+        with self.db._write() as conn, self.assertRaises(sqlite3.IntegrityError):
+            self.db._insert_task_tx(
+                conn, worker["id"], "escalate", [], {},
+                creator_session_id=root["id"], creator_run_id=run["id"],
+                parent_task_id=task["id"], workspace_id=workspace["id"],
+                workspace_mode="read_write")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db._execute("UPDATE tasks SET workspace_id=NULL,workspace_mode=NULL WHERE id=?",
+                             (task["id"],))
+        with self.assertRaises(ValueError):
+            self.db.create_task(root["id"], "half", workspace_id=workspace["id"])
+
+    def test_workspace_binding_is_root_only_and_internal_scope_is_exact(self):
+        root, worker = self._root_worker()
+        legacy = self.db.create_session("legacy")
+        workspace = self.db.create_workspace(
+            "dir", "C:/registered/dir", "directory", "read_write")
+        for agent_id in (worker["id"], legacy["id"]):
+            with self.subTest(agent_id=agent_id), self.assertRaises(AgentHierarchyError):
+                self.db.create_task(agent_id, "forged", workspace_id=workspace["id"],
+                                    workspace_mode="read_write")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db._execute("""
+                INSERT INTO tasks(id,session_id,goal,created_at,updated_at,
+                                  workspace_id,workspace_mode)
+                VALUES ('forged-task',?,'forged',?,?,?,'read_write')
+            """, (worker["id"], NOW, NOW, workspace["id"]))
+
+        parent = self.db.create_task(root["id"], "parent", workspace_id=workspace["id"],
+                                     workspace_mode="read_write")
+        parent_run, _ = self.db.create_run(parent["id"], "parent")
+        with self.db._write() as conn, self.assertRaises(sqlite3.IntegrityError):
+            self.db._insert_task_tx(
+                conn, worker["id"], "downgrade", [], {},
+                creator_session_id=root["id"], creator_run_id=parent_run["id"],
+                parent_task_id=parent["id"],
+                requested_grant=json.loads(parent_run["effective_grant_json"]),
+                workspace_id=workspace["id"], workspace_mode="read_only")
+
+    def test_filesystem_capability_is_explicit_and_workspace_bounds_runs(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker")
+        self.assertFalse({"filesystem.read", "filesystem.write"}.intersection(
+            json.loads(worker["capabilities_json"])["grants"]))
+        worker = self.db.set_agent_filesystem_capability(worker["id"], True, True)
+        self.assertTrue({"filesystem.read", "filesystem.write"} <= set(
+            json.loads(worker["capabilities_json"])["grants"]))
+        with self.assertRaises(ValueError):
+            self.db.set_agent_filesystem_capability(worker["id"], False, True)
+        plain = self.db.create_task(worker["id"], "no workspace")
+        run, _ = self.db.create_run(plain["id"], "plain")
+        self.assertFalse({"filesystem.read", "filesystem.write"}.intersection(
+            json.loads(run["effective_grant_json"])["grants"]))
+        readonly = self.db.create_workspace(
+            "readonly", "C:/registered/readonly", "directory", "read_only")
+        with self.assertRaises(AgentHierarchyError):
+            self.db.create_task(root["id"], "write", workspace_id=readonly["id"],
+                                workspace_mode="read_write")
+        mutable = self.db.create_workspace(
+            "mutable", "C:/registered/mutable", "directory", "read_write")
+        task = self.db.create_task(root["id"], "old write", workspace_id=mutable["id"],
+                                   workspace_mode="read_write")
+        old_run, _ = self.db.create_run(task["id"], "old-write")
+        self.db.request_control(old_run["id"], "cancel")
+        self.db.update_workspace(mutable["id"], max_mode="read_only")
+        with self.assertRaises(InvalidRunTransition):
+            self.db.create_run(task["id"], "retry", options={"retry": True})
+        self.assertEqual(self.db.get_task(task["id"])["status"], "cancelled")
+
+    def test_directory_writer_lease_is_exclusive_and_terminal_releases(self):
+        root, _ = self._root_worker()
+        workspace = self.db.create_workspace(
+            "dir", "C:/registered/dir", "directory", "read_write")
+        first = self.db.create_task(root["id"], "first", workspace_id=workspace["id"],
+                                    workspace_mode="read_write")
+        second = self.db.create_task(root["id"], "second", workspace_id=workspace["id"],
+                                     workspace_mode="read_write")
+        lease = self.db.acquire_workspace_writer_lease(first["id"])
+        self.assertEqual(self.db.acquire_workspace_writer_lease(first["id"]), lease)
+        with self.assertRaises(AgentHierarchyError):
+            self.db.acquire_workspace_writer_lease(second["id"])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db._execute(
+                "UPDATE workspace_writer_leases SET task_id=? WHERE task_id=?",
+                (second["id"], first["id"]))
+        run, _ = self.db.create_run(first["id"], "first")
+        self.db.request_control(run["id"], "cancel")
+        self.assertIsNone(self.db._query_one(
+            "SELECT * FROM workspace_writer_leases WHERE task_id=?", (first["id"],)))
+        self.assertEqual(self.db.acquire_workspace_writer_lease(second["id"])["task_id"],
+                         second["id"])
+
+    def test_unknown_approval_wait_keeps_directory_writer_exclusive(self):
+        root, _ = self._root_worker()
+        workspace = self.db.create_workspace(
+            "unknown", "C:/registered/unknown", "directory", "read_write")
+        task = self.db.create_task(root["id"], "unknown write",
+                                   workspace_id=workspace["id"],
+                                   workspace_mode="read_write")
+        run, _ = self.db.create_run(task["id"], "unknown")
+        run = self.db.claim_next_run("p3-test", 120)
+        run, _ = self.db.transition_run(
+            run["id"], run["version"], "waiting", "run.waiting", {},
+            wait_reason="approval", lease_owner="p3-test",
+            lease_epoch=run["lease_epoch"])
+        self.assertEqual(self.db._query_one(
+            "SELECT task_id FROM workspace_writer_leases WHERE workspace_id=?",
+            (workspace["id"],))["task_id"], task["id"])
+        self.assertIsNotNone(self.db.run_workspace_scope(run["id"]))
+
+    def test_directory_delegates_serialize_and_parent_reacquires_after_wait(self):
+        root, first_worker = self._root_worker()
+        capabilities = json.loads(first_worker["capabilities_json"])
+        second_worker = self.db.create_worker(
+            root["id"], "worker-2", capabilities=capabilities)
+        workspace = self.db.create_workspace(
+            "shared", "C:/registered/shared", "directory", "read_write")
+        parent_task = self.db.create_task(
+            root["id"], "parent", workspace_id=workspace["id"],
+            workspace_mode="read_write")
+        parent, _ = self.db.create_run(parent_task["id"], "parent")
+        self.assertEqual(self.db._query_one(
+            "SELECT task_id FROM workspace_writer_leases WHERE workspace_id=?",
+            (workspace["id"],))["task_id"], parent_task["id"])
+
+        calls = [self._delegate_call(worker["id"]) for worker in
+                 (first_worker, second_worker)]
+        calls[0]["id"], calls[1]["id"] = "delegate-first", "delegate-second"
+        parent = self.db.claim_next_run("p3-test", 120)
+        parent, _ = self.db.transition_run(
+            parent["id"], parent["version"], "running", "model.completed",
+            {"round": 1, "tool_count": 2},
+            checkpoint={"v": 1, "phase": "tool_pending", "round": 1,
+                        "assistant_message_id": None, "next_tool_index": 0},
+            message={"role": "assistant", "content": None, "tool_calls": calls},
+            lease_owner="p3-test", lease_epoch=parent["lease_epoch"])
+        child_ids = []
+        for call in calls:
+            parent = self.db.start_tool_call(
+                parent["id"], parent["version"], "p3-test", parent["lease_epoch"],
+                call["id"], "delegate_task", "effectful", "a" * 64, 8192)
+            parent, message_id = self.db.apply_control_tool(
+                parent["id"], parent["version"], "p3-test", parent["lease_epoch"],
+                call["id"], "delegate_task", call["function"]["arguments"])
+            result = json.loads(self.db.get_message(message_id)["content"])
+            self.assertIsNone(result["run_id"])
+            child_ids.append(result["task_id"])
+
+        parent, _ = self.db.transition_run(
+            parent["id"], parent["version"], "running", "tool.batch_completed",
+            {"round": 1}, checkpoint={"v": 1, "phase": "model_pending", "round": 2},
+            lease_owner="p3-test", lease_epoch=parent["lease_epoch"])
+        wait_call = {"id": "wait-both", "type": "function", "function": {
+            "name": "wait_for_tasks",
+            "arguments": json.dumps({"task_ids": child_ids}),
+        }}
+        parent, _ = self.db.transition_run(
+            parent["id"], parent["version"], "running", "model.completed",
+            {"round": 2, "tool_count": 1},
+            checkpoint={"v": 1, "phase": "tool_pending", "round": 2,
+                        "assistant_message_id": None, "next_tool_index": 0},
+            message={"role": "assistant", "content": None, "tool_calls": [wait_call]},
+            lease_owner="p3-test", lease_epoch=parent["lease_epoch"])
+        parent = self.db.start_tool_call(
+            parent["id"], parent["version"], "p3-test", parent["lease_epoch"],
+            wait_call["id"], "wait_for_tasks", "effectful", "a" * 64, 8192)
+        parent, _ = self.db.apply_control_tool(
+            parent["id"], parent["version"], "p3-test", parent["lease_epoch"],
+            wait_call["id"], "wait_for_tasks", wait_call["function"]["arguments"])
+        self.assertEqual((parent["status"], parent["wait_reason"]),
+                         ("waiting", "children"))
+        self.assertIsNone(self.db.run_workspace_scope(parent["id"]))
+
+        first_scheduled = self.db.schedule_pending_tasks()
+        self.assertEqual(len(first_scheduled), 1)
+        first_child = self.db.claim_next_run("p3-child", 120)
+        self.assertEqual(first_child["id"], first_scheduled[0]["id"])
+        self.db.transition_run(
+            first_child["id"], first_child["version"], "completed", "run.completed", {},
+            lease_owner="p3-child", lease_epoch=first_child["lease_epoch"])
+        self.assertEqual(self.db.get_run(parent["id"])["status"], "queued")
+
+        second_scheduled = self.db.schedule_pending_tasks()
+        self.assertEqual(len(second_scheduled), 1)
+        second_child = self.db.claim_next_run("p3-child", 120)
+        self.assertEqual(second_child["id"], second_scheduled[0]["id"])
+        self.db.transition_run(
+            second_child["id"], second_child["version"], "completed", "run.completed", {},
+            lease_owner="p3-child", lease_epoch=second_child["lease_epoch"])
+        resumed = self.db.claim_next_run("p3-test", 120)
+        self.assertEqual(resumed["id"], parent["id"])
+        self.assertEqual(self.db.run_workspace_scope(resumed["id"]), {
+            "workspace_id": workspace["id"], "kind": "directory",
+            "effective_root": workspace["root_path"], "mode": "read_write",
+        })
+
+    def test_git_checkout_scope_state_and_artifact_ownership(self):
+        root, _ = self._root_worker()
+        workspace = self.db.create_workspace(
+            "repo", "C:/registered/repo", "git", "read_write")
+        task = self.db.create_task(root["id"], "edit", workspace_id=workspace["id"],
+                                   workspace_mode="read_write")
+        checkout = self.db.create_worktree_checkout(
+            task["id"], "C:/state/worktrees/task", "codex/task", "a" * 40)
+        self.assertEqual(checkout["state"], "creating")
+        with self.assertRaises(InvalidRunTransition):
+            self.db.create_run(task["id"], "edit")
+        checkout = self.db.transition_worktree_checkout(task["id"], "active")
+        run, _ = self.db.create_run(task["id"], "edit")
+        self.assertEqual(self.db.run_workspace_scope(run["id"]), {
+            "workspace_id": workspace["id"], "kind": "git",
+            "effective_root": checkout["path"], "mode": "read_write",
+        })
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db._execute("UPDATE worktree_checkouts SET path='other' WHERE task_id=?",
+                             (task["id"],))
+        artifact = self.db.register_artifact(
+            run["id"], "text", "reports/result.txt", "artifacts/result.txt",
+            "b" * 64, 12, "text/plain")
+        self.assertEqual(self.db.list_task_artifacts(task["id"])[0]["id"], artifact["id"])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db._execute("UPDATE artifacts SET size_bytes=13 WHERE id=?", (artifact["id"],))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db._execute("DELETE FROM artifacts WHERE id=?", (artifact["id"],))
+        other = self.db.create_task(root["id"], "other", workspace_id=workspace["id"],
+                                    workspace_mode="read_only")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db._execute("""
+                INSERT INTO artifacts
+                    (id,task_id,run_id,owner_session_id,workspace_id,kind,relative_path,
+                     storage_relpath,sha256,size_bytes,created_at)
+                VALUES ('forged',?,?,?,?,'text','x','forged/x',?,0,?)
+            """, (other["id"], run["id"], root["id"], workspace["id"],
+                  "c" * 64, NOW))
+        self.db.transition_worktree_checkout(task["id"], "retained")
+        with self.assertRaises(InvalidRunTransition):
+            self.db.transition_worktree_checkout(task["id"], "removing")
+        self.assertTrue(self.db.task_has_active_run(task["id"]))
+        self.db.request_control(run["id"], "cancel")
+        self.assertFalse(self.db.task_has_active_run(task["id"]))
+        self.db.transition_worktree_checkout(task["id"], "removing")
+        self.db.transition_worktree_checkout(task["id"], "removed")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db._execute("UPDATE worktree_checkouts SET state='active' WHERE task_id=?",
+                             (task["id"],))
 
 
 if __name__ == "__main__":

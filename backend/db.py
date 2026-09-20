@@ -17,7 +17,7 @@ from backend.config import BASE_DIR
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "countboter.db"
 logger = logging.getLogger("agent.db")
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MAX_EVENT_BYTES = 64 * 1024
 MAX_RUN_EVENT_BYTES = 4 * 1024 * 1024
 TERMINAL_EVENT_RESERVE = 8 * 1024
@@ -49,6 +49,10 @@ class InvalidRunTransition(RepositoryError):
     code = "invalid_run_transition"
 
 
+class WorkspaceUnavailable(InvalidRunTransition):
+    pass
+
+
 class EventLimitExceeded(RepositoryError):
     code = "event_limit_exceeded"
 
@@ -64,7 +68,7 @@ class AgentHierarchyError(RepositoryError):
 HOST_GRANTS = frozenset({
     "read_only", "control.delegate_task", "control.send_agent_message",
     "control.get_task_status", "control.wait_for_tasks", "control.cancel_task",
-    "control.request_human_approval",
+    "control.request_human_approval", "filesystem.read", "filesystem.write",
 })
 
 
@@ -135,7 +139,7 @@ class Database:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version < SCHEMA_VERSION and self._existing_file:
                 backup_path = self.db_path.with_name(
-                    f"{self.db_path.name}.pre-v4-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}.bak"
+                    f"{self.db_path.name}.pre-v{SCHEMA_VERSION}-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}.bak"
                 )
                 backup = sqlite3.connect(str(backup_path))
                 try:
@@ -154,6 +158,9 @@ class Database:
             if version == 3 and SCHEMA_VERSION >= 4:
                 self._migrate_3_to_4()
                 version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == 4 and SCHEMA_VERSION >= 5:
+                self._migrate_4_to_5()
+                version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
                 raise RuntimeError(f"不支持的数据库版本：{version}")
             self._verify_integrity()
@@ -166,7 +173,7 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             # 另一个进程可能已在等待 writer lock 时完成同一迁移。
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version in (1, 2, 3, SCHEMA_VERSION):
+            if version in (1, 2, 3, 4, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 0:
@@ -392,7 +399,7 @@ class Database:
         try:
             conn.execute("BEGIN IMMEDIATE")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version in (2, 3, SCHEMA_VERSION):
+            if version in (2, 3, 4, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 1:
@@ -414,7 +421,7 @@ class Database:
         try:
             conn.execute("BEGIN IMMEDIATE")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version in (3, SCHEMA_VERSION):
+            if version in (3, 4, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 2:
@@ -590,7 +597,7 @@ class Database:
         conn.execute("BEGIN IMMEDIATE")
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version == 4:
+            if version in (4, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 3:
@@ -691,6 +698,205 @@ class Database:
                 BEGIN SELECT RAISE(ABORT,'invalid agent message provenance'); END
             """)
             conn.execute("PRAGMA user_version = 4")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _migrate_4_to_5(self):
+        """P3 task-scoped workspaces, writer ownership, and immutable artifacts."""
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == 5:
+                conn.commit()
+                return
+            if version != 4:
+                raise RuntimeError(f"不支持的数据库版本：{version}")
+            conn.execute("""
+                CREATE TABLE workspaces (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 200),
+                    root_path TEXT NOT NULL UNIQUE
+                        CHECK (length(trim(root_path)) BETWEEN 1 AND 32768),
+                    kind TEXT NOT NULL CHECK (kind IN ('directory','git')),
+                    max_mode TEXT NOT NULL CHECK (max_mode IN ('read_only','read_write')),
+                    archived_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("ALTER TABLE tasks ADD COLUMN workspace_id TEXT REFERENCES workspaces(id) ON DELETE RESTRICT")
+            conn.execute("ALTER TABLE tasks ADD COLUMN workspace_mode TEXT CHECK (workspace_mode IN ('read_only','read_write'))")
+            conn.execute("CREATE INDEX idx_tasks_workspace ON tasks(workspace_id,created_at)")
+            conn.execute("""
+                CREATE TABLE worktree_checkouts (
+                    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+                    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+                    path TEXT NOT NULL UNIQUE CHECK (length(trim(path)) BETWEEN 1 AND 32768),
+                    branch TEXT NOT NULL UNIQUE CHECK (length(trim(branch)) BETWEEN 1 AND 500),
+                    base_commit TEXT NOT NULL CHECK (length(trim(base_commit)) BETWEEN 1 AND 200),
+                    state TEXT NOT NULL CHECK (state IN
+                        ('creating','active','retained','removing','removed','failed')),
+                    error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK ((state='failed' AND error_code IS NOT NULL AND
+                            length(trim(error_code)) BETWEEN 1 AND 200) OR
+                           (state<>'failed' AND error_code IS NULL))
+                )
+            """)
+            conn.execute("CREATE INDEX idx_worktree_workspace_state ON worktree_checkouts(workspace_id,state)")
+            conn.execute("""
+                CREATE TABLE workspace_writer_leases (
+                    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE RESTRICT,
+                    task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE RESTRICT,
+                    acquired_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE artifacts (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+                    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+                    owner_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+                    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+                    kind TEXT NOT NULL CHECK (length(trim(kind)) BETWEEN 1 AND 80),
+                    relative_path TEXT NOT NULL
+                        CHECK (length(trim(relative_path)) BETWEEN 1 AND 32768),
+                    storage_relpath TEXT NOT NULL UNIQUE
+                        CHECK (length(trim(storage_relpath)) BETWEEN 1 AND 32768),
+                    sha256 TEXT NOT NULL CHECK (
+                        length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+                    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+                    mime_type TEXT CHECK (mime_type IS NULL OR
+                        length(trim(mime_type)) BETWEEN 1 AND 200),
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (run_id,task_id) REFERENCES runs(id,task_id) ON DELETE RESTRICT
+                )
+            """)
+            conn.execute("CREATE INDEX idx_artifacts_task_created ON artifacts(task_id,created_at,id)")
+            conn.execute("""
+                CREATE TRIGGER trg_workspace_identity_immutable
+                BEFORE UPDATE OF root_path,kind ON workspaces
+                WHEN NEW.root_path IS NOT OLD.root_path OR NEW.kind IS NOT OLD.kind
+                BEGIN SELECT RAISE(ABORT,'workspace root and kind are immutable'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_task_workspace_insert BEFORE INSERT ON tasks
+                WHEN (NEW.workspace_id IS NULL) != (NEW.workspace_mode IS NULL) OR
+                     (NEW.workspace_id IS NOT NULL AND NOT EXISTS (
+                        SELECT 1 FROM workspaces WHERE id=NEW.workspace_id
+                            AND archived_at IS NULL
+                            AND (NEW.workspace_mode='read_only' OR max_mode='read_write'))) OR
+                     (NEW.workspace_id IS NOT NULL AND NEW.creator_run_id IS NULL AND
+                        NOT EXISTS (SELECT 1 FROM sessions WHERE id=NEW.session_id
+                            AND agent_role='supervisor' AND archived_at IS NULL)) OR
+                     (NEW.creator_run_id IS NOT NULL AND (
+                        NEW.parent_task_id IS NOT (
+                            SELECT task_id FROM runs WHERE id=NEW.creator_run_id) OR
+                        NEW.workspace_id IS NOT (
+                            SELECT parent.workspace_id FROM runs
+                            JOIN tasks AS parent ON parent.id=runs.task_id
+                            WHERE runs.id=NEW.creator_run_id) OR
+                        NEW.workspace_mode IS NOT (
+                            SELECT parent.workspace_mode FROM runs
+                            JOIN tasks AS parent ON parent.id=runs.task_id
+                            WHERE runs.id=NEW.creator_run_id)))
+                BEGIN SELECT RAISE(ABORT,'invalid task workspace contract'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_task_workspace_immutable
+                BEFORE UPDATE OF workspace_id,workspace_mode ON tasks
+                WHEN NEW.workspace_id IS NOT OLD.workspace_id OR
+                     NEW.workspace_mode IS NOT OLD.workspace_mode
+                BEGIN SELECT RAISE(ABORT,'task workspace is immutable'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_worktree_checkout_insert BEFORE INSERT ON worktree_checkouts
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM tasks JOIN workspaces ON workspaces.id=tasks.workspace_id
+                    WHERE tasks.id=NEW.task_id AND tasks.workspace_id=NEW.workspace_id
+                        AND tasks.status='open' AND tasks.workspace_mode='read_write'
+                        AND workspaces.kind='git'
+                        AND workspaces.archived_at IS NULL)
+                BEGIN SELECT RAISE(ABORT,'invalid worktree checkout ownership'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_worktree_checkout_identity_immutable
+                BEFORE UPDATE OF task_id,workspace_id,path,branch,base_commit ON worktree_checkouts
+                WHEN NEW.task_id IS NOT OLD.task_id OR NEW.workspace_id IS NOT OLD.workspace_id OR
+                     NEW.path IS NOT OLD.path OR NEW.branch IS NOT OLD.branch OR
+                     NEW.base_commit IS NOT OLD.base_commit
+                BEGIN SELECT RAISE(ABORT,'worktree checkout identity is immutable'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_worktree_checkout_transition BEFORE UPDATE OF state ON worktree_checkouts
+                WHEN (OLD.state<>NEW.state AND NOT (
+                        (OLD.state='creating' AND NEW.state IN ('active','failed')) OR
+                        (OLD.state='active' AND NEW.state IN ('retained','removing','failed')) OR
+                        (OLD.state='retained' AND NEW.state IN ('active','removing')) OR
+                        (OLD.state='removing' AND NEW.state IN ('removed','failed')) OR
+                        (OLD.state='failed' AND NEW.state='removing'))) OR
+                     (NEW.state='removing' AND EXISTS (
+                        SELECT 1 FROM runs WHERE task_id=NEW.task_id
+                            AND status IN ('queued','running','waiting','paused')))
+                BEGIN SELECT RAISE(ABORT,'invalid worktree checkout transition'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_writer_lease_insert BEFORE INSERT ON workspace_writer_leases
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM tasks JOIN workspaces ON workspaces.id=tasks.workspace_id
+                    WHERE tasks.id=NEW.task_id AND tasks.workspace_id=NEW.workspace_id
+                        AND tasks.status='open' AND tasks.workspace_mode='read_write'
+                        AND workspaces.kind='directory' AND workspaces.archived_at IS NULL)
+                BEGIN SELECT RAISE(ABORT,'invalid workspace writer lease ownership'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_writer_lease_no_update
+                BEFORE UPDATE ON workspace_writer_leases
+                BEGIN SELECT RAISE(ABORT,'workspace writer lease is immutable'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_task_terminal_release_writer
+                AFTER UPDATE OF status ON tasks
+                WHEN OLD.status='open' AND NEW.status<>'open'
+                BEGIN DELETE FROM workspace_writer_leases WHERE task_id=NEW.id; END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_run_release_writer
+                AFTER UPDATE OF status ON runs
+                WHEN OLD.status='running' AND (
+                    NEW.status IN ('paused','completed','failed','cancelled') OR
+                    (NEW.status='waiting' AND NEW.wait_reason IN ('input','children')))
+                BEGIN DELETE FROM workspace_writer_leases WHERE task_id=NEW.task_id; END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_artifact_insert BEFORE INSERT ON artifacts
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM runs JOIN tasks ON tasks.id=runs.task_id
+                    WHERE runs.id=NEW.run_id AND tasks.id=NEW.task_id
+                        AND runs.session_id=NEW.owner_session_id
+                        AND tasks.workspace_id=NEW.workspace_id)
+                BEGIN SELECT RAISE(ABORT,'invalid artifact ownership'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_artifact_no_update BEFORE UPDATE ON artifacts
+                BEGIN SELECT RAISE(ABORT,'artifact is immutable'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_artifact_no_delete BEFORE DELETE ON artifacts
+                BEGIN SELECT RAISE(ABORT,'artifact is immutable'); END
+            """)
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError(
+                    f"数据库外键检查失败：{[tuple(row) for row in violations]}"
+                )
+            if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise sqlite3.DatabaseError("数据库完整性检查失败")
+            conn.execute("PRAGMA user_version = 5")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -931,6 +1137,39 @@ class Database:
                   _json({"grants": sorted(grants)}), int(can_delegate)))
             return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone())
 
+    def set_agent_filesystem_capability(self, agent_id, filesystem_read,
+                                        filesystem_write):
+        """Change only future filesystem grants; frozen Runs remain unchanged."""
+        if (not isinstance(filesystem_read, bool) or
+                not isinstance(filesystem_write, bool) or
+                filesystem_write and not filesystem_read):
+            raise ValueError("filesystem.write 必须同时启用 filesystem.read")
+        with self._write() as conn:
+            agent = conn.execute(
+                "SELECT * FROM sessions WHERE id=? AND archived_at IS NULL", (agent_id,)
+            ).fetchone()
+            if not agent or agent["agent_role"] is None:
+                raise ResourceNotFound("Agent 不存在或已归档")
+            grants = set(json.loads(agent["capabilities_json"])["grants"])
+            grants -= {"filesystem.read", "filesystem.write"}
+            if filesystem_read:
+                grants.add("filesystem.read")
+            if filesystem_write:
+                grants.add("filesystem.write")
+            if agent["agent_role"] == "worker":
+                parent = conn.execute(
+                    "SELECT capabilities_json FROM sessions WHERE id=?",
+                    (agent["parent_session_id"],),
+                ).fetchone()
+                parent_grants = set(json.loads(parent["capabilities_json"])["grants"])
+                if not {"filesystem.read", "filesystem.write"}.intersection(grants) <= parent_grants:
+                    raise AgentHierarchyError("Worker filesystem 能力超过父 Agent")
+            conn.execute(
+                "UPDATE sessions SET capabilities_json=?,updated_at=? WHERE id=?",
+                (_json({"grants": sorted(grants)}), _utc_now(), agent_id),
+            )
+            return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone())
+
     def list_agent_tree(self, root_agent_id=None, include_archived=False):
         root = self.get_supervisor() if root_agent_id is None else self.get_session(root_agent_id)
         if not root or root["agent_role"] != "supervisor":
@@ -1142,6 +1381,83 @@ class Database:
                 raise
         logger.info("DB 删除项目：project_id=%s", project_id)
         return True
+
+    @staticmethod
+    def _workspace_values(name, root_path, kind, max_mode):
+        if (not isinstance(name, str) or not 1 <= len(name.strip()) <= 200 or
+                not isinstance(root_path, str) or
+                not 1 <= len(root_path.strip()) <= 32768 or
+                kind not in {"directory", "git"} or
+                max_mode not in {"read_only", "read_write"}):
+            raise ValueError("无效 Workspace 注册信息")
+        return name.strip(), root_path.strip(), kind, max_mode
+
+    def create_workspace(self, name, root_path, kind, max_mode):
+        name, root_path, kind, max_mode = self._workspace_values(
+            name, root_path, kind, max_mode
+        )
+        workspace_id, now = str(uuid.uuid4()), _utc_now()
+        with self._write() as conn:
+            conn.execute("""
+                INSERT INTO workspaces
+                    (id,name,root_path,kind,max_mode,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?)
+            """, (workspace_id, name, root_path, kind, max_mode, now, now))
+            return dict(conn.execute(
+                "SELECT * FROM workspaces WHERE id=?", (workspace_id,)
+            ).fetchone())
+
+    def get_workspace(self, workspace_id):
+        return self._query_one("SELECT * FROM workspaces WHERE id=?", (workspace_id,))
+
+    def list_workspaces(self, include_archived=False):
+        if not isinstance(include_archived, bool):
+            raise ValueError("include_archived 必须为布尔值")
+        return self._query_all("""
+            SELECT * FROM workspaces WHERE (? OR archived_at IS NULL)
+            ORDER BY created_at,id
+        """, (int(include_archived),))
+
+    def update_workspace(self, workspace_id, name=None, max_mode=None, archive=False):
+        if (name is None and max_mode is None and not archive) or not isinstance(archive, bool):
+            raise ValueError("Workspace 更新为空或无效")
+        if name is not None and (not isinstance(name, str) or
+                                 not 1 <= len(name.strip()) <= 200):
+            raise ValueError("无效 Workspace 名称")
+        if max_mode is not None and max_mode not in {"read_only", "read_write"}:
+            raise ValueError("无效 Workspace max_mode")
+        with self._write() as conn:
+            workspace = conn.execute(
+                "SELECT * FROM workspaces WHERE id=?", (workspace_id,)
+            ).fetchone()
+            if not workspace or workspace["archived_at"]:
+                raise ResourceNotFound("Workspace 不存在或已归档")
+            if max_mode == "read_only" and conn.execute("""
+                SELECT 1 FROM tasks WHERE workspace_id=? AND workspace_mode='read_write'
+                    AND status='open' LIMIT 1
+            """, (workspace_id,)).fetchone():
+                raise InvalidRunTransition("Workspace 仍有 read_write Task")
+            if archive and (conn.execute(
+                    "SELECT 1 FROM tasks WHERE workspace_id=? AND status='open' LIMIT 1",
+                    (workspace_id,),
+                ).fetchone() or conn.execute(
+                    "SELECT 1 FROM worktree_checkouts WHERE workspace_id=? AND state<>'removed' LIMIT 1",
+                    (workspace_id,),
+                ).fetchone() or conn.execute(
+                    "SELECT 1 FROM workspace_writer_leases WHERE workspace_id=?",
+                    (workspace_id,),
+                ).fetchone()):
+                raise InvalidRunTransition("Workspace 仍有活动 Task 或未清理写资源")
+            now = _utc_now()
+            conn.execute("""
+                UPDATE workspaces SET name=COALESCE(?,name),max_mode=COALESCE(?,max_mode),
+                    archived_at=CASE WHEN ? THEN ? ELSE archived_at END,updated_at=?
+                WHERE id=?
+            """, (name.strip() if name is not None else None, max_mode,
+                  int(archive), now, now, workspace_id))
+            return dict(conn.execute(
+                "SELECT * FROM workspaces WHERE id=?", (workspace_id,)
+            ).fetchone())
 
     def register_upload(self, file_id, filename, stored_path, size, mime_type, parsed):
         parsed_json = (
@@ -1433,9 +1749,29 @@ class Database:
         return {"message_refs": value.get("message_refs", []),
                 "artifact_refs": value.get("artifact_refs", [])}
 
+    @staticmethod
+    def _workspace_contract_tx(conn, workspace_id, workspace_mode):
+        if (workspace_id is None) != (workspace_mode is None):
+            raise ValueError("workspace_id/workspace_mode 必须同时为空或同时提供")
+        if workspace_id is None:
+            return None, None
+        if (not isinstance(workspace_id, str) or not workspace_id or
+                workspace_mode not in {"read_only", "read_write"}):
+            raise ValueError("无效 Task Workspace")
+        workspace = conn.execute(
+            "SELECT * FROM workspaces WHERE id=? AND archived_at IS NULL",
+            (workspace_id,),
+        ).fetchone()
+        if not workspace:
+            raise ResourceNotFound("Workspace 不存在或已归档")
+        if workspace_mode == "read_write" and workspace["max_mode"] != "read_write":
+            raise AgentHierarchyError("Task Workspace mode 超过注册上限")
+        return workspace_id, workspace_mode
+
     def _insert_task_tx(self, conn, agent_id, goal, acceptance, context, *,
                         creator_session_id=None, creator_run_id=None,
-                        parent_task_id=None, requested_grant=None, limits=None):
+                        parent_task_id=None, requested_grant=None, limits=None,
+                        workspace_id=None, workspace_mode=None):
         goal, acceptance_json, context_json = self._task_values(
             goal, acceptance, context
         )
@@ -1448,25 +1784,45 @@ class Database:
                           if agent["agent_role"] else {"read_only"})
         requested = self._capabilities(requested_grant, default_grants)
         task_limits = self._limits(limits)
+        workspace_id, workspace_mode = self._workspace_contract_tx(
+            conn, workspace_id, workspace_mode
+        )
+        if (workspace_id is not None and creator_run_id is None and
+                agent["agent_role"] != "supervisor"):
+            raise AgentHierarchyError("只有活动根 Supervisor 可绑定 Workspace")
         task_id, now = str(uuid.uuid4()), _utc_now()
         conn.execute("""
             INSERT INTO tasks
                 (id,session_id,goal,acceptance_json,context_json,status,
                  created_at,updated_at,creator_session_id,creator_run_id,
-                 parent_task_id,requested_grant_json,limits_json)
-            VALUES (?,?,?,?,?,'open',?,?,?,?,?,?,?)
+                 parent_task_id,requested_grant_json,limits_json,
+                 workspace_id,workspace_mode)
+            VALUES (?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?)
         """, (task_id, agent_id, goal, acceptance_json, context_json, now, now,
               creator_session_id, creator_run_id, parent_task_id,
-              _json({"grants": sorted(requested)}), _json(task_limits)))
+              _json({"grants": sorted(requested)}), _json(task_limits),
+              workspace_id, workspace_mode))
         self._insert_message_tx(conn, agent_id, "user", goal, task_id=task_id)
         return dict(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
 
-    def create_task(self, agent_id, goal, acceptance=None, context=None):
+    def create_task(self, agent_id, goal, acceptance=None, context=None,
+                    workspace_id=None, workspace_mode=None):
         with self._write() as conn:
-            return self._insert_task_tx(conn, agent_id, goal, acceptance, context)
+            return self._insert_task_tx(
+                conn, agent_id, goal, acceptance, context,
+                workspace_id=workspace_id, workspace_mode=workspace_mode,
+            )
 
     def get_task(self, task_id):
         return self._query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+
+    def task_has_active_run(self, task_id):
+        if not self.get_task(task_id):
+            raise ResourceNotFound("Task 不存在")
+        return self._query_one("""
+            SELECT 1 AS active FROM runs WHERE task_id=?
+                AND status IN ('queued','running','waiting','paused') LIMIT 1
+        """, (task_id,)) is not None
 
     def list_tasks(self, agent_id=None, status=None, limit=50):
         if status is not None and status not in {"open", "completed", "failed", "cancelled"}:
@@ -1521,8 +1877,12 @@ class Database:
             """, (assignee_agent_id,)).fetchone()
             run = None
             if not busy:
-                run, _ = self._insert_run_tx(conn, task, f"delegate:{task['id']}:1",
-                                             {}, None, None)
+                try:
+                    run, _ = self._insert_run_tx(
+                        conn, task, f"delegate:{task['id']}:1", {}, None, None
+                    )
+                except WorkspaceUnavailable:
+                    pass
             return task, run
 
     def schedule_pending_tasks(self):
@@ -1545,10 +1905,206 @@ class Database:
                     ORDER BY created_at,id LIMIT 1
                 """, (agent["id"],)).fetchone()
                 if task:
-                    run, _ = self._insert_run_tx(conn, task, f"delegate:{task['id']}:1",
-                                                 {}, None, None)
+                    try:
+                        run, _ = self._insert_run_tx(
+                            conn, task, f"delegate:{task['id']}:1", {}, None, None
+                        )
+                    except WorkspaceUnavailable:
+                        continue
                     scheduled.append(run)
         return scheduled
+
+    @staticmethod
+    def _prepare_workspace_run_tx(conn, task):
+        """Atomically reserve the task's executable workspace, if it is ready."""
+        if task["workspace_id"] is None:
+            return True
+        workspace = conn.execute(
+            "SELECT * FROM workspaces WHERE id=? AND archived_at IS NULL",
+            (task["workspace_id"],),
+        ).fetchone()
+        if not workspace:
+            return False
+        if task["workspace_mode"] == "read_only":
+            return True
+        if workspace["max_mode"] != "read_write":
+            return False
+        if workspace["kind"] == "git":
+            return conn.execute("""
+                SELECT 1 FROM worktree_checkouts
+                WHERE task_id=? AND workspace_id=? AND state='active'
+            """, (task["id"], workspace["id"])).fetchone() is not None
+        lease = conn.execute(
+            "SELECT task_id FROM workspace_writer_leases WHERE workspace_id=?",
+            (workspace["id"],),
+        ).fetchone()
+        if lease:
+            return lease["task_id"] == task["id"]
+        conn.execute("""
+            INSERT INTO workspace_writer_leases(workspace_id,task_id,acquired_at)
+            VALUES (?,?,?)
+        """, (workspace["id"], task["id"], _utc_now()))
+        return True
+
+    def create_worktree_checkout(self, task_id, path, branch, base_commit):
+        if any(not isinstance(value, str) or not value.strip()
+               for value in (task_id, path, branch, base_commit)):
+            raise ValueError("无效 worktree checkout")
+        if len(path.strip()) > 32768 or len(branch.strip()) > 500 or len(base_commit.strip()) > 200:
+            raise ValueError("worktree checkout 字段过长")
+        with self._write() as conn:
+            task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not task:
+                raise ResourceNotFound("Task 不存在")
+            now = _utc_now()
+            conn.execute("""
+                INSERT INTO worktree_checkouts
+                    (task_id,workspace_id,path,branch,base_commit,state,created_at,updated_at)
+                VALUES (?,?,?,?,?,'creating',?,?)
+            """, (task_id, task["workspace_id"], path.strip(), branch.strip(),
+                  base_commit.strip(), now, now))
+            return dict(conn.execute(
+                "SELECT * FROM worktree_checkouts WHERE task_id=?", (task_id,)
+            ).fetchone())
+
+    def get_worktree_checkout(self, task_id):
+        return self._query_one(
+            "SELECT * FROM worktree_checkouts WHERE task_id=?", (task_id,)
+        )
+
+    def transition_worktree_checkout(self, task_id, state, error_code=None):
+        if state not in {"active", "retained", "removing", "removed", "failed"}:
+            raise ValueError("无效 worktree checkout 状态")
+        if ((state == "failed") != (isinstance(error_code, str) and
+                                     1 <= len(error_code.strip()) <= 200)):
+            raise ValueError("failed checkout 必须且只能包含 error_code")
+        with self._write() as conn:
+            checkout = conn.execute(
+                "SELECT * FROM worktree_checkouts WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if not checkout:
+                raise ResourceNotFound("worktree checkout 不存在")
+            if state == "removing" and conn.execute("""
+                SELECT 1 FROM runs WHERE task_id=?
+                    AND status IN ('queued','running','waiting','paused') LIMIT 1
+            """, (task_id,)).fetchone():
+                raise InvalidRunTransition("活动 Run 的 worktree 不可清理")
+            conn.execute("""
+                UPDATE worktree_checkouts SET state=?,error_code=?,updated_at=?
+                WHERE task_id=?
+            """, (state, error_code.strip() if error_code else None,
+                  _utc_now(), task_id))
+            return dict(conn.execute(
+                "SELECT * FROM worktree_checkouts WHERE task_id=?", (task_id,)
+            ).fetchone())
+
+    def acquire_workspace_writer_lease(self, task_id):
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task_id 不能为空")
+        with self._write() as conn:
+            task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not task:
+                raise ResourceNotFound("Task 不存在")
+            existing = conn.execute(
+                "SELECT * FROM workspace_writer_leases WHERE workspace_id=?",
+                (task["workspace_id"],),
+            ).fetchone()
+            if existing:
+                if existing["task_id"] == task_id:
+                    return dict(existing)
+                raise AgentHierarchyError("Workspace 已由其他 Task 持有写租约")
+            conn.execute("""
+                INSERT INTO workspace_writer_leases(workspace_id,task_id,acquired_at)
+                VALUES (?,?,?)
+            """, (task["workspace_id"], task_id, _utc_now()))
+            return dict(conn.execute(
+                "SELECT * FROM workspace_writer_leases WHERE task_id=?", (task_id,)
+            ).fetchone())
+
+    def release_workspace_writer_lease(self, task_id):
+        with self._write() as conn:
+            return bool(conn.execute(
+                "DELETE FROM workspace_writer_leases WHERE task_id=?", (task_id,)
+            ).rowcount)
+
+    def register_artifact(self, run_id, kind, relative_path, storage_relpath,
+                          sha256, size_bytes, mime_type=None):
+        if (not isinstance(run_id, str) or not run_id or
+                not isinstance(kind, str) or not 1 <= len(kind.strip()) <= 80 or
+                not isinstance(relative_path, str) or
+                not 1 <= len(relative_path.strip()) <= 32768 or
+                not isinstance(storage_relpath, str) or
+                not 1 <= len(storage_relpath.strip()) <= 32768 or
+                not isinstance(sha256, str) or
+                re.fullmatch(r"[0-9a-f]{64}", sha256) is None or
+                not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or
+                size_bytes < 0 or
+                (mime_type is not None and (not isinstance(mime_type, str) or
+                 not 1 <= len(mime_type.strip()) <= 200))):
+            raise ValueError("无效 Artifact 元数据")
+        with self._write() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise ResourceNotFound("Run 不存在")
+            task = conn.execute("SELECT * FROM tasks WHERE id=?", (run["task_id"],)).fetchone()
+            if not task or task["workspace_id"] is None:
+                raise AgentHierarchyError("Artifact 必须归属 Task Workspace")
+            artifact_id = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO artifacts
+                    (id,task_id,run_id,owner_session_id,workspace_id,kind,
+                     relative_path,storage_relpath,sha256,size_bytes,mime_type,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (artifact_id, task["id"], run_id, run["session_id"],
+                  task["workspace_id"], kind.strip(), relative_path.strip(),
+                  storage_relpath.strip(), sha256, size_bytes,
+                  mime_type.strip() if mime_type is not None else None, _utc_now()))
+            return dict(conn.execute(
+                "SELECT * FROM artifacts WHERE id=?", (artifact_id,)
+            ).fetchone())
+
+    def get_artifact(self, artifact_id):
+        return self._query_one("SELECT * FROM artifacts WHERE id=?", (artifact_id,))
+
+    def list_task_artifacts(self, task_id):
+        return self._query_all("""
+            SELECT * FROM artifacts WHERE task_id=? ORDER BY created_at,id
+        """, (task_id,))
+
+    def run_workspace_scope(self, run_id):
+        """Return trusted stored scope; path interpretation belongs to Workspace policy."""
+        with self._lock:
+            row = self._conn.execute("""
+                SELECT tasks.id AS task_id,tasks.workspace_id,tasks.workspace_mode,
+                       workspaces.kind,workspaces.root_path,workspaces.max_mode,
+                       workspaces.archived_at
+                FROM runs JOIN tasks ON tasks.id=runs.task_id
+                LEFT JOIN workspaces ON workspaces.id=tasks.workspace_id
+                WHERE runs.id=?
+            """, (run_id,)).fetchone()
+            if not row:
+                raise ResourceNotFound("Run 不存在")
+            if row["workspace_id"] is None or row["workspace_mode"] is None or row["archived_at"]:
+                return None
+            if row["workspace_mode"] == "read_write" and row["max_mode"] != "read_write":
+                return None
+            effective_root = row["root_path"]
+            if row["workspace_mode"] == "read_write":
+                if row["kind"] == "git":
+                    checkout = self._conn.execute("""
+                        SELECT path FROM worktree_checkouts
+                        WHERE task_id=? AND workspace_id=? AND state='active'
+                    """, (row["task_id"], row["workspace_id"])).fetchone()
+                    if not checkout:
+                        return None
+                    effective_root = checkout["path"]
+                elif not self._conn.execute("""
+                    SELECT 1 FROM workspace_writer_leases
+                    WHERE workspace_id=? AND task_id=?
+                """, (row["workspace_id"], row["task_id"])).fetchone():
+                    return None
+            return {"workspace_id": row["workspace_id"], "kind": row["kind"],
+                    "effective_root": effective_root, "mode": row["workspace_mode"]}
 
     @staticmethod
     def _validated_result(value):
@@ -1767,6 +2323,10 @@ class Database:
             parents = set(json.loads(creator["capabilities_json"])["grants"])
         grants = (set(parents) & set(json.loads(assignee["capabilities_json"])["grants"])
                   & set(json.loads(task["requested_grant_json"])["grants"]) & HOST_GRANTS)
+        if task["workspace_id"] is None:
+            grants -= {"filesystem.read", "filesystem.write"}
+        elif task["workspace_mode"] == "read_only":
+            grants.discard("filesystem.write")
         if not assignee["can_delegate"]:
             grants.discard("control.delegate_task")
         return grants
@@ -1806,6 +2366,8 @@ class Database:
                 UPDATE tasks SET status='open',finished_at=NULL,result_json=NULL,
                     updated_at=? WHERE id=?
             """, (_utc_now(), task["id"]))
+        if not self._prepare_workspace_run_tx(conn, task):
+            raise WorkspaceUnavailable("Task Workspace 写资源尚未就绪")
         grants = self._effective_grants_tx(conn, task)
         if config_snapshot is None or tool_snapshot is None:
             frozen_config, frozen_tools = self._default_run_snapshots_tx(conn, grants)
@@ -2034,17 +2596,27 @@ class Database:
             raise ValueError("lease_owner 不能为空")
         deadline = self._lease_deadline(lease_seconds)
         with self._write() as conn:
-            candidate = conn.execute("""
-                SELECT * FROM runs WHERE status='queued'
-                ORDER BY created_at,id LIMIT 1
-            """).fetchone()
+            candidates = conn.execute("""
+                SELECT runs.* FROM runs
+                WHERE runs.status='queued'
+                ORDER BY runs.created_at,runs.id
+            """).fetchall()
+            candidate = None
+            for queued in candidates:
+                task = conn.execute(
+                    "SELECT * FROM tasks WHERE id=?", (queued["task_id"],)
+                ).fetchone()
+                conn.execute("SAVEPOINT claim_one")
+                if task and self._prepare_workspace_run_tx(conn, task):
+                    candidate = queued
+                    break
+                conn.execute("RELEASE claim_one")
             if not candidate:
                 return None
             now = _utc_now()
             checkpoint = candidate["checkpoint_json"] or _json({
                 "v": 1, "phase": "model_pending", "round": 1
             })
-            conn.execute("SAVEPOINT claim_one")
             updated = conn.execute("""
                 UPDATE runs SET status='running', version=version+1,
                     lease_epoch=lease_epoch+1, lease_owner=?, lease_until=?,
@@ -2267,7 +2839,9 @@ class Database:
                     creator_session_id=agent["id"], creator_run_id=run_id,
                     parent_task_id=run["task_id"],
                     requested_grant=json.loads(run["effective_grant_json"]),
-                    limits=arguments.get("limits"))
+                    limits=arguments.get("limits"),
+                    workspace_id=task["workspace_id"],
+                    workspace_mode=task["workspace_mode"])
                 self._reserve_child_receipt_tx(conn, run_id, child["id"])
                 busy = conn.execute("""
                     SELECT 1 FROM runs WHERE session_id=? AND
@@ -2275,8 +2849,12 @@ class Database:
                 """, (assignee["id"],)).fetchone()
                 child_run = None
                 if not busy:
-                    child_run, _ = self._insert_run_tx(conn, child,
-                        f"delegate:{child['id']}:1", {}, None, None)
+                    try:
+                        child_run, _ = self._insert_run_tx(
+                            conn, child, f"delegate:{child['id']}:1", {}, None, None
+                        )
+                    except WorkspaceUnavailable:
+                        pass
                 text = _json({"task_id": child["id"],
                               "run_id": child_run["id"] if child_run else None,
                               "status": "queued"})

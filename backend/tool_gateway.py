@@ -26,7 +26,7 @@ _SECRET_FIELDS = frozenset({"authorization", "cookie", "api_key", "token", "secr
 P2_HOST_GRANT_CEILING = frozenset({
     "read_only", "control.delegate_task", "control.send_agent_message",
     "control.get_task_status", "control.wait_for_tasks", "control.cancel_task",
-    "control.request_human_approval",
+    "control.request_human_approval", "filesystem.read", "filesystem.write",
 })
 _BUILTIN_POLICY = {
     "get_current_time": ("read_only", (), "never"),
@@ -119,7 +119,7 @@ def make_run_context(run_id: str, task_id: str = "", actor_id: str = "local-host
 
 def intersect_effective_grants(parent_run, worker_capability, task_requested,
                                host_ceiling=P2_HOST_GRANT_CEILING) -> frozenset[str]:
-    """四个可信上界求交；畸形输入失败关闭，P2 不开放 Workspace/网络/进程。"""
+    """四个可信上界求交；畸形输入失败关闭，P3 仅增加 Workspace filesystem。"""
     def grant_set(value):
         if (not isinstance(value, (set, frozenset, list, tuple))
                 or any(not isinstance(item, str) for item in value)):
