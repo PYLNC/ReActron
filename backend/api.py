@@ -15,6 +15,7 @@ from backend.file_parser import parse_uploaded_file
 from backend.harness import get_harness, run_self_tests
 from backend.mcp.manager import get_manager
 from backend.schemas import (
+    AgentFilesystemCapabilityRequest,
     AgentListResponse,
     AgentRenameRequest,
     ApprovalDecisionRequest,
@@ -40,10 +41,13 @@ from backend.schemas import (
     SupervisorCreateRequest,
     SupervisorSelectRequest,
     TaskCreateRequest,
+    TaskCleanupRequest,
     TaskListResponse,
     TaskResponse,
     ToolsResponse,
     WorkerCreateRequest,
+    WorkspaceCreateRequest,
+    WorkspaceUpdateRequest,
 )
 from backend.services import (
     InvalidBaseUrl,
@@ -74,6 +78,13 @@ def _runner():
     return get_runner()
 
 
+def _workspace_service():
+    """延迟导入，保持 API 可独立测试且不把 Git/路径逻辑放入路由。"""
+    from backend import workspace
+
+    return workspace
+
+
 router = APIRouter(prefix="/api", dependencies=[Depends(_require_local_session)])
 public_router = APIRouter(prefix="/api")
 
@@ -83,8 +94,9 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024
 SAFE_AGENT_GRANTS = frozenset({
     "read_only", "control.delegate_task", "control.send_agent_message",
     "control.get_task_status", "control.wait_for_tasks", "control.cancel_task",
-    "control.request_human_approval",
+    "control.request_human_approval", "filesystem.read", "filesystem.write",
 })
+MAX_DIFF_BYTES = 256 * 1024
 
 def _error_response(status_code: int, code: str, message: str, details=None):
     return JSONResponse(
@@ -116,6 +128,23 @@ def _repository_error(exc: Exception):
         return _error_response(409, code, "Agent 树结构不允许此操作")
     if code == "event_limit_exceeded":
         return _error_response(409, code, "Run 事件容量已达上限")
+    if code in {"workspace_in_use", "worktree_dirty", "worktree_mismatch",
+                "worktree_exists", "branch_exists"}:
+        return _error_response(409, code, "Workspace 当前不能清理")
+    if code in {"task_workspace_not_found", "worktree_not_found"}:
+        return _error_response(404, code, "Task Workspace 不存在")
+    if code in {"workspace_scope_invalid", "workspace_kind_invalid",
+                "git_root_invalid", "invalid_task_id"}:
+        return _error_response(422, code, "Workspace 授权无效")
+    if code == "limit_exceeded":
+        return _error_response(413, code, "Workspace 输出超过限制")
+    if code == "git_unavailable":
+        return _error_response(503, code, "Git 当前不可用")
+    if code == "git_timeout":
+        return _error_response(504, code, "Git 操作超时")
+    if code in {"git_failed", "workspace_io_failed", "invalid_utf8",
+                "active_run_state_required"}:
+        return _error_response(500, code, "Workspace 操作失败")
     if isinstance(exc, ValueError):
         return _error_response(422, "invalid_request", "请求参数无效")
     raise exc
@@ -130,6 +159,8 @@ def _task_response(row: dict) -> dict:
         "context": json.loads(row["context_json"]),
         "status": row["status"],
         "latest_run_id": db.get_latest_run_id(row["id"]),
+        "workspace_id": row.get("workspace_id"),
+        "workspace_mode": row.get("workspace_mode"),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "finished_at": row["finished_at"],
@@ -230,6 +261,39 @@ def _agent_message_response(row: dict) -> dict:
         "kind": row["kind"], "role": row["role"],
         "content": row["content"], "created_at": row["created_at"],
         "needs_reply": bool(row.get("needs_reply", False)),
+    }
+
+
+def _workspace_response(row: dict) -> dict:
+    """Workspace 注册根只对宿主投影；永不回显 checkout/storage 字段。"""
+    return {key: row.get(key) for key in (
+        "name", "root_path", "kind", "max_mode", "created_at", "updated_at", "archived_at"
+    )} | {"workspace_id": row["id"]}
+
+
+def _artifact_response(row: dict) -> dict:
+    """Artifact 仅回显可展示元数据，不回显 owner、hash 或存储位置。"""
+    return {
+        "artifact_id": row.get("artifact_id", row.get("id")),
+        "kind": row.get("kind"),
+        "relative_path": row.get("relative_path"),
+        "size_bytes": row.get("size_bytes"),
+        "mime_type": row.get("mime_type"),
+        "created_at": row.get("created_at"),
+    }
+
+
+def _diff_response(task_id: str, row: dict | str, max_bytes: int) -> dict:
+    raw = row if isinstance(row, str) else row.get("diff", "")
+    encoded = raw.encode("utf-8")
+    clipped = len(encoded) > max_bytes
+    if clipped:
+        raw = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return {
+        "task_id": task_id,
+        "diff": raw,
+        "truncated": clipped or (isinstance(row, dict) and bool(row.get("truncated"))),
+        "bytes_returned": len(raw.encode("utf-8")),
     }
 
 
@@ -363,12 +427,18 @@ async def skills():
 @router.post("/tasks", status_code=201, response_model=TaskResponse)
 async def create_task(payload: TaskCreateRequest):
     try:
-        if not await _host_task_agent(payload.agent_id):
+        agent = await _host_task_agent(payload.agent_id)
+        if not agent:
             return _error_response(404, "not_found", "资源不存在")
-        row = await asyncio.to_thread(
-            db.create_task, payload.agent_id, payload.goal, payload.acceptance,
-            payload.context.model_dump() if payload.context else None,
-        )
+        if bool(payload.workspace_id) != bool(payload.workspace_mode):
+            return _error_response(422, "invalid_request", "workspace_id 与 workspace_mode 必须同时提供")
+        args = [payload.agent_id, payload.goal, payload.acceptance,
+                payload.context.model_dump() if payload.context else None]
+        if payload.workspace_id:
+            if agent.get("agent_role") != "supervisor":
+                return _error_response(422, "invalid_request", "只有活动根 Task 可选择 Workspace")
+            args.extend((payload.workspace_id, payload.workspace_mode))
+        row = await asyncio.to_thread(db.create_task, *args)
     except Exception as exc:
         return _repository_error(exc)
     return await asyncio.to_thread(_task_response, row)
@@ -396,6 +466,45 @@ async def get_task(task_id: str):
     if not row:
         return _error_response(404, "not_found", "资源不存在")
     return await asyncio.to_thread(_task_response, row)
+
+
+@router.get("/tasks/{task_id}/artifacts")
+async def list_task_artifacts(task_id: str):
+    if not await asyncio.to_thread(db.get_task, task_id):
+        return _error_response(404, "not_found", "资源不存在")
+    try:
+        rows = await asyncio.to_thread(db.list_task_artifacts, task_id)
+    except Exception as exc:
+        return _repository_error(exc)
+    return {"task_id": task_id, "artifacts": [_artifact_response(row) for row in rows]}
+
+
+@router.get("/tasks/{task_id}/diff")
+async def get_task_diff(task_id: str,
+                        max_bytes: int = Query(MAX_DIFF_BYTES, ge=1, le=MAX_DIFF_BYTES)):
+    if not await asyncio.to_thread(db.get_task, task_id):
+        return _error_response(404, "not_found", "资源不存在")
+    try:
+        row = await asyncio.to_thread(_workspace_service().get_task_diff, db, task_id, max_bytes)
+    except Exception as exc:
+        return _repository_error(exc)
+    return _diff_response(task_id, row, max_bytes)
+
+
+@router.post("/tasks/{task_id}/cleanup")
+async def cleanup_task_workspace(
+    task_id: str,
+    payload: TaskCleanupRequest = Body(default=TaskCleanupRequest()),
+):
+    if not await asyncio.to_thread(db.get_task, task_id):
+        return _error_response(404, "not_found", "资源不存在")
+    try:
+        result = await asyncio.to_thread(_workspace_service().cleanup_task_workspace, db, task_id)
+    except Exception as exc:
+        return _repository_error(exc)
+    status = result.get("status") if isinstance(result, dict) else None
+    return {"task_id": task_id,
+            "cleanup_status": status if status in {"removed", "not_applicable"} else "removed"}
 
 
 @router.post("/tasks/{task_id}/runs", status_code=202, response_model=RunResponse)
@@ -533,6 +642,45 @@ async def _tree_agent(row: dict) -> dict:
     return _agent_tree_response(row, status)
 
 
+@router.post("/workspaces", status_code=201)
+async def create_workspace(payload: WorkspaceCreateRequest):
+    try:
+        root_path = await asyncio.to_thread(
+            _workspace_service().normalize_workspace_root, payload.root_path, payload.kind
+        )
+        row = await asyncio.to_thread(
+            db.create_workspace, payload.name, str(root_path), payload.kind, payload.max_mode
+        )
+    except Exception as exc:
+        return _repository_error(exc)
+    return _workspace_response(row)
+
+
+@router.get("/workspaces")
+async def list_workspaces(include_archived: bool = False):
+    try:
+        rows = await asyncio.to_thread(db.list_workspaces, include_archived)
+    except Exception as exc:
+        return _repository_error(exc)
+    return {"workspaces": [_workspace_response(row) for row in rows]}
+
+
+@router.patch("/workspaces/{workspace_id}")
+async def update_workspace(workspace_id: str, payload: WorkspaceUpdateRequest):
+    changes = payload.model_dump(exclude_unset=True)
+    if (not changes or changes.get("archived") is False
+            or changes.get("max_mode") == "read_write"):
+        return _error_response(422, "invalid_request", "只允许重命名、收缩 max_mode 或归档")
+    try:
+        row = await asyncio.to_thread(
+            db.update_workspace, workspace_id, changes.get("name"),
+            changes.get("max_mode"), bool(changes.get("archived", False)),
+        )
+    except Exception as exc:
+        return _repository_error(exc)
+    return _workspace_response(row)
+
+
 @router.get("/supervisor")
 async def get_supervisor():
     row = await asyncio.to_thread(db.get_supervisor)
@@ -593,6 +741,22 @@ async def get_agent_status(agent_id: str):
 async def rename_agent(agent_id: str, payload: AgentRenameRequest):
     try:
         row = await asyncio.to_thread(db.rename_agent, agent_id, payload.title)
+    except Exception as exc:
+        return _repository_error(exc)
+    return await _tree_agent(row)
+
+
+@router.put("/agents/{agent_id}/filesystem-capability")
+async def update_agent_filesystem_capability(
+    agent_id: str, payload: AgentFilesystemCapabilityRequest,
+):
+    if payload.filesystem_write and not payload.filesystem_read:
+        return _error_response(422, "invalid_request", "filesystem.write 必须同时允许 read")
+    try:
+        row = await asyncio.to_thread(
+            db.set_agent_filesystem_capability, agent_id,
+            payload.filesystem_read, payload.filesystem_write,
+        )
     except Exception as exc:
         return _repository_error(exc)
     return await _tree_agent(row)

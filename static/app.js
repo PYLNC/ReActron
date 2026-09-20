@@ -22,6 +22,16 @@ const delegationResult = document.getElementById("delegationResult");
 const refreshDelegationsBtn = document.getElementById("refreshDelegationsBtn");
 const agentMessageList = document.getElementById("agentMessageList");
 const refreshAgentMessagesBtn = document.getElementById("refreshAgentMessagesBtn");
+const workspaceList = document.getElementById("workspaceList");
+const registerWorkspaceBtn = document.getElementById("registerWorkspaceBtn");
+const workspaceControls = document.getElementById("workspaceControls");
+const workspaceSelect = document.getElementById("workspaceSelect");
+const workspaceModeSelect = document.getElementById("workspaceModeSelect");
+const taskWorkspaceStatus = document.getElementById("taskWorkspaceStatus");
+const taskArtifactList = document.getElementById("taskArtifactList");
+const taskDiff = document.getElementById("taskDiff");
+const viewTaskDiffBtn = document.getElementById("viewTaskDiffBtn");
+const cleanupTaskBtn = document.getElementById("cleanupTaskBtn");
 const runBar = document.getElementById("runBar");
 const runStatus = document.getElementById("runStatus");
 const runActions = document.getElementById("runActions");
@@ -60,9 +70,11 @@ const mcpStatus = document.getElementById("mcpStatus");
 const ACTIVE_SESSION_KEY = "countboter_active_session";
 let sessions = [];
 let agentTree = [];
+let workspaces = [];
 let projects = [];
 let activeSessionId = null;
 let activeTaskId = null;
+let activeTask = null;
 let activeRunId = null;
 let eventSource = null;
 let lastEventIdByRun = {};
@@ -151,8 +163,9 @@ function setStatus(mode) {
 
 
 function setSendButton() {
-  const workerSelected = agentTree.some((agent) =>
-    agent.agent_id === activeSessionId && agent.agent_role === "worker");
+  const selectedAgent = agentTree.find((agent) => agent.agent_id === activeSessionId);
+  const workerSelected = selectedAgent && selectedAgent.agent_role === "worker";
+  workspaceControls.hidden = !selectedAgent || selectedAgent.agent_role !== "supervisor";
   input.readOnly = workerSelected;
   if (workerSelected) {
     sendBtn.textContent = "Worker 仅接受委派";
@@ -504,6 +517,125 @@ async function assignActiveSessionProject() {
 }
 
 
+function renderWorkspaceModeOptions() {
+  const workspace = workspaces.find((item) => item.workspace_id === workspaceSelect.value);
+  const current = workspaceModeSelect.value;
+  workspaceModeSelect.replaceChildren();
+  workspaceModeSelect.disabled = !workspace;
+  if (!workspace) return;
+  for (const mode of workspace.max_mode === "read_write" ?
+      ["read_only", "read_write"] : ["read_only"]) {
+    const option = document.createElement("option");
+    option.value = mode;
+    option.textContent = mode;
+    workspaceModeSelect.appendChild(option);
+  }
+  if ([...workspaceModeSelect.children].some((option) => option.value === current)) {
+    workspaceModeSelect.value = current;
+  }
+}
+
+
+function renderWorkspaces() {
+  const selected = workspaceSelect.value;
+  workspaceList.replaceChildren();
+  workspaceSelect.replaceChildren();
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "不绑定";
+  workspaceSelect.appendChild(none);
+  for (const workspace of workspaces) {
+    const option = document.createElement("option");
+    option.value = workspace.workspace_id;
+    option.textContent = workspace.name + " · " + workspace.kind + " · " + workspace.max_mode;
+    workspaceSelect.appendChild(option);
+
+    const item = document.createElement("li");
+    const label = document.createElement("span");
+    label.textContent = workspace.name + " · " + workspace.kind + " · " + workspace.max_mode;
+    item.appendChild(label);
+    const root = document.createElement("small");
+    root.textContent = workspace.root_path;
+    item.appendChild(root);
+    const rename = document.createElement("button");
+    rename.type = "button";
+    rename.textContent = "重命名";
+    rename.addEventListener("click", () => updateWorkspace(workspace, "rename"));
+    item.appendChild(rename);
+    if (workspace.max_mode === "read_write") {
+      const shrink = document.createElement("button");
+      shrink.type = "button";
+      shrink.textContent = "收缩为只读";
+      shrink.addEventListener("click", () => updateWorkspace(workspace, "shrink"));
+      item.appendChild(shrink);
+    }
+    const archive = document.createElement("button");
+    archive.type = "button";
+    archive.textContent = "归档";
+    archive.addEventListener("click", () => updateWorkspace(workspace, "archive"));
+    item.appendChild(archive);
+    workspaceList.appendChild(item);
+  }
+  workspaceSelect.value = workspaces.some((item) => item.workspace_id === selected) ? selected : "";
+  renderWorkspaceModeOptions();
+}
+
+
+async function loadWorkspaces() {
+  try {
+    const data = await apiJson("/api/workspaces");
+    workspaces = data.workspaces || [];
+    renderWorkspaces();
+    if (activeTask) await showTaskWorkspace(activeTask);
+  } catch (err) {
+    log("加载 Workspace 失败: " + err.message);
+  }
+}
+
+
+async function registerWorkspace() {
+  const name = window.prompt("Workspace 名称");
+  const rootPath = name && window.prompt("绝对根目录");
+  const kind = rootPath && window.prompt("类型：directory 或 git", "directory");
+  const maxMode = kind && window.prompt("最大模式：read_only 或 read_write", "read_only");
+  if (!name || !rootPath || !["directory", "git"].includes(kind) ||
+      !["read_only", "read_write"].includes(maxMode)) return;
+  try {
+    await apiJson("/api/workspaces", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name.trim(), root_path: rootPath.trim(), kind, max_mode: maxMode }),
+    });
+    await loadWorkspaces();
+  } catch (err) {
+    appendNote("登记 Workspace 失败: " + err.message);
+  }
+}
+
+
+async function updateWorkspace(workspace, action) {
+  let payload;
+  if (action === "rename") {
+    const name = window.prompt("Workspace 名称", workspace.name);
+    if (!name || !name.trim()) return;
+    payload = { name: name.trim() };
+  } else if (action === "shrink") {
+    payload = { max_mode: "read_only" };
+  } else {
+    if (!window.confirm("归档 Workspace “" + workspace.name + "”？")) return;
+    payload = { archived: true };
+  }
+  try {
+    await apiJson("/api/workspaces/" + encodeURIComponent(workspace.workspace_id), {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    await loadWorkspaces();
+  } catch (err) {
+    appendNote("更新 Workspace 失败: " + err.message);
+  }
+}
+
+
 // 从后端读取工具列表和运行配置，让侧边栏与后端保持一致
 async function loadRuntimeInfo() {
   try {
@@ -687,6 +819,13 @@ function renderAgentTree() {
       " · 能力上限: " + (agent.capability_grants || []).join(", ") +
       (agent.can_delegate ? " · 可委派" : " · 不可委派");
     item.appendChild(info);
+    if (!agent.archived_at) {
+      const filesystem = document.createElement("button");
+      filesystem.type = "button";
+      filesystem.textContent = "文件能力";
+      filesystem.addEventListener("click", () => updateAgentFilesystemCapability(agent));
+      item.appendChild(filesystem);
+    }
     if (!agent.archived_at && agent.can_delegate && agent.depth < 2 &&
         (agent.capability_grants || []).includes("control.delegate_task")) {
       const add = document.createElement("button");
@@ -782,6 +921,28 @@ async function createWorker(parentId) {
 }
 
 
+async function updateAgentFilesystemCapability(agent) {
+  const grants = agent.capability_grants || [];
+  const current = grants.includes("filesystem.write") ? "read_write" :
+    grants.includes("filesystem.read") ? "read_only" : "none";
+  const mode = window.prompt("文件能力：none、read_only 或 read_write", current);
+  if (!mode || !["none", "read_only", "read_write"].includes(mode)) return;
+  try {
+    await apiJson("/api/agents/" + encodeURIComponent(agent.agent_id) +
+      "/filesystem-capability", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filesystem_read: mode !== "none",
+          filesystem_write: mode === "read_write",
+        }),
+      });
+    await loadAgentTree();
+  } catch (err) {
+    appendNote("更新文件能力失败: " + err.message);
+  }
+}
+
+
 async function renameTreeAgent(agent) {
   const title = window.prompt("Agent 名称", agent.title);
   if (!title || !title.trim()) return;
@@ -859,6 +1020,7 @@ async function loadDelegations() {
 async function showDelegation(taskId) {
   try {
     const data = await apiJson("/api/delegations/" + encodeURIComponent(taskId));
+    await showTaskWorkspace(data.task);
     const result = data.result;
     delegationResult.textContent = result ?
       [result.summary,
@@ -870,6 +1032,82 @@ async function showDelegation(taskId) {
       "Task " + data.task.status + "，尚无结构化结果";
   } catch (err) {
     appendNote("读取 Task 结果失败: " + err.message);
+  }
+}
+
+
+function clearTaskWorkspace() {
+  activeTask = null;
+  taskWorkspaceStatus.textContent = "尚未选择 Task";
+  taskArtifactList.replaceChildren();
+  taskDiff.textContent = "";
+  viewTaskDiffBtn.disabled = true;
+  cleanupTaskBtn.disabled = true;
+}
+
+
+async function showTaskWorkspace(task) {
+  activeTask = task;
+  activeTaskId = task.task_id;
+  taskArtifactList.replaceChildren();
+  taskDiff.textContent = "";
+  const workspace = workspaces.find((item) => item.workspace_id === task.workspace_id);
+  const hasCheckout = workspace && workspace.kind === "git" &&
+    task.workspace_mode === "read_write";
+  taskWorkspaceStatus.textContent = task.workspace_id ?
+    "Workspace: " + (workspace ? workspace.name : task.workspace_id) +
+      " · " + task.workspace_mode + (task.workspace_mode === "read_write" ?
+        " · 写操作仍需审批且当前失败关闭" : "") :
+    "Task 未绑定 Workspace";
+  viewTaskDiffBtn.disabled = !hasCheckout;
+  cleanupTaskBtn.disabled = !hasCheckout;
+  try {
+    const data = await apiJson("/api/tasks/" + encodeURIComponent(task.task_id) + "/artifacts");
+    if (!activeTask || activeTask.task_id !== task.task_id) return;
+    for (const artifact of data.artifacts || []) {
+      const item = document.createElement("li");
+      item.textContent = artifact.relative_path + " · " + artifact.kind +
+        " · " + artifact.size_bytes + " bytes";
+      taskArtifactList.appendChild(item);
+    }
+  } catch (err) {
+    if (activeTask && activeTask.task_id === task.task_id) {
+      taskWorkspaceStatus.textContent += " · Artifact 读取失败";
+    }
+  }
+}
+
+
+async function viewTaskDiff() {
+  if (!activeTask) return;
+  const taskId = activeTask.task_id;
+  try {
+    const data = await apiJson("/api/tasks/" + encodeURIComponent(taskId) + "/diff");
+    if (!activeTask || activeTask.task_id !== taskId) return;
+    taskDiff.textContent = data.diff || "(无 diff)";
+    if (data.truncated) taskWorkspaceStatus.textContent += " · diff 已截断";
+  } catch (err) {
+    taskWorkspaceStatus.textContent += " · diff 读取失败";
+  }
+}
+
+
+async function cleanupTaskWorkspace() {
+  if (!activeTask || !window.confirm(
+      "永久删除此 Task 的干净 checkout？Task 完成时默认保留，Git 分支不会删除。")) return;
+  const taskId = activeTask.task_id;
+  try {
+    const data = await apiJson("/api/tasks/" + encodeURIComponent(taskId) + "/cleanup", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    if (!activeTask || activeTask.task_id !== taskId) return;
+    taskWorkspaceStatus.textContent += " · checkout: " + data.cleanup_status + "（分支保留）";
+    viewTaskDiffBtn.disabled = true;
+    cleanupTaskBtn.disabled = true;
+  } catch (err) {
+    if (activeTask && activeTask.task_id === taskId) {
+      taskWorkspaceStatus.textContent += " · checkout 删除被拒绝";
+    }
   }
 }
 
@@ -967,6 +1205,7 @@ async function openSession(sessionId) {
   closeRunSubscription();
   activeRunId = null;
   activeTaskId = null;
+  clearTaskWorkspace();
   streaming = false;
   runAllowedActions = [];
   setSendButton();
@@ -1077,6 +1316,7 @@ async function deleteSession(sessionId) {
       renderAgentTree();
       activeRunId = null;
       activeTaskId = null;
+      clearTaskWorkspace();
       streaming = false;
       runAllowedActions = [];
       setSendButton();
@@ -1378,6 +1618,7 @@ async function loadTasks(agentId, restore = false) {
     button.textContent = task.goal + " · " + task.status;
     button.addEventListener("click", () => {
       activeTaskId = task.task_id;
+      showTaskWorkspace(task);
       if (task.latest_run_id) openRun(task.latest_run_id, true);
       else runSnapshot.textContent = "Task " + task.task_id + " 尚未启动 Run";
     });
@@ -1393,6 +1634,7 @@ async function loadTasks(agentId, restore = false) {
   }
   if (restore && data.tasks && data.tasks[0] && data.tasks[0].latest_run_id) {
     activeTaskId = data.tasks[0].task_id;
+    await showTaskWorkspace(data.tasks[0]);
     await openRun(data.tasks[0].latest_run_id, true);
   }
 }
@@ -1593,15 +1835,22 @@ async function sendMessage() {
   showTyping();
   try {
     const sessionId = await ensureSession(text);
+    const payload = { agent_id: sessionId, goal: text };
+    const selectedAgent = agentTree.find((agent) => agent.agent_id === sessionId);
+    if (selectedAgent && selectedAgent.agent_role === "supervisor" && workspaceSelect.value) {
+      payload.workspace_id = workspaceSelect.value;
+      payload.workspace_mode = workspaceModeSelect.value;
+    }
     const task = await apiJson("/api/tasks", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ agent_id: sessionId, goal: text }),
+      body: JSON.stringify(payload),
     });
     input.value = "";
     autoResize();
     appendBubble("user", text);
     currentSessionHasMessages = true;
     activeTaskId = task.task_id;
+    await showTaskWorkspace(task);
     await startRun(task.task_id);
   } catch (err) {
     hideTyping();
@@ -1638,6 +1887,10 @@ fileInput.addEventListener("change", uploadFile);
 newSessionBtn.addEventListener("click", createNewSession);
 createSupervisorBtn.addEventListener("click", createSupervisor);
 selectSupervisorBtn.addEventListener("click", selectSupervisor);
+registerWorkspaceBtn.addEventListener("click", registerWorkspace);
+workspaceSelect.addEventListener("change", renderWorkspaceModeOptions);
+viewTaskDiffBtn.addEventListener("click", viewTaskDiff);
+cleanupTaskBtn.addEventListener("click", cleanupTaskWorkspace);
 newProjectBtn.addEventListener("click", createProject);
 projectAssignSelect.addEventListener("change", assignActiveSessionProject);
 settingsBtn.addEventListener("click", openSettings);
@@ -1673,6 +1926,7 @@ bootstrapIfNeeded().then((ready) => {
     loadRuntimeInfo();
     loadSessions();
     loadAgentTree();
+    loadWorkspaces();
     loadDelegations();
   }
 }).catch(() => { statusText.textContent = "连接失败"; });

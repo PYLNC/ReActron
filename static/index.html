@@ -49,6 +49,13 @@
           </div>
           <ul class="agent-tree-list" id="agentTreeList" aria-live="polite"></ul>
         </section>
+        <section class="workspace-panel" aria-labelledby="workspaceHeading">
+          <div class="workspace-head">
+            <h3 id="workspaceHeading">Workspace</h3>
+            <button id="registerWorkspaceBtn" class="small-btn" type="button">登记</button>
+          </div>
+          <ul class="task-list" id="workspaceList" aria-live="polite"></ul>
+        </section>
         <ul class="session-list" id="sessionList"></ul>
         <section class="task-panel" aria-labelledby="taskHeading">
           <h3 id="taskHeading">当前 Agent 的任务</h3>
@@ -91,6 +98,21 @@
           <div class="info-section-body">
             <button id="refreshAgentMessagesBtn" class="small-btn" type="button">刷新消息</button>
             <ul id="agentMessageList" class="task-list" aria-live="polite"></ul>
+          </div>
+        </section>
+
+        <section class="info-section open" id="taskWorkspaceSection">
+          <button class="info-section-toggle" type="button">
+            <span>Task Workspace / Artifact</span><span class="chevron" aria-hidden="true">⌄</span>
+          </button>
+          <div class="info-section-body">
+            <p id="taskWorkspaceStatus" aria-live="polite">尚未选择 Task</p>
+            <div class="task-workspace-actions">
+              <button id="viewTaskDiffBtn" class="small-btn" type="button" disabled>查看 diff</button>
+              <button id="cleanupTaskBtn" class="small-btn" type="button" disabled>删除 checkout</button>
+            </div>
+            <ul id="taskArtifactList" class="task-list" aria-live="polite"></ul>
+            <pre id="taskDiff" class="task-diff" aria-live="polite"></pre>
           </div>
         </section>
 
@@ -157,6 +179,11 @@
     </div>
 
     <footer class="composer-wrap">
+      <div id="workspaceControls" class="workspace-controls" hidden>
+        <label>Workspace <select id="workspaceSelect"><option value="">不绑定</option></select></label>
+        <label>模式 <select id="workspaceModeSelect" disabled></select></label>
+        <small>read_write 只是权限上限；写操作仍需审批。Task 完成后保留 worktree，只有手动操作才删除 checkout。</small>
+      </div>
       <form class="composer" id="composer">
         <input type="file" id="fileInput" hidden>
         <button id="uploadBtn" class="upload-btn" type="button">上传</button>

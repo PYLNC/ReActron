@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 from typing import Annotated
 
 
@@ -33,6 +33,10 @@ class BootstrapRequest(BaseModel):
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 RefId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+WorkspaceName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
+WorkspacePath = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)]
+WorkspaceKind = Literal["directory", "git"]
+WorkspaceMode = Literal["read_only", "read_write"]
 
 
 class DelegationContext(BaseModel):
@@ -51,6 +55,8 @@ class TaskCreateRequest(BaseModel):
     goal: NonEmptyText
     acceptance: List[str] = Field(default_factory=list)
     context: DelegationContext | None = None
+    workspace_id: RefId | None = None
+    workspace_mode: WorkspaceMode | None = None
 
 
 class RunCreateRequest(BaseModel):
@@ -63,6 +69,12 @@ class RunControlRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: Literal["pause", "resume", "cancel"]
+
+
+class TaskCleanupRequest(BaseModel):
+    """Cleanup 没有 force；繁忙或脏 checkout 必须失败关闭。"""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -80,6 +92,8 @@ class TaskResponse(BaseModel):
     context: Dict[str, Any]
     status: str
     latest_run_id: Optional[str]
+    workspace_id: Optional[str] = None
+    workspace_mode: Optional[WorkspaceMode] = None
     created_at: str
     updated_at: str
     finished_at: Optional[str]
@@ -131,6 +145,15 @@ class AgentCapabilitiesRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     grants: List[ControlGrant] = Field(default_factory=list, max_length=32)
+
+
+class AgentFilesystemCapabilityRequest(BaseModel):
+    """窄更新：服务端只允许改变 Agent 的两个 filesystem grant。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    filesystem_read: StrictBool
+    filesystem_write: StrictBool
 
 
 class SupervisorCreateRequest(BaseModel):
@@ -186,6 +209,25 @@ class HumanReplyRequest(BaseModel):
 
     reply_to_message_id: int = Field(ge=1)
     content: NonEmptyText = Field(max_length=4000)
+
+
+class WorkspaceCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: WorkspaceName
+    root_path: WorkspacePath
+    kind: WorkspaceKind
+    max_mode: WorkspaceMode
+
+
+class WorkspaceUpdateRequest(BaseModel):
+    """root_path/kind 不可变；归档不可撤销。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: WorkspaceName | None = None
+    max_mode: WorkspaceMode | None = None
+    archived: StrictBool | None = None
 
 
 class SettingsRequest(BaseModel):
