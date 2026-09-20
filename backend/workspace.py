@@ -451,6 +451,7 @@ def _task_checkout(database, task_id: str, allowed_states: frozenset[str]):
             or checkout.get("state") not in allowed_states):
         raise WorkspaceError("worktree_not_found")
     root = normalize_workspace_root(workspace["root_path"], "git")
+    initialize_workspace_state()
     _, branch, expected = _task_parts(STATE_ROOT, task_id)
     raw_checkout = checkout.get("path")
     if (not isinstance(raw_checkout, str) or not Path(raw_checkout).is_absolute()
