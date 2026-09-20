@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 import uuid
 from contextlib import suppress
 from dataclasses import replace
@@ -45,6 +46,7 @@ class TaskRunner:
         self._wake = asyncio.Event()
         self._task = None
         self._closing = False
+        self._workspace_checked_at = 0.0
 
     def _verified_provider(self, run):
         from backend.security import verify_frozen_provider
@@ -99,6 +101,7 @@ class TaskRunner:
         if self._task and not self._task.done():
             return
         self.database.recover_expired_leases()
+        await self._coordinate_workspaces(force=True)
         self._closing = False
         self._task = asyncio.create_task(self._loop(), name="reactron-runner")
         self.wake()
@@ -132,6 +135,7 @@ class TaskRunner:
                 pass
 
     async def run_once(self):
+        await self._coordinate_workspaces()
         self.database.schedule_pending_tasks()
         run = self.database.claim_next_run(self._owner, lease_seconds=RUN_LEASE_SECONDS)
         if not run:
@@ -141,6 +145,14 @@ class TaskRunner:
         finally:
             self.database.schedule_pending_tasks()
         return True
+
+    async def _coordinate_workspaces(self, *, force=False):
+        now = time.monotonic()
+        if not force and now - self._workspace_checked_at < 1:
+            return
+        self._workspace_checked_at = now
+        from backend.workspace import coordinate_git_worktrees
+        await asyncio.to_thread(coordinate_git_worktrees, self.database)
 
     async def _fail(self, run, code):
         self.database.transition_run(

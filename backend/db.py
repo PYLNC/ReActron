@@ -876,6 +876,15 @@ class Database:
                 BEGIN DELETE FROM workspace_writer_leases WHERE task_id=NEW.id; END
             """)
             conn.execute("""
+                CREATE TRIGGER trg_task_terminal_retain_worktree
+                AFTER UPDATE OF status ON tasks
+                WHEN OLD.status='open' AND NEW.status<>'open'
+                BEGIN
+                    UPDATE worktree_checkouts SET state='retained',updated_at=NEW.updated_at
+                    WHERE task_id=NEW.id AND state='active';
+                END
+            """)
+            conn.execute("""
                 CREATE TRIGGER trg_run_release_writer
                 AFTER UPDATE OF status ON runs
                 WHEN OLD.status='running' AND (
@@ -1835,6 +1844,38 @@ class Database:
                 AND status IN ('queued','running','waiting','paused') LIMIT 1
         """, (task_id,)) is not None
 
+    def list_pending_git_worktree_tasks(self, limit=16):
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise ValueError("limit 必须为 1..100")
+        return self._query_all("""
+            SELECT tasks.*,workspaces.root_path AS workspace_root_path
+            FROM tasks JOIN workspaces ON workspaces.id=tasks.workspace_id
+            LEFT JOIN worktree_checkouts ON worktree_checkouts.task_id=tasks.id
+            WHERE tasks.status='open' AND tasks.workspace_mode='read_write'
+                AND workspaces.kind='git' AND workspaces.max_mode='read_write'
+                AND workspaces.archived_at IS NULL AND worktree_checkouts.task_id IS NULL
+                AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.task_id=tasks.id)
+            ORDER BY tasks.created_at,tasks.id LIMIT ?
+        """, (limit,))
+
+    def list_worktree_checkouts(self, states):
+        allowed = {"creating", "active", "retained", "removing", "removed", "failed"}
+        if (not isinstance(states, (set, frozenset, list, tuple)) or not states
+                or any(state not in allowed for state in states)):
+            raise ValueError("无效 worktree checkout states")
+        states = tuple(sorted(set(states)))
+        placeholders = ",".join("?" for _ in states)
+        return self._query_all(f"""
+            SELECT worktree_checkouts.*,tasks.status AS task_status,
+                   workspaces.root_path AS workspace_root_path,
+                   workspaces.archived_at AS workspace_archived_at
+            FROM worktree_checkouts
+            JOIN tasks ON tasks.id=worktree_checkouts.task_id
+            JOIN workspaces ON workspaces.id=worktree_checkouts.workspace_id
+            WHERE worktree_checkouts.state IN ({placeholders})
+            ORDER BY worktree_checkouts.created_at,worktree_checkouts.task_id
+        """, states)
+
     def list_tasks(self, agent_id=None, status=None, limit=50):
         if status is not None and status not in {"open", "completed", "failed", "cancelled"}:
             raise ValueError("无效 Task 状态")
@@ -1967,6 +2008,8 @@ class Database:
             task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 raise ResourceNotFound("Task 不存在")
+            if conn.execute("SELECT 1 FROM runs WHERE task_id=? LIMIT 1", (task_id,)).fetchone():
+                raise InvalidRunTransition("worktree 必须在 Run 创建前进入 creating")
             now = _utc_now()
             conn.execute("""
                 INSERT INTO worktree_checkouts

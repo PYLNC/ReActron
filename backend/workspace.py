@@ -6,6 +6,7 @@ never choose a root and are resolved before reaching a filesystem primitive.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import stat
@@ -19,6 +20,7 @@ from typing import Mapping
 from backend.config import BASE_DIR
 
 
+logger = logging.getLogger("agent.workspace")
 MAX_PATH_CHARS = 1_024
 MAX_LIST_ENTRIES = 256
 MAX_TEXT_BYTES = 64 * 1024
@@ -370,20 +372,30 @@ def _task_parts(state_root, task_id: str) -> tuple[Path, str, Path]:
     return state, f"reactron/{task_id}", checkout
 
 
-def _worktree_paths(git_root: Path) -> set[Path]:
+def _worktrees(git_root: Path) -> dict[Path, str | None]:
     _, output = _git(git_root, "worktree", "list", "--porcelain")
-    paths = set()
-    for line in output.splitlines():
+    worktrees = {}
+    path = None
+    for line in (*output.splitlines(), ""):
         if line.startswith("worktree "):
-            paths.add(Path(line[9:]).resolve(strict=False))
-    return paths
+            path = Path(line[9:]).resolve(strict=False)
+            worktrees[path] = None
+        elif line.startswith("branch ") and path is not None:
+            worktrees[path] = line[7:]
+        elif not line:
+            path = None
+    return worktrees
 
 
-def create_git_worktree(git_root, state_root, task_id: str) -> dict:
-    """Create one isolated checkout at current HEAD; never changes the main checkout."""
+def _worktree_paths(git_root: Path) -> set[Path]:
+    return set(_worktrees(git_root))
+
+
+def plan_git_worktree(git_root, state_root, task_id: str) -> dict:
+    """Freeze the checkout identity at the registered repository's current HEAD."""
     root = _registered_git_root(git_root)
     _, branch, checkout = _task_parts(state_root, task_id)
-    if os.path.lexists(checkout):
+    if os.path.lexists(checkout) or checkout.resolve(strict=False) in _worktree_paths(root):
         raise WorkspaceError("worktree_exists")
     _git(root, "check-ref-format", "--branch", branch)
     branch_code, _ = _git(root, "show-ref", "--verify", "--quiet",
@@ -393,8 +405,49 @@ def create_git_worktree(git_root, state_root, task_id: str) -> dict:
     _, head = _git(root, "rev-parse", "--verify", "HEAD")
     if not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
         raise WorkspaceError("git_failed")
-    _git(root, "worktree", "add", "-b", branch, str(checkout), head)
     return {"branch": branch, "checkout_path": str(checkout), "head": head}
+
+
+def resume_git_worktree(git_root, state_root, task_id: str,
+                        branch: str, base_commit: str) -> dict:
+    """Idempotently finish a persisted creating checkout without deleting refs."""
+    root = _registered_git_root(git_root)
+    _, expected_branch, checkout = _task_parts(state_root, task_id)
+    if (branch != expected_branch or not isinstance(base_commit, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{40,64}", base_commit)):
+        raise WorkspaceError("worktree_mismatch")
+    _git(root, "cat-file", "-e", f"{base_commit}^{{commit}}")
+    worktrees = _worktrees(root)
+    canonical_checkout = checkout.resolve(strict=False)
+    if os.path.lexists(checkout):
+        if canonical_checkout not in worktrees:
+            raise WorkspaceError("worktree_mismatch")
+        details = inspect_git_worktree(root, state_root, task_id)
+        if details["head"] != base_commit:
+            raise WorkspaceError("worktree_mismatch")
+        return {"branch": branch, "checkout_path": str(checkout), "head": base_commit}
+    if canonical_checkout in worktrees:
+        raise WorkspaceError("worktree_mismatch")
+    ref = f"refs/heads/{branch}"
+    branch_code, _ = _git(root, "show-ref", "--verify", "--quiet", ref,
+                          allowed_codes=(0, 1))
+    if branch_code == 0:
+        _, branch_head = _git(root, "rev-parse", "--verify", ref)
+        if branch_head != base_commit or ref in worktrees.values():
+            raise WorkspaceError("branch_exists")
+        _git(root, "worktree", "add", str(checkout), branch)
+    else:
+        _git(root, "worktree", "add", "-b", branch, str(checkout), base_commit)
+    details = inspect_git_worktree(root, state_root, task_id)
+    if details["head"] != base_commit:
+        raise WorkspaceError("worktree_mismatch")
+    return {"branch": branch, "checkout_path": str(checkout), "head": base_commit}
+
+
+def create_git_worktree(git_root, state_root, task_id: str) -> dict:
+    """Create one isolated checkout at current HEAD; never changes the main checkout."""
+    plan = plan_git_worktree(git_root, state_root, task_id)
+    return resume_git_worktree(git_root, state_root, task_id, plan["branch"], plan["head"])
 
 
 def inspect_git_worktree(git_root, state_root, task_id: str) -> dict:
@@ -433,6 +486,100 @@ def remove_git_worktree(git_root, state_root, task_id: str,
     checkout = Path(details["checkout_path"])
     _git(root, "worktree", "remove", str(checkout))
     return {"branch": details["branch"], "removed": True}
+
+
+def resume_remove_git_worktree(git_root, state_root, task_id: str) -> dict:
+    """Finish a persisted removing state with ordinary Git removal only."""
+    root = _registered_git_root(git_root)
+    _, branch, checkout = _task_parts(state_root, task_id)
+    registered = checkout.resolve(strict=False) in _worktree_paths(root)
+    if not os.path.lexists(checkout) and not registered:
+        return {"branch": branch, "removed": True}
+    if os.path.lexists(checkout):
+        return remove_git_worktree(root, state_root, task_id, has_active_runs=False)
+    _git(root, "worktree", "remove", str(checkout))
+    return {"branch": branch, "removed": True}
+
+
+def _stored_checkout_identity(row: Mapping) -> tuple[Path, str, Path]:
+    root = normalize_workspace_root(row.get("workspace_root_path"), "git")
+    _, branch, checkout = _task_parts(STATE_ROOT, row.get("task_id"))
+    if (row.get("branch") != branch or not isinstance(row.get("path"), str)
+            or not Path(row["path"]).is_absolute()
+            or os.path.normcase(os.path.abspath(row["path"])) !=
+               os.path.normcase(str(checkout))):
+        raise WorkspaceError("worktree_mismatch")
+    return root, branch, checkout
+
+
+def coordinate_git_worktrees(database, limit: int = 16) -> dict:
+    """Reconcile persisted Git lifecycle states, then let DB schedule ready Tasks."""
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise ValueError("limit must be 1..100")
+    counts = {"active": 0, "retained": 0, "removed": 0, "failed": 0}
+    rows = database.list_worktree_checkouts(
+        {"creating", "active", "retained", "removing"}
+    )
+    pending = database.list_pending_git_worktree_tasks(limit)
+    if not rows and not pending:
+        scheduled = database.schedule_pending_tasks()
+        return {**counts, "scheduled": len(scheduled)}
+    initialize_workspace_state()
+    for row in rows:
+        task_id, state = row["task_id"], row["state"]
+        if state == "active" and row.get("task_status") != "open":
+            database.transition_worktree_checkout(task_id, "retained")
+            counts["retained"] += 1
+            continue
+        if state == "retained" and row.get("task_status") == "open":
+            try:
+                root, _, _ = _stored_checkout_identity(row)
+                inspect_git_worktree(root, STATE_ROOT, task_id)
+                database.transition_worktree_checkout(task_id, "active")
+                counts["active"] += 1
+            except WorkspaceError:
+                logger.warning("Retained worktree cannot reactivate: task=%s", task_id)
+            continue
+        if state not in {"creating", "removing"}:
+            continue
+        try:
+            root, branch, _ = _stored_checkout_identity(row)
+            if state == "creating":
+                if row.get("task_status") != "open" or row.get("workspace_archived_at"):
+                    raise WorkspaceError("workspace_unavailable")
+                resume_git_worktree(root, STATE_ROOT, task_id, branch, row["base_commit"])
+                database.transition_worktree_checkout(task_id, "active")
+                counts["active"] += 1
+            else:
+                resume_remove_git_worktree(root, STATE_ROOT, task_id)
+                database.transition_worktree_checkout(task_id, "removed")
+                counts["removed"] += 1
+        except WorkspaceError as exc:
+            database.transition_worktree_checkout(task_id, "failed", error_code=exc.code)
+            counts["failed"] += 1
+
+    for task in pending:
+        try:
+            plan = plan_git_worktree(task["workspace_root_path"], STATE_ROOT, task["id"])
+            row = database.create_worktree_checkout(
+                task["id"], plan["checkout_path"], plan["branch"], plan["head"]
+            )
+            resume_git_worktree(task["workspace_root_path"], STATE_ROOT, task["id"],
+                                row["branch"], row["base_commit"])
+            database.transition_worktree_checkout(task["id"], "active")
+            counts["active"] += 1
+        except WorkspaceError as exc:
+            row = database.get_worktree_checkout(task["id"])
+            if row and row["state"] == "creating":
+                database.transition_worktree_checkout(
+                    task["id"], "failed", error_code=exc.code
+                )
+                counts["failed"] += 1
+            else:
+                logger.warning("Cannot plan Git worktree: task=%s code=%s",
+                               task["id"], exc.code)
+    scheduled = database.schedule_pending_tasks()
+    return {**counts, "scheduled": len(scheduled)}
 
 
 def _task_checkout(database, task_id: str, allowed_states: frozenset[str]):
@@ -479,7 +626,7 @@ def cleanup_task_workspace(database, task_id: str) -> dict:
     # in the same write transaction before changing state to removing.
     database.transition_worktree_checkout(task_id, "removing")
     try:
-        result = remove_git_worktree(root, STATE_ROOT, task_id, has_active_runs=False)
+        result = resume_remove_git_worktree(root, STATE_ROOT, task_id)
     except WorkspaceError as exc:
         database.transition_worktree_checkout(task_id, "failed", error_code=exc.code)
         raise
