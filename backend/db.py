@@ -1967,7 +1967,7 @@ class Database:
         return scheduled
 
     @staticmethod
-    def _prepare_workspace_run_tx(conn, task):
+    def _prepare_workspace_run_tx(conn, task, *, retry=False):
         """Atomically reserve the task's executable workspace, if it is ready."""
         if task["workspace_id"] is None:
             return True
@@ -1982,10 +1982,28 @@ class Database:
         if workspace["max_mode"] != "read_write":
             return False
         if workspace["kind"] == "git":
-            return conn.execute("""
-                SELECT 1 FROM worktree_checkouts
-                WHERE task_id=? AND workspace_id=? AND state='active'
-            """, (task["id"], workspace["id"])).fetchone() is not None
+            checkout = conn.execute("""
+                SELECT * FROM worktree_checkouts
+                WHERE task_id=? AND workspace_id=?
+            """, (task["id"], workspace["id"])).fetchone()
+            if checkout and checkout["state"] == "active":
+                return True
+            if not retry or not checkout or checkout["state"] != "retained":
+                return False
+            from backend.workspace import (STATE_ROOT, WorkspaceError,
+                                           _stored_checkout_identity,
+                                           inspect_git_worktree)
+            try:
+                root, _, _ = _stored_checkout_identity({
+                    **dict(checkout), "workspace_root_path": workspace["root_path"]})
+                inspect_git_worktree(root, STATE_ROOT, task["id"])
+            except WorkspaceError:
+                return False
+            conn.execute("""
+                UPDATE worktree_checkouts SET state='active',updated_at=?
+                WHERE task_id=? AND state='retained'
+            """, (_utc_now(), task["id"]))
+            return True
         lease = conn.execute(
             "SELECT task_id FROM workspace_writer_leases WHERE workspace_id=?",
             (workspace["id"],),
@@ -2420,7 +2438,7 @@ class Database:
                 UPDATE tasks SET status='open',finished_at=NULL,result_json=NULL,
                     updated_at=? WHERE id=?
             """, (_utc_now(), task["id"]))
-        if not self._prepare_workspace_run_tx(conn, task):
+        if not self._prepare_workspace_run_tx(conn, task, retry=retry):
             raise WorkspaceUnavailable("Task Workspace 写资源尚未就绪")
         grants = self._effective_grants_tx(conn, task)
         if config_snapshot is None or tool_snapshot is None:
@@ -2929,6 +2947,16 @@ class Database:
                         raise ResourceNotFound("只能向直属父 Agent 报告")
                     if arguments.get("related_task_id", run["task_id"]) != run["task_id"]:
                         raise AgentHierarchyError("消息 Task 不属于发方 Run")
+                    if kind == "result":
+                        validated = self._validated_result(content)
+                        for ref in validated["artifacts"]:
+                            if not conn.execute("""
+                                SELECT 1 FROM artifacts
+                                WHERE id=? AND task_id=? AND run_id=? AND workspace_id=?
+                                    AND kind=?
+                            """, (ref["artifact_id"], task["id"], run_id,
+                                  task["workspace_id"], ref["kind"])).fetchone():
+                                raise AgentHierarchyError("结果 Artifact 不属于当前 Run")
                     parent_run_id = task["creator_run_id"]
                     message_id = self._insert_message_tx(
                         conn, recipient["id"], "user", content,
@@ -2939,7 +2967,6 @@ class Database:
                     if kind == "question":
                         status, wait_reason = "waiting", "input"
                     elif kind == "result":
-                        validated = self._validated_result(content)
                         status = "completed"
                         conn.execute("""
                             UPDATE tasks SET status='completed',result_json=?,

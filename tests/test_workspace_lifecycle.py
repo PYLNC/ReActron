@@ -7,12 +7,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from backend.db import Database
+from backend.db import Database, InvalidRunTransition, WorkspaceUnavailable
 from backend.workspace import (
     cleanup_task_workspace,
     coordinate_git_worktrees,
     initialize_workspace_state,
     plan_git_worktree,
+    WorkspaceError,
 )
 
 
@@ -120,6 +121,51 @@ class GitLifecycleTest(unittest.TestCase):
             self.assertEqual((failed_row["state"], failed_row["error_code"]),
                              ("failed", "git_failed"))
             self.assertFalse(Path(failed_plan["checkout_path"]).exists())
+
+    def test_failed_and_cancelled_git_tasks_retry_in_their_retained_checkout(self):
+        with patch("backend.workspace.STATE_ROOT", self.state):
+            for terminal in ("failed", "cancelled"):
+                with self.subTest(terminal=terminal):
+                    task = self._task(terminal)
+                    coordinate_git_worktrees(self.database)
+                    checkout = self.database.get_worktree_checkout(task["id"])
+                    checkout_path = Path(checkout["path"])
+                    (checkout_path / "note.txt").write_text(
+                        f"{terminal}-dirty\n", encoding="utf-8")
+                    run, _ = self.database.create_run(task["id"], f"{terminal}-first")
+                    running = self.database.claim_next_run("retry-test", 120)
+                    self.assertEqual(running["id"], run["id"])
+                    self.database.transition_run(
+                        run["id"], running["version"], terminal, f"run.{terminal}",
+                        {}, lease_owner="retry-test", lease_epoch=running["lease_epoch"])
+                    self.assertEqual(self.database.get_worktree_checkout(task["id"])["state"],
+                                     "retained")
+                    with self.assertRaises(InvalidRunTransition):
+                        self.database.create_run(task["id"], f"{terminal}-ordinary")
+                    with patch("backend.workspace.inspect_git_worktree",
+                               side_effect=WorkspaceError("worktree_mismatch")):
+                        with self.assertRaises(WorkspaceUnavailable):
+                            self.database.create_run(
+                                task["id"], f"{terminal}-blocked", {"retry": True})
+                    self.assertEqual(self.database.get_task(task["id"])["status"], terminal)
+                    self.assertEqual(self.database.get_worktree_checkout(task["id"])["state"],
+                                     "retained")
+                    retried, created = self.database.create_run(
+                        task["id"], f"{terminal}-retry", {"retry": True})
+                    self.assertTrue(created)
+                    self.assertEqual(retried["attempt"], 2)
+                    self.assertEqual(self.database.get_task(task["id"])["status"], "open")
+                    self.assertEqual(self.database.get_worktree_checkout(task["id"])["state"],
+                                     "active")
+                    self.assertEqual((checkout_path / "note.txt").read_text(encoding="utf-8"),
+                                     f"{terminal}-dirty\n")
+                    self.assertEqual((self.repository / "note.txt").read_text(encoding="utf-8"),
+                                     "committed\n")
+                    claimed = self.database.claim_next_run("retry-test", 120)
+                    self.assertEqual(claimed["id"], retried["id"])
+                    self.database.transition_run(
+                        claimed["id"], claimed["version"], "completed", "run.completed", {},
+                        lease_owner="retry-test", lease_epoch=claimed["lease_epoch"])
 
 
 if __name__ == "__main__":

@@ -691,6 +691,86 @@ class P2AgentSchemaTest(unittest.TestCase):
                          ("result", parent_run["id"]))
         self.assertEqual(self.db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
 
+    def test_result_artifacts_belong_to_the_exact_task_run_and_workspace(self):
+        root = self.db.create_supervisor()
+        worker = self.db.create_worker(root["id"], "worker")
+        workspace_root = Path(self.tmp.name) / "workspace"
+        workspace_root.mkdir()
+        workspace = self.db.create_workspace(
+            "artifacts", str(workspace_root), "directory", "read_only")
+        parent_task = self.db.create_task(
+            root["id"], "parent", workspace_id=workspace["id"],
+            workspace_mode="read_only")
+        parent, _ = self.db.create_run(parent_task["id"], "parent")
+        delegate = self._call("delegate", "delegate_task", {
+            "assignee_agent_id": worker["id"], "goal": "child", "acceptance": []})
+        parent = self._control_run(parent, [delegate])
+        parent, tool_message_id = self._apply_control(parent, delegate)
+        child_task_id = json.loads(self.db.get_message(tool_message_id)["content"])["task_id"]
+        original = self.db.get_run(self.db.get_latest_run_id(child_task_id))
+        self.db.transition_run(
+            parent["id"], parent["version"], "completed", "run.completed", {},
+            lease_owner="p2-test", lease_epoch=parent["lease_epoch"])
+
+        def artifact(run_id, name):
+            return self.db.register_artifact(
+                run_id, "text", name, f"artifacts/{name}", "a" * 64, 1)
+
+        cross_task = artifact(parent["id"], "cross-task.txt")
+        cross_run = artifact(original["id"], "cross-run.txt")
+        first = self.db.claim_next_run("p2-test", 120)
+        self.assertEqual(first["id"], original["id"])
+        self.db.transition_run(
+            first["id"], first["version"], "failed", "run.failed", {},
+            lease_owner="p2-test", lease_epoch=first["lease_epoch"])
+
+        invalid_ids = ("missing-artifact", cross_task["id"], cross_run["id"])
+        for index, artifact_id in enumerate(invalid_ids):
+            with self.subTest(artifact_id=artifact_id):
+                run, _ = self.db.create_run(
+                    child_task_id, f"retry-{index}", {"retry": True})
+                result = {"summary": "done", "acceptance_results": [],
+                          "artifacts": [{"artifact_id": artifact_id, "kind": "text"}],
+                          "evidence": [], "followups": []}
+                call = self._call(f"result-{index}", "send_agent_message", {
+                    "to_agent_id": root["id"], "kind": "result",
+                    "content": json.dumps(result)})
+                running = self._control_run(run, [call])
+                started = self.db.start_tool_call(
+                    running["id"], running["version"], "p2-test",
+                    running["lease_epoch"], call["id"], "send_agent_message",
+                    "effectful", "a" * 64, 8192)
+                before_event = self.db.get_last_event_id(started["id"])
+                before_messages = len(self.db.list_agent_messages(root["id"]))
+                before_parent_event = self.db.get_last_event_id(parent["id"])
+                with self.assertRaises(AgentHierarchyError):
+                    self.db.apply_control_tool(
+                        started["id"], started["version"], "p2-test",
+                        started["lease_epoch"], call["id"],
+                        "send_agent_message", call["function"]["arguments"])
+                self.assertEqual(self.db.get_last_event_id(started["id"]), before_event)
+                self.assertEqual(self.db.get_run(started["id"])["status"], "running")
+                self.assertEqual(self.db.get_task(child_task_id)["status"], "open")
+                self.assertEqual(len(self.db.list_agent_messages(root["id"])),
+                                 before_messages)
+                self.assertEqual(self.db.get_last_event_id(parent["id"]),
+                                 before_parent_event)
+                self.db.transition_run(
+                    started["id"], started["version"], "failed", "run.failed", {},
+                    lease_owner="p2-test", lease_epoch=started["lease_epoch"])
+
+        valid_run, _ = self.db.create_run(child_task_id, "retry-valid", {"retry": True})
+        valid = artifact(valid_run["id"], "valid.txt")
+        result = {"summary": "done", "acceptance_results": [],
+                  "artifacts": [{"artifact_id": valid["id"], "kind": "text"}],
+                  "evidence": [], "followups": []}
+        call = self._call("result-valid", "send_agent_message", {
+            "to_agent_id": root["id"], "kind": "result", "content": json.dumps(result)})
+        running = self._control_run(valid_run, [call])
+        completed, _ = self._apply_control(running, call)
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(self.db.get_task_result(child_task_id), result)
+
     def test_cross_tree_target_and_forged_sender_have_no_message(self):
         root = self.db.create_supervisor()
         worker = self.db.create_worker(root["id"], "worker")
