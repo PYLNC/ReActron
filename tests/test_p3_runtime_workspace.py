@@ -1,5 +1,6 @@
 """Minimal end-to-end checks for trusted Runner workspace wiring."""
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -163,6 +164,59 @@ class RunnerWorkspaceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(note.read_text(encoding="utf-8"), "after")
         self.assertEqual(sum(event["type"] == "tool.started"
                              for event in self.db.list_events(run["id"])), 1)
+
+    async def test_close_then_start_invalidates_pending_approval(self):
+        workspace_root = self.root / "restart-write"
+        workspace_root.mkdir()
+        note = workspace_root / "note.txt"
+        note.write_text("before", encoding="utf-8")
+        workspace = self.db.create_workspace(
+            "restart", str(workspace_root), "directory", "read_write")
+        task = self.db.create_task(
+            self.agent["id"], "write", workspace_id=workspace["id"],
+            workspace_mode="read_write")
+        run, _ = self.db.create_run(
+            task["id"], "restart", config_snapshot={"model": "fake", "max_rounds": 2})
+
+        def model_factory(*_):
+            async def step(*_args, **_kwargs):
+                return {"content": None, "tool_calls": [
+                    _call("write", "workspace_write_text",
+                          {"path": "note.txt", "content": "after"}),
+                ]}
+            return step
+
+        runner = TaskRunner(self.db, model_factory=model_factory,
+                            provider_config=self.provider)
+        await runner.start()
+        try:
+            first_nonce = runner.approval_nonce
+            await runner.start()  # Idempotent while the loop is active.
+            self.assertEqual(runner.approval_nonce, first_nonce)
+            for _ in range(100):
+                if self.db.get_run(run["id"])["status"] == "waiting":
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                self.fail("Runner did not request write approval")
+            self.assertEqual(len(self.db.list_workspace_write_approvals(
+                self.agent["id"], first_nonce)), 1)
+        finally:
+            await runner.close()
+        self.assertIsNone(self.db._query_one(
+            "SELECT 1 FROM runs WHERE status='running' AND lease_owner=?",
+            (first_nonce,)))
+
+        await runner.start()
+        try:
+            self.assertNotEqual(runner.approval_nonce, first_nonce)
+            self.assertEqual(self.db.get_run(run["id"])["status"], "failed")
+            self.assertEqual(self.db.get_task(task["id"])["status"], "failed")
+            self.assertEqual(note.read_text(encoding="utf-8"), "before")
+            self.assertFalse(any(event["type"] == "tool.started"
+                                 for event in self.db.list_events(run["id"])))
+        finally:
+            await runner.close()
 
 
 if __name__ == "__main__":

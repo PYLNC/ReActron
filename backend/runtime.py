@@ -107,6 +107,7 @@ class TaskRunner:
     async def start(self):
         if self._task and not self._task.done():
             return
+        self._owner = f"runner-{uuid.uuid4()}"
         self.database.reconcile_workspace_write_approvals(self.approval_nonce)
         self.database.recover_expired_leases()
         await self._coordinate_workspaces(force=True)
