@@ -1324,5 +1324,118 @@ class P3WorkspaceStorageTest(unittest.TestCase):
                              (task["id"],))
 
 
+class P4WorkspaceWriteApprovalTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Database(Path(self.tmp.name) / "approval.db")
+        self.addCleanup(self.db.close)
+        self.root = self.db.create_supervisor()
+        directory = Path(self.tmp.name) / "project"
+        directory.mkdir()
+        workspace = self.db.create_workspace(
+            "project", str(directory), "directory", "read_write")
+        self.task = self.db.create_task(
+            self.root["id"], "edit", workspace_id=workspace["id"],
+            workspace_mode="read_write")
+        run, _ = self.db.create_run(
+            self.task["id"], "edit", config_snapshot={"v": 1},
+            tool_snapshot={"v": 1, "specs": {}, "grants": ["filesystem.write"]})
+        run = self.db.claim_next_run("p4-test", 120)
+        self.assertEqual(run["task_id"], self.task["id"])
+        call = {"id": "write-1", "type": "function", "function": {
+            "name": "workspace_write_text",
+            "arguments": json.dumps({"path": "a.txt", "content": "approved text"}),
+        }}
+        self.run, _ = self.db.transition_run(
+            run["id"], run["version"], "running", "model.completed",
+            {"round": 1, "tool_count": 1},
+            checkpoint={"v": 1, "phase": "tool_pending", "round": 1,
+                        "assistant_message_id": None, "next_tool_index": 0},
+            message={"role": "assistant", "content": None, "tool_calls": [call]},
+            lease_owner="p4-test", lease_epoch=run["lease_epoch"])
+        self.run, self.approval = self.db.request_workspace_write_approval(
+            self.run["id"], self.run["version"], "p4-test",
+            self.run["lease_epoch"], "write-1", "boot-a")
+
+    def test_approved_write_is_exactly_bound_and_started_once(self):
+        self.assertEqual((self.run["status"], self.run["wait_reason"]),
+                         ("waiting", "approval"))
+        self.assertIsNone(self.db._query_one(
+            "SELECT 1 FROM workspace_writer_leases WHERE task_id=?",
+            (self.task["id"],)))
+        self.assertEqual(len(self.db.list_workspace_write_approvals(
+            self.root["id"], "boot-a")), 1)
+        with self.assertRaises(InvalidRunTransition):
+            self.db.decide_approval(self.approval["id"], "approve")
+        with self.assertRaises(InvalidRunTransition):
+            self.db.create_approval(self.run["id"], "write-1", "pre_execution",
+                                    "a" * 64, {"tool_name": "workspace_write_text"},
+                                    self.approval["expires_at"])
+        decided = self.db.decide_workspace_write_approval(
+            self.approval["id"], self.root["id"], "boot-a", "approve")
+        self.assertEqual(decided["status"], "resolved")
+        running = self.db.claim_next_run("p4-test", 120)
+        self.assertEqual(running["id"], self.run["id"])
+        for wrong_hash, wrong_effect, wrong_nonce in (
+                ("0" * 64, "effectful", "boot-a"),
+                (self.approval["action_hash"], "read_only", "boot-a"),
+                (self.approval["action_hash"], "effectful", "boot-b")):
+            with self.assertRaises(InvalidRunTransition):
+                self.db.start_tool_call(
+                    running["id"], running["version"], "p4-test",
+                    running["lease_epoch"], "write-1", "workspace_write_text",
+                    wrong_effect, wrong_hash, boot_nonce=wrong_nonce)
+        started = self.db.start_tool_call(
+            running["id"], running["version"], "p4-test", running["lease_epoch"],
+            "write-1", "workspace_write_text", "effectful",
+            self.approval["action_hash"], boot_nonce="boot-a")
+        self.assertEqual(started["status"], "running")
+        self.assertIsNone(self.db.get_workspace_write_approval(
+            started["id"], "write-1", "boot-a"))
+        with self.assertRaises(InvalidRunTransition):
+            self.db.start_tool_call(
+                started["id"], started["version"], "p4-test",
+                started["lease_epoch"], "write-1", "workspace_write_text",
+                "effectful", self.approval["action_hash"], boot_nonce="boot-a")
+        self.assertEqual(self.db.reconcile_workspace_write_approvals(
+            "boot-b", now="9999-01-01T00:00:00.000Z"), [])
+        self.assertEqual(self.db.get_run(started["id"])["status"], "running")
+
+    def test_old_boot_fails_approved_but_unstarted_write(self):
+        self.db.decide_workspace_write_approval(
+            self.approval["id"], self.root["id"], "boot-a", "approve")
+        before_started = self.db._query_one(
+            "SELECT COUNT(*) AS n FROM events WHERE run_id=? AND type='run.started'",
+            (self.run["id"],))["n"]
+        self.assertEqual(self.db.reconcile_workspace_write_approvals("boot-b"),
+                         [self.approval["id"]])
+        self.assertEqual(self.db.reconcile_workspace_write_approvals("boot-b"), [])
+        self.assertEqual(self.db.get_run(self.run["id"])["status"], "failed")
+        self.assertEqual(self.db.get_task(self.task["id"])["status"], "failed")
+        self.assertEqual(self.db.get_approval(self.approval["id"])["status"], "expired")
+        self.assertEqual(self.db._query_one(
+            "SELECT COUNT(*) AS n FROM events WHERE run_id=? AND type='tool.started'",
+            (self.run["id"],))["n"], 0)
+        self.assertEqual(self.db._query_one(
+            "SELECT COUNT(*) AS n FROM events WHERE run_id=? AND type='run.started'",
+            (self.run["id"],))["n"], before_started)
+        self.assertEqual(self.db._query_one(
+            "SELECT COUNT(*) AS n FROM events WHERE run_id=? AND type='run.failed'",
+            (self.run["id"],))["n"], 1)
+        self.assertIsNone(self.db._query_one(
+            "SELECT 1 FROM workspace_writer_leases WHERE task_id=?",
+            (self.task["id"],)))
+
+    def test_expired_pending_write_fails_without_retry(self):
+        self.assertEqual(self.db.reconcile_workspace_write_approvals(
+            "boot-a", now="9999-01-01T00:00:00.000Z"), [self.approval["id"]])
+        failed = self.db.get_run(self.run["id"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(json.loads(failed["error_json"])["code"],
+                         "workspace_write_approval_expired")
+        self.assertEqual(self.db.get_approval(self.approval["id"])["status"], "expired")
+
+
 if __name__ == "__main__":
     unittest.main()

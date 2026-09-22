@@ -2179,6 +2179,84 @@ class Database:
                     "effective_root": effective_root, "mode": row["workspace_mode"]}
 
     @staticmethod
+    def _workspace_write_binding_tx(conn, run, call_id, boot_nonce, *, require_lease):
+        """Reconstruct the proposed write from durable model output, never caller data."""
+        from backend.workspace import MAX_TEXT_BYTES, resolve_workspace_path
+
+        checkpoint = json.loads(run["checkpoint_json"] or "{}")
+        if checkpoint.get("phase") != "tool_pending":
+            raise InvalidRunTransition("Run 不在工具调用检查点")
+        message = conn.execute("SELECT * FROM messages WHERE id=?", (
+            checkpoint.get("assistant_message_id"),)).fetchone()
+        if not message or message["run_id"] != run["id"] or message["role"] != "assistant":
+            raise InvalidRunTransition("缺少已持久化工具调用")
+        calls = json.loads(message["tool_calls_json"] or "[]")
+        index = checkpoint.get("next_tool_index")
+        if not isinstance(index, int) or not 0 <= index < len(calls):
+            raise InvalidRunTransition("工具调用检查点无效")
+        call = calls[index]
+        if call.get("id") != call_id or call.get("function", {}).get("name") != "workspace_write_text":
+            raise InvalidRunTransition("写入调用与检查点不一致")
+        arguments = call["function"]["arguments"]
+        arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+        if not isinstance(arguments, dict) or set(arguments) != {"path", "content"}:
+            raise InvalidRunTransition("写入参数无效")
+        content = arguments["content"]
+        if not isinstance(content, str):
+            raise InvalidRunTransition("写入内容无效")
+        try:
+            data = content.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            raise InvalidRunTransition("写入内容不是 UTF-8") from None
+        if len(data) > MAX_TEXT_BYTES:
+            raise InvalidRunTransition("写入内容超限")
+        task = conn.execute("SELECT * FROM tasks WHERE id=?", (run["task_id"],)).fetchone()
+        workspace = conn.execute("SELECT * FROM workspaces WHERE id=? AND archived_at IS NULL",
+                                 (task["workspace_id"],)).fetchone() if task else None
+        if (not workspace or task["workspace_mode"] != "read_write" or
+                workspace["max_mode"] != "read_write" or
+                "filesystem.write" not in json.loads(run["effective_grant_json"])["grants"]):
+            raise InvalidRunTransition("Run 无 Workspace 写权限")
+        root = workspace["root_path"]
+        if workspace["kind"] == "git":
+            checkout = conn.execute("""
+                SELECT path FROM worktree_checkouts
+                WHERE task_id=? AND workspace_id=? AND state='active'
+            """, (task["id"], workspace["id"])).fetchone()
+            if not checkout:
+                raise WorkspaceUnavailable("写入 worktree 不可用")
+            root = checkout["path"]
+        elif workspace["kind"] == "directory" and require_lease:
+            lease = conn.execute("""
+                SELECT 1 FROM workspace_writer_leases WHERE workspace_id=? AND task_id=?
+            """, (workspace["id"], task["id"])).fetchone()
+            if not lease:
+                raise WorkspaceUnavailable("目录写租约未持有")
+        elif workspace["kind"] != "directory":
+            raise WorkspaceUnavailable("Workspace 类型不支持写入")
+        try:
+            target = resolve_workspace_path(root, arguments["path"], for_write=True)
+        except Exception as exc:
+            from backend.workspace import WorkspaceError
+            if not isinstance(exc, WorkspaceError):
+                raise
+            raise WorkspaceUnavailable(exc.code) from None
+        canonical_target = str(target)
+        arguments_hash = hashlib.sha256(_json({
+            "path": canonical_target, "content": content,
+        }).encode("utf-8")).hexdigest()
+        binding = {"run_id": run["id"], "attempt": run["attempt"],
+                   "call_id": call_id, "workspace_id": workspace["id"],
+                   "canonical_target": canonical_target,
+                   "arguments_hash": arguments_hash, "boot_nonce": boot_nonce}
+        summary = {"tool_name": "workspace_write_text", **binding,
+                   "relative_path": target.relative_to(Path(root)).as_posix(),
+                   "content": content,
+                   "content_sha256": hashlib.sha256(data).hexdigest(),
+                   "content_bytes": len(data)}
+        return hashlib.sha256(_json(binding).encode("utf-8")).hexdigest(), summary
+
+    @staticmethod
     def _validated_result(value):
         if isinstance(value, str):
             if len(value) > 8000:
@@ -3127,7 +3205,8 @@ class Database:
             return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), tool_message_id
 
     def start_tool_call(self, run_id, expected_version, lease_owner, lease_epoch,
-                        call_id, name, effect, action_hash, min_result_bytes=4096):
+                        call_id, name, effect, action_hash, min_result_bytes=4096,
+                        *, boot_nonce=None):
         """Durable pre-invocation marker; budget the uncertain result before side effects."""
         if (not 4096 <= min_result_bytes <= MAX_EVENT_BYTES or
                 not isinstance(call_id, str) or
@@ -3153,6 +3232,24 @@ class Database:
             """, (run_id, call_id)).fetchone()
             if started:
                 raise InvalidRunTransition("tool_call_id 已启动；必须先核实结果")
+            if name == "workspace_write_text":
+                if effect != "effectful" or not isinstance(boot_nonce, str) or not boot_nonce:
+                    raise InvalidRunTransition("写入工具必须绑定本次启动身份及副作用")
+                bound_hash, summary = self._workspace_write_binding_tx(
+                    conn, run, call_id, boot_nonce, require_lease=True)
+                if action_hash != bound_hash:
+                    raise InvalidRunTransition("写入目标或参数已变化")
+                approval = conn.execute("""
+                    SELECT * FROM approvals WHERE run_id=? AND tool_call_id=?
+                        AND kind='pre_execution' AND action_hash=?
+                """, (run_id, call_id, bound_hash)).fetchone()
+                decision = json.loads(approval["decision_json"] or "{}") if approval else {}
+                if (not approval or approval["status"] != "resolved" or
+                        approval["expires_at"] <= _utc_now() or
+                        decision.get("decision") != "approve" or
+                        "consumed_at" in decision or
+                        json.loads(approval["request_summary_json"]) != summary):
+                    raise InvalidRunTransition("写入审批不存在、失效或未批准")
             self._append_event_tx(conn, run_id, "tool.started", {
                 "call_id": call_id, "name": name, "effect": effect,
                 "action_hash": action_hash,
@@ -3162,9 +3259,74 @@ class Database:
             if used + min_result_bytes > MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE:
                 raise EventLimitExceeded("工具结果 Event 空间不足，拒绝调用")
             now = _utc_now()
+            if name == "workspace_write_text":
+                conn.execute("UPDATE approvals SET decision_json=? WHERE id=?", (
+                    _json({"decision": "approve", "consumed_at": now}), approval["id"]))
             conn.execute("UPDATE runs SET version=version+1,updated_at=? WHERE id=?",
                          (now, run_id))
             return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+
+    def request_workspace_write_approval(self, run_id, expected_version, lease_owner,
+                                         lease_epoch, call_id, boot_nonce,
+                                         ttl_seconds=3600):
+        """Freeze an unstarted write and yield its Run without granting execution."""
+        if (not isinstance(boot_nonce, str) or not 1 <= len(boot_nonce) <= 200 or
+                not isinstance(call_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", call_id) or
+                not isinstance(ttl_seconds, int) or not 1 <= ttl_seconds <= 86400):
+            raise ValueError("无效写入审批参数")
+        with self._write() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise ResourceNotFound("Run 不存在")
+            now = _utc_now()
+            if (run["status"] != "running" or run["version"] != expected_version or
+                    run["lease_owner"] != lease_owner or run["lease_epoch"] != lease_epoch or
+                    run["lease_until"] <= now or run["control_requested"]):
+                raise InvalidRunTransition("Run lease/version/control 已变化")
+            if conn.execute("""
+                SELECT 1 FROM events WHERE run_id=? AND type='tool.started'
+                    AND json_extract(payload_json,'$.call_id')=?
+            """, (run_id, call_id)).fetchone():
+                raise InvalidRunTransition("工具已启动，不能请求预执行审批")
+            if conn.execute("""
+                SELECT 1 FROM messages WHERE run_id=? AND role='tool' AND tool_call_id=?
+            """, (run_id, call_id)).fetchone():
+                raise InvalidRunTransition("工具已有结果")
+            if conn.execute("""
+                SELECT 1 FROM approvals WHERE run_id=? AND tool_call_id=?
+                    AND kind='pre_execution'
+                    AND json_extract(request_summary_json,'$.tool_name')='workspace_write_text'
+            """, (run_id, call_id)).fetchone():
+                raise InvalidRunTransition("写入调用已有审批记录")
+            action_hash, summary = self._workspace_write_binding_tx(
+                conn, run, call_id, boot_nonce, require_lease=True)
+            summary_json = _json(summary)
+            # Full 64 KiB UTF-8 content may expand under JSON escaping.
+            if len(summary_json.encode("utf-8")) > 512 * 1024:
+                raise ValueError("审批内容过大")
+            expires_at = (datetime.now(timezone.utc) + timedelta(
+                seconds=ttl_seconds)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            approval_id = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO approvals
+                    (id,run_id,tool_call_id,kind,action_hash,request_summary_json,
+                     status,expires_at,created_at)
+                VALUES (?,?,?,'pre_execution',?,?,'pending',?,?)
+            """, (approval_id, run_id, call_id, action_hash, summary_json,
+                  expires_at, now))
+            conn.execute("""
+                UPDATE runs SET status='waiting',wait_reason='approval',
+                    lease_owner=NULL,lease_until=NULL,control_requested=NULL,
+                    version=version+1,updated_at=? WHERE id=? AND version=?
+            """, (now, run_id, expected_version))
+            self._append_event_tx(conn, run_id, "approval.requested", {
+                "approval_id": approval_id, "call_id": call_id,
+                "kind": "workspace_write_text", "action_hash": action_hash,
+            })
+            # Only an unstarted write can yield its directory writer lease.
+            conn.execute("DELETE FROM workspace_writer_leases WHERE task_id=?", (run["task_id"],))
+            return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), dict(
+                conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone())
 
     def recover_expired_leases(self, now=None):
         """Startup scan pauses, never re-executes an uncertain tool."""
@@ -3240,6 +3402,9 @@ class Database:
             raise ValueError("tool_call_id/action_hash 不能为空")
         if not isinstance(request_summary, dict) or not isinstance(expires_at, str):
             raise ValueError("无效 Approval 请求")
+        if (kind == "pre_execution" and
+                request_summary.get("tool_name") == "workspace_write_text"):
+            raise InvalidRunTransition("Workspace 写入必须使用专用审批入口")
         summary_json = _json(request_summary)
         if len(summary_json.encode()) > MAX_EVENT_BYTES:
             raise ValueError("Approval 摘要过大")
@@ -3267,6 +3432,160 @@ class Database:
     def get_approval(self, approval_id):
         return self._query_one("SELECT * FROM approvals WHERE id=?", (approval_id,))
 
+    def get_workspace_write_approval(self, run_id, call_id, boot_nonce):
+        rows = self._query_all("""
+            SELECT * FROM approvals WHERE run_id=? AND tool_call_id=?
+                AND kind='pre_execution' AND status='resolved' AND expires_at>?
+            ORDER BY decided_at DESC
+        """, (run_id, call_id, _utc_now()))
+        for row in rows:
+            summary = json.loads(row["request_summary_json"])
+            decision = json.loads(row["decision_json"] or "{}")
+            if (summary.get("tool_name") == "workspace_write_text" and
+                    summary.get("boot_nonce") == boot_nonce and
+                    decision.get("decision") == "approve" and
+                    "consumed_at" not in decision):
+                return row
+        return None
+
+    def list_workspace_write_approvals(self, root_agent_id, boot_nonce, limit=50):
+        if not isinstance(boot_nonce, str) or not boot_nonce or not 1 <= limit <= 100:
+            raise ValueError("无效审批查询")
+        with self._lock:
+            root = self._conn.execute("""
+                SELECT id FROM sessions WHERE id=? AND agent_role='supervisor'
+                    AND root_session_id=id AND archived_at IS NULL
+            """, (root_agent_id,)).fetchone()
+            if not root:
+                raise ResourceNotFound("活动根 Supervisor 不存在")
+            rows = self._conn.execute("""
+                SELECT approvals.* FROM approvals
+                JOIN runs ON runs.id=approvals.run_id
+                JOIN sessions ON sessions.id=runs.session_id
+                WHERE approvals.kind='pre_execution' AND approvals.status='pending'
+                    AND approvals.expires_at>? AND sessions.root_session_id=?
+                    AND sessions.archived_at IS NULL
+                    AND runs.status='waiting' AND runs.wait_reason='approval'
+                    AND json_extract(approvals.request_summary_json,'$.tool_name')='workspace_write_text'
+                    AND json_extract(approvals.request_summary_json,'$.boot_nonce')=?
+                ORDER BY approvals.created_at,approvals.id LIMIT ?
+            """, (_utc_now(), root_agent_id, boot_nonce, limit)).fetchall()
+            return [dict(row) for row in rows]
+
+    def _finish_rejected_write_tx(self, conn, run, approval_id, reason, now):
+        if run["status"] == "queued":
+            # The v3 state trigger permits queued -> running -> failed only.
+            # Both updates stay inside this transaction; no worker sees the interim state.
+            conn.execute("""
+                UPDATE runs SET status='running',lease_owner='approval-reconcile',
+                    lease_until=?,version=version+1 WHERE id=? AND status='queued'
+            """, (now, run["id"]))
+        conn.execute("""
+            UPDATE runs SET status='failed',wait_reason=NULL,version=version+1,
+                lease_owner=NULL,lease_until=NULL,control_requested=NULL,
+                error_json=?,finished_at=?,updated_at=?
+            WHERE id=? AND status IN ('queued','running','waiting','paused')
+        """, (_json({"code": reason, "approval_id": approval_id}), now, now, run["id"]))
+        conn.execute("DELETE FROM workspace_writer_leases WHERE task_id=?", (run["task_id"],))
+        self._append_event_tx(conn, run["id"], "run.failed", {
+            "code": reason, "approval_id": approval_id}, f"{run['id']}:run.failed")
+        updated = conn.execute("""
+            UPDATE tasks SET status='failed',finished_at=?,updated_at=?
+            WHERE id=? AND status='open'
+        """, (now, now, run["task_id"]))
+        if updated.rowcount:
+            self._notify_parent_child_terminal_tx(conn, run["task_id"],
+                                                  run["id"], "failed")
+
+    def decide_workspace_write_approval(self, approval_id, root_agent_id, boot_nonce,
+                                        decision, decided_by="local-host"):
+        if decision not in {"approve", "reject"}:
+            raise ValueError("写入审批仅接受 approve/reject")
+        if (not isinstance(boot_nonce, str) or not boot_nonce or
+                not isinstance(decided_by, str) or not decided_by):
+            raise ValueError("无效审批身份")
+        with self._write() as conn:
+            root = conn.execute("""
+                SELECT id FROM sessions WHERE id=? AND agent_role='supervisor'
+                    AND root_session_id=id AND archived_at IS NULL
+            """, (root_agent_id,)).fetchone()
+            row = conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (row["run_id"],)).fetchone() if row else None
+            agent = conn.execute("SELECT * FROM sessions WHERE id=?", (run["session_id"],)).fetchone() if run else None
+            if (not root or not row or not run or not agent or agent["archived_at"] or
+                    agent["root_session_id"] != root_agent_id):
+                raise ResourceNotFound("审批不在活动根树")
+            summary = json.loads(row["request_summary_json"])
+            if row["kind"] != "pre_execution" or summary.get("tool_name") != "workspace_write_text":
+                raise ResourceNotFound("写入审批不存在")
+            now = _utc_now()
+            if (summary.get("boot_nonce") != boot_nonce or row["status"] != "pending" or
+                    row["expires_at"] <= now or run["status"] != "waiting" or
+                    run["wait_reason"] != "approval" or
+                    conn.execute("""
+                        SELECT 1 FROM events WHERE run_id=? AND type='tool.started'
+                            AND json_extract(payload_json,'$.call_id')=?
+                    """, (run["id"], row["tool_call_id"])).fetchone()):
+                raise InvalidRunTransition("写入审批已失效")
+            bound_hash, current = self._workspace_write_binding_tx(
+                conn, run, row["tool_call_id"], boot_nonce, require_lease=False)
+            if bound_hash != row["action_hash"] or current != summary:
+                raise InvalidRunTransition("写入审批内容已变化")
+            conn.execute("""
+                UPDATE approvals SET status='resolved',decided_at=?,decided_by=?,
+                    decision_json=? WHERE id=? AND status='pending'
+            """, (now, decided_by, _json({"decision": decision}), approval_id))
+            if decision == "approve":
+                conn.execute("""
+                    UPDATE runs SET status='queued',wait_reason=NULL,
+                        version=version+1,updated_at=?
+                    WHERE id=? AND status='waiting' AND wait_reason='approval'
+                """, (now, run["id"]))
+                self._append_event_tx(conn, run["id"], "approval.decided", {
+                    "approval_id": approval_id, "decision": decision})
+            else:
+                self._finish_rejected_write_tx(conn, run, approval_id,
+                                               "workspace_write_rejected", now)
+            return dict(conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone())
+
+    def reconcile_workspace_write_approvals(self, boot_nonce, now=None):
+        """Fail stale or expired unstarted writes; never reinterpret an unknown outcome."""
+        if not isinstance(boot_nonce, str) or not boot_nonce:
+            raise ValueError("无效本次启动身份")
+        now = now or _utc_now()
+        expired = []
+        with self._write() as conn:
+            rows = conn.execute("""
+                SELECT approvals.*,runs.status AS run_status,runs.task_id
+                FROM approvals JOIN runs ON runs.id=approvals.run_id
+                WHERE approvals.kind='pre_execution'
+                    AND approvals.status IN ('pending','resolved','expired')
+                    AND json_extract(approvals.request_summary_json,'$.tool_name')='workspace_write_text'
+                    AND runs.status IN ('queued','running','waiting','paused')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM events WHERE events.run_id=approvals.run_id
+                            AND events.type='tool.started'
+                            AND json_extract(events.payload_json,'$.call_id')=approvals.tool_call_id)
+                ORDER BY approvals.created_at,approvals.id
+            """).fetchall()
+            for row in rows:
+                summary = json.loads(row["request_summary_json"])
+                decision = json.loads(row["decision_json"] or "{}")
+                if (row["status"] == "resolved" and decision.get("decision") != "approve"):
+                    continue
+                if (row["status"] != "expired" and row["expires_at"] > now and
+                        summary.get("boot_nonce") == boot_nonce):
+                    continue
+                conn.execute("UPDATE approvals SET status='expired' WHERE id=?", (row["id"],))
+                run = conn.execute("SELECT * FROM runs WHERE id=?", (row["run_id"],)).fetchone()
+                if run["status"] in {"completed", "failed", "cancelled"}:
+                    continue
+                reason = ("workspace_write_approval_expired" if row["expires_at"] <= now
+                          else "workspace_write_approval_stale")
+                self._finish_rejected_write_tx(conn, run, row["id"], reason, now)
+                expired.append(row["id"])
+        return expired
+
     def list_approvals(self, run_id=None, status="pending", limit=50):
         if status not in {"pending", "resolved", "expired", None} or not 1 <= limit <= 100:
             raise ValueError("无效 Approval 查询")
@@ -3289,6 +3608,10 @@ class Database:
             row = conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
             if not row:
                 raise ResourceNotFound("Approval 不存在")
+            if (row["kind"] == "pre_execution" and
+                    json.loads(row["request_summary_json"]).get("tool_name") ==
+                    "workspace_write_text"):
+                raise InvalidRunTransition("Workspace 写入必须使用专用审批入口")
             if decision not in allowed[row["kind"]]:
                 raise ValueError("该 Approval 不接受此 decision")
             decision_json = _json({"decision": decision, "note": note})
@@ -3397,6 +3720,30 @@ class Database:
                 """, (now, now, run_id, old, run["version"]))
                 self._append_event_tx(conn, run_id, "run.cancelled",
                                       {"reason": "user_request"})
+                updated_task = conn.execute("""
+                    UPDATE tasks SET status='cancelled',finished_at=?,updated_at=?
+                    WHERE id=? AND status='open'
+                """, (now, now, run["task_id"]))
+                if updated_task.rowcount:
+                    self._notify_parent_child_terminal_tx(conn, run["task_id"],
+                                                          run_id, "cancelled")
+            elif old == "waiting" and run["wait_reason"] == "approval" and action == "cancel":
+                approval = conn.execute("""
+                    SELECT * FROM approvals WHERE run_id=? AND kind='pre_execution'
+                        AND status='pending'
+                        AND json_extract(request_summary_json,'$.tool_name')='workspace_write_text'
+                    ORDER BY created_at DESC LIMIT 1
+                """, (run_id,)).fetchone()
+                if not approval:
+                    raise InvalidRunTransition("Run 状态不允许此控制动作")
+                now = _utc_now()
+                conn.execute("UPDATE approvals SET status='expired' WHERE id=?", (approval["id"],))
+                conn.execute("""
+                    UPDATE runs SET status='cancelled',wait_reason=NULL,version=version+1,
+                        finished_at=?,updated_at=? WHERE id=? AND version=?
+                """, (now, now, run_id, run["version"]))
+                self._append_event_tx(conn, run_id, "run.cancelled",
+                                      {"reason": "user_request", "approval_id": approval["id"]})
                 updated_task = conn.execute("""
                     UPDATE tasks SET status='cancelled',finished_at=?,updated_at=?
                     WHERE id=? AND status='open'
