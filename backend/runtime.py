@@ -14,7 +14,9 @@ from types import MappingProxyType
 from backend.agent import AgentStep
 from backend.context import build_context
 from backend.db import EventLimitExceeded, InvalidRunTransition, ResourceNotFound, db, _json
-from backend.tool_gateway import ToolOutcome, execute_tool
+from backend.tool_gateway import (ToolOutcome, _started_workspace_write,
+                                  execute_tool, prepare_workspace_write)
+from backend.workspace import WorkspaceError
 
 
 logger = logging.getLogger("agent.runner")
@@ -47,6 +49,10 @@ class TaskRunner:
         self._task = None
         self._closing = False
         self._workspace_checked_at = 0.0
+
+    @property
+    def approval_nonce(self):
+        return self._owner
 
     def _verified_provider(self, run):
         from backend.security import verify_frozen_provider
@@ -94,12 +100,14 @@ class TaskRunner:
             # Workspace handlers receive canonical paths from backend.workspace;
             # never grant legacy/arbitrary path handlers a root.
             workspace_roots=(),
+            workspace_scope=MappingProxyType(scope) if scope else None,
             **self.database.control_scope(run["id"]),
         )
 
     async def start(self):
         if self._task and not self._task.done():
             return
+        self.database.reconcile_workspace_write_approvals(self.approval_nonce)
         self.database.recover_expired_leases()
         await self._coordinate_workspaces(force=True)
         self._closing = False
@@ -135,6 +143,7 @@ class TaskRunner:
                 pass
 
     async def run_once(self):
+        self.database.reconcile_workspace_write_approvals(self.approval_nonce)
         await self._coordinate_workspaces()
         self.database.schedule_pending_tasks()
         run = self.database.claim_next_run(self._owner, lease_seconds=RUN_LEASE_SECONDS)
@@ -371,14 +380,15 @@ class TaskRunner:
         started = self.database.get_tool_start(run["id"], call_id)
         if started and (not spec or spec.origin != "internal"):
             # Crash after the invocation marker: no approval decision is a replay grant.
-            effect = json.loads(started["payload_json"])["effect"]
+            started_data = json.loads(started["payload_json"])
+            effect = started_data["effect"]
             if effect == "effectful":
                 outcome = ToolOutcome(call_id, "outcome_unknown", effect, False,
                                       "工具结果未确认", None, "restart_unknown")
                 expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
                 self.database.record_unknown_outcome(
                     run["id"], run["version"], self._owner, run["lease_epoch"],
-                    outcome, name, action_hash, expires)
+                    outcome, name, started_data["action_hash"], expires)
             else:
                 await self._fail(run, "incomplete_tool_call")
             return self.database.get_run(run["id"])
@@ -386,13 +396,42 @@ class TaskRunner:
             # Startup accounting includes this persisted start; replay reserves it once.
             context.budget.tool_calls = max(0, context.budget.tool_calls - 1)
         effect = "effectful" if spec and spec.effects - {"read_only", "filesystem.read"} else "read_only"
+        prepared_write = None
+        approval = None
+        if name == "workspace_write_text" and not started:
+            try:
+                prepared_write = prepare_workspace_write(
+                    replace(context, call_id=call_id), arguments)
+            except WorkspaceError as exc:
+                return self.database.transition_run(
+                    run["id"], run["version"], "running", "tool.completed",
+                    {"call_id": call_id, "name": name, "status": "error",
+                     "effect": "effectful", "error_code": exc.code},
+                    checkpoint={**checkpoint, "next_tool_index": index + 1},
+                    message={"role": "tool", "tool_call_id": call_id,
+                             "content": f"Tool unavailable: {exc.code}"},
+                    lease_owner=self._owner, lease_epoch=run["lease_epoch"])[0]
+            approval = self.database.get_workspace_write_approval(
+                run["id"], call_id, self.approval_nonce)
+            if approval is None:
+                return self.database.request_workspace_write_approval(
+                    run["id"], run["version"], self._owner, run["lease_epoch"],
+                    call_id, self.approval_nonce)[0]
         cfg = self.provider_config(run)
         context = replace(context, secrets=(cfg.api_key,))
         if not started:
             run = self.database.start_tool_call(
                 run["id"], run["version"], self._owner, run["lease_epoch"],
-                call_id, name, effect, action_hash)
-        outcome = await self.tool_executor(replace(context, call_id=call_id), name, arguments)
+                call_id, name, effect,
+                approval["action_hash"] if approval else action_hash,
+                **({"boot_nonce": self.approval_nonce} if approval else {}))
+        if prepared_write:
+            context = self._trusted_context(run, context)
+        invocation = replace(context, call_id=call_id)
+        outcome = (await self.tool_executor(invocation, name, arguments,
+                                            approved_write=_started_workspace_write(prepared_write))
+                   if prepared_write else
+                   await self.tool_executor(invocation, name, arguments))
         if outcome.call_id != call_id:
             raise ValueError("ToolOutcome call_id mismatch")
         run = self.database.get_run(run["id"])
@@ -404,7 +443,8 @@ class TaskRunner:
             expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
             self.database.record_unknown_outcome(
                 run["id"], run["version"], self._owner, run["lease_epoch"],
-                outcome, name, action_hash, expires)
+                outcome, name, approval["action_hash"] if approval else action_hash,
+                expires)
             return self.database.get_run(run["id"])
         if spec and spec.origin == "internal" and outcome.status == "ok":
             return self.database.apply_control_tool(
@@ -452,3 +492,11 @@ def get_runner(database=db):
     if _runner is None or _runner.database is not database:
         _runner = TaskRunner(database)
     return _runner
+
+
+def get_active_runner(database=db):
+    """Read-only lookup for Host approval routes; never mint a new boot nonce."""
+    runner = _runner
+    return (runner if runner is not None and runner.database is database
+            and runner._task is not None and not runner._task.done()
+            and not runner._closing else None)

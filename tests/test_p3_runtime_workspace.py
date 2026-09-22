@@ -116,7 +116,7 @@ class RunnerWorkspaceTest(unittest.IsolatedAsyncioTestCase):
                          "retained")
         self.assertTrue(checkout.is_dir())
 
-    async def test_write_is_visible_but_fails_closed_without_approval(self):
+    async def test_write_waits_for_host_approval_then_executes_once(self):
         workspace_root = self.root / "writable"
         workspace_root.mkdir()
         note = workspace_root / "note.txt"
@@ -140,15 +140,29 @@ class RunnerWorkspaceTest(unittest.IsolatedAsyncioTestCase):
                     ]}
                 result = next(message["content"] for message in messages
                               if message.get("tool_call_id") == "write")
-                self.assertEqual(result, "Tool unavailable: approval_unavailable")
+                self.assertEqual(json.loads(result), {"path": "note.txt", "bytes": 5})
                 return {"content": "done", "tool_calls": []}
             return step
 
         runner = TaskRunner(self.db, model_factory=model_factory,
                             provider_config=self.provider)
         await runner.run_once()
-        self.assertEqual(self.db.get_run(run["id"])["status"], "completed")
+        waiting = self.db.get_run(run["id"])
+        self.assertEqual((waiting["status"], waiting["wait_reason"]),
+                         ("waiting", "approval"))
+        self.assertFalse(any(event["type"] == "tool.started"
+                             for event in self.db.list_events(run["id"])))
         self.assertEqual(note.read_text(encoding="utf-8"), "before")
+        approvals = self.db.list_workspace_write_approvals(
+            self.agent["id"], runner.approval_nonce)
+        self.assertEqual(len(approvals), 1)
+        self.db.decide_workspace_write_approval(
+            approvals[0]["id"], self.agent["id"], runner.approval_nonce, "approve")
+        await runner.run_once()
+        self.assertEqual(self.db.get_run(run["id"])["status"], "completed")
+        self.assertEqual(note.read_text(encoding="utf-8"), "after")
+        self.assertEqual(sum(event["type"] == "tool.started"
+                             for event in self.db.list_events(run["id"])), 1)
 
 
 if __name__ == "__main__":

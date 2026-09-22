@@ -5,8 +5,11 @@ import hashlib
 import inspect
 import json
 import logging
+import os
+import stat
 import threading
 import time
+from collections.abc import Mapping as MappingABC
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,6 +86,7 @@ class RunContext:
     tool_specs: Mapping[str, ToolSpec] = field(default_factory=lambda: MappingProxyType({}))
     grants: frozenset[str] = frozenset()
     workspace_roots: tuple[Path, ...] = ()
+    workspace_scope: Mapping | None = None
     mcp_tools: frozenset[str] = frozenset()
     budget: ToolBudget = field(default_factory=ToolBudget)
     secrets: tuple[str, ...] = ()
@@ -110,6 +114,64 @@ class ToolOutcome:
     model_text: str
     result_ref: str | None
     error_code: str | None
+
+
+@dataclass(frozen=True)
+class PreparedWorkspaceWrite:
+    root: Path
+    target: Path
+    content_hash: str
+    content_bytes: int
+
+
+_STARTED_WRITE_TOKEN = object()
+
+
+def _started_workspace_write(prepared: PreparedWorkspaceWrite):
+    """Only Runner calls this after the durable start transaction succeeds."""
+    return (_STARTED_WRITE_TOKEN, prepared)
+
+
+def prepare_workspace_write(context: RunContext, arguments: str | dict) -> PreparedWorkspaceWrite:
+    """Pure, trusted-scope preflight; re-run it after a Host decision."""
+    from backend.workspace import (MAX_TEXT_BYTES, WorkspaceError,
+                                   resolve_workspace_path, workspace_tool_specs)
+
+    spec = context.tool_specs.get("workspace_write_text")
+    scope = context.workspace_scope
+    if (not isinstance(scope, MappingABC) or not spec or
+            spec.name != "workspace_write_text" or spec.origin != "builtin" or
+            spec.approval != "always" or spec.effects != {"filesystem.write"} or
+            "filesystem.write" not in context.grants or
+            "workspace_write_text" not in workspace_tool_specs(scope)):
+        raise WorkspaceError("tool_not_granted")
+    try:
+        raw = (arguments.encode("utf-8") if isinstance(arguments, str) else
+               json.dumps(arguments, ensure_ascii=False, separators=(",", ":"),
+                          allow_nan=False).encode("utf-8"))
+        if len(raw) > MAX_ARGUMENT_BYTES:
+            raise WorkspaceError("limit_exceeded")
+        value = json.loads(arguments) if isinstance(arguments, str) else arguments
+        if not isinstance(value, dict):
+            raise WorkspaceError("invalid_arguments")
+        Draft202012Validator(_strict_schema(spec.schema)).validate(value)
+        content = value["content"].encode("utf-8", errors="strict")
+        if len(content) > MAX_TEXT_BYTES:
+            raise WorkspaceError("limit_exceeded")
+        root = Path(scope["effective_root"]).resolve(strict=True)
+        target = resolve_workspace_path(root, value["path"], for_write=True)
+        if os.path.lexists(target) and not stat.S_ISREG(os.lstat(target).st_mode):
+            raise WorkspaceError("not_a_file")
+        content_hash = hashlib.sha256(content).hexdigest()
+        return PreparedWorkspaceWrite(root, target, content_hash, len(content))
+    except WorkspaceError:
+        raise
+    except (UnicodeError, TypeError, ValueError, KeyError):
+        raise WorkspaceError("invalid_arguments") from None
+    except OSError:
+        raise WorkspaceError("path_not_granted") from None
+    except Exception:
+        raise WorkspaceError("invalid_arguments") from None
 
 
 def make_run_context(run_id: str, task_id: str = "", actor_id: str = "local-host") -> RunContext:
@@ -313,7 +375,8 @@ def _outcome(context: RunContext, status: str, effect: str, code: str | None = N
     )
 
 
-async def execute_tool(run_context: RunContext, tool_name: str, arguments: str | dict) -> ToolOutcome:
+async def execute_tool(run_context: RunContext, tool_name: str, arguments: str | dict,
+                       *, approved_write: tuple[object, PreparedWorkspaceWrite] | None = None) -> ToolOutcome:
     """只返回安全摘要；拒绝时不调用 handler，异常正文不外送。"""
     started = time.monotonic()
     effect = "read_only"
@@ -385,16 +448,31 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
     call_hash = hashlib.sha256(str(run_context.call_id).encode("utf-8")).hexdigest()[:16]
-    if spec.approval in {"always", "on_risk"}:
+    prepared_write = None
+    if (spec.approval == "always" and tool_name == "workspace_write_text" and
+            isinstance(approved_write, tuple) and len(approved_write) == 2 and
+            approved_write[0] is _STARTED_WRITE_TOKEN):
+        try:
+            prepared_write = prepare_workspace_write(run_context, arguments)
+        except Exception:
+            return _outcome(run_context, "error", effect, "approval_unavailable")
+        if prepared_write != approved_write[1]:
+            return _outcome(run_context, "error", effect, "approval_unavailable")
+    elif spec.approval in {"always", "on_risk"}:
         logger.info("tool rejected run=%s call_hash=%s name=%s code=approval_unavailable hash=%s",
                     run_context.run_id, call_hash, tool_name, action_hash)
         return _outcome(run_context, "error", effect, "approval_unavailable")
-    if spec.approval != "never":
+    if spec.approval != "never" and prepared_write is None:
         return _outcome(run_context, "error", effect, "approval_unavailable")
 
     async_task = None
     try:
-        if spec.origin == "internal":
+        if prepared_write is not None:
+            from backend.workspace import write_workspace_text
+            result = await asyncio.wait_for(asyncio.to_thread(
+                write_workspace_text, prepared_write.root, prepared_write.target,
+                arguments["content"]), timeout=spec.timeout_seconds)
+        elif spec.origin == "internal":
             result = spec.handler(run_context, tool_name, arguments)
         elif inspect.iscoroutinefunction(spec.handler):
             async_task = asyncio.create_task(spec.handler(**arguments))
@@ -426,4 +504,7 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
     except Exception:
         logger.warning("tool failed run=%s call_hash=%s name=%s hash=%s code=tool_failed",
                        run_context.run_id, call_hash, tool_name, action_hash)
+        if prepared_write is not None:
+            return _outcome(run_context, "outcome_unknown", effect,
+                            "unconfirmed_effect", quiesced=False)
         return _outcome(run_context, "error", effect, "tool_failed")
