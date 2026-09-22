@@ -617,6 +617,17 @@ def _workspace_write_approval_response(row: dict, run: dict) -> dict:
     }
 
 
+def _is_workspace_write_approval(row: dict) -> bool:
+    if row["kind"] == "workspace_write_text":
+        return True
+    if row["kind"] != "pre_execution":
+        return False
+    try:
+        return json.loads(row["request_summary_json"]).get("tool_name") == "workspace_write_text"
+    except (TypeError, ValueError):
+        return True  # Corrupt pre-execution records cannot enter the legacy lane.
+
+
 async def _visible_approval(row: dict):
     run = await asyncio.to_thread(db.get_run, row["run_id"])
     session = (await asyncio.to_thread(db.get_session, run["session_id"])) if run else None
@@ -629,7 +640,7 @@ async def list_approvals(agent_id: str | None = None, status: str = Query("pendi
     rows = await asyncio.to_thread(db.list_approvals, None, status, limit)
     approvals = []
     for row in rows:
-        if row["kind"] == "workspace_write_text":
+        if _is_workspace_write_approval(row):
             continue
         run = await _visible_approval(row)
         if run and (agent_id is None or agent_id == run["session_id"]):
@@ -641,7 +652,7 @@ async def list_approvals(agent_id: str | None = None, status: str = Query("pendi
 async def decide_approval(approval_id: str, payload: ApprovalDecisionRequest,
                           principal=Depends(_require_local_session)):
     row = await asyncio.to_thread(db.get_approval, approval_id)
-    if row and row["kind"] == "workspace_write_text":
+    if row and _is_workspace_write_approval(row):
         return _error_response(404, "not_found", "资源不存在")
     run = await _visible_approval(row) if row else None
     if not run:
