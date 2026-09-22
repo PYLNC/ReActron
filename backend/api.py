@@ -19,6 +19,7 @@ from backend.schemas import (
     AgentListResponse,
     AgentRenameRequest,
     ApprovalDecisionRequest,
+    WorkspaceWriteDecisionRequest,
     ChatRequest,
     BootstrapRequest,
     ConfigResponse,
@@ -83,6 +84,13 @@ def _workspace_service():
     from backend import workspace
 
     return workspace
+
+
+def _workspace_approval_runner():
+    """Read the already-running instance; never mint a nonce during a request."""
+    from backend.runtime import get_active_runner
+
+    return get_active_runner(db)
 
 
 router = APIRouter(prefix="/api", dependencies=[Depends(_require_local_session)])
@@ -593,6 +601,22 @@ def _approval_response(row: dict, run: dict) -> dict:
     }
 
 
+def _workspace_write_approval_response(row: dict, run: dict) -> dict:
+    summary = json.loads(row["request_summary_json"])
+    return {
+        "approval_id": row["id"], "run_id": row["run_id"],
+        "task_id": run["task_id"], "source_agent_id": run["session_id"],
+        "attempt": summary["attempt"], "tool_call_id": row["tool_call_id"],
+        "workspace_id": summary["workspace_id"],
+        "relative_path": summary["relative_path"],
+        "content": summary["content"],
+        "content_sha256": summary["content_sha256"],
+        "content_bytes": summary["content_bytes"],
+        "arguments_hash": summary["arguments_hash"],
+        "expires_at": row["expires_at"], "status": row["status"],
+    }
+
+
 async def _visible_approval(row: dict):
     run = await asyncio.to_thread(db.get_run, row["run_id"])
     session = (await asyncio.to_thread(db.get_session, run["session_id"])) if run else None
@@ -605,6 +629,8 @@ async def list_approvals(agent_id: str | None = None, status: str = Query("pendi
     rows = await asyncio.to_thread(db.list_approvals, None, status, limit)
     approvals = []
     for row in rows:
+        if row["kind"] == "workspace_write_text":
+            continue
         run = await _visible_approval(row)
         if run and (agent_id is None or agent_id == run["session_id"]):
             approvals.append(_approval_response(row, run))
@@ -615,6 +641,8 @@ async def list_approvals(agent_id: str | None = None, status: str = Query("pendi
 async def decide_approval(approval_id: str, payload: ApprovalDecisionRequest,
                           principal=Depends(_require_local_session)):
     row = await asyncio.to_thread(db.get_approval, approval_id)
+    if row and row["kind"] == "workspace_write_text":
+        return _error_response(404, "not_found", "资源不存在")
     run = await _visible_approval(row) if row else None
     if not run:
         return _error_response(404, "not_found", "资源不存在")
@@ -625,6 +653,51 @@ async def decide_approval(approval_id: str, payload: ApprovalDecisionRequest,
         return _repository_error(exc)
     await _runner().approval_decided(approval_id)
     return _approval_response(decided, run)
+
+
+@router.get("/approvals/workspace-writes")
+async def list_workspace_write_approvals(limit: int = Query(50, ge=1, le=100)):
+    root = await asyncio.to_thread(db.get_supervisor)
+    if not root:
+        return _error_response(404, "not_found", "活动 Supervisor 不存在")
+    runner = _workspace_approval_runner()
+    if not runner or not getattr(runner, "approval_nonce", None):
+        return _error_response(503, "runner_unavailable", "Runner 未就绪")
+    try:
+        rows = await asyncio.to_thread(
+            db.list_workspace_write_approvals, root["id"], runner.approval_nonce, limit
+        )
+        approvals = []
+        for row in rows:
+            run = await asyncio.to_thread(db.get_run, row["run_id"])
+            if run:
+                approvals.append(_workspace_write_approval_response(row, run))
+    except Exception as exc:
+        return _repository_error(exc)
+    return {"approvals": approvals}
+
+
+@router.post("/approvals/{approval_id}/workspace-decision")
+async def decide_workspace_write_approval(
+    approval_id: str, payload: WorkspaceWriteDecisionRequest,
+    principal=Depends(_require_local_session),
+):
+    root = await asyncio.to_thread(db.get_supervisor)
+    if not root:
+        return _error_response(404, "not_found", "活动 Supervisor 不存在")
+    runner = _workspace_approval_runner()
+    if not runner or not getattr(runner, "approval_nonce", None):
+        return _error_response(503, "runner_unavailable", "Runner 未就绪")
+    try:
+        decided = await asyncio.to_thread(
+            db.decide_workspace_write_approval, approval_id, root["id"],
+            runner.approval_nonce, payload.decision, decided_by=principal.actor_id,
+        )
+    except Exception as exc:
+        return _repository_error(exc)
+    runner.wake()
+    return {"approval_id": decided["id"], "status": decided["status"],
+            "decision": payload.decision}
 
 
 @router.get("/agents", response_model=AgentListResponse)

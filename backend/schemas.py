@@ -84,6 +84,12 @@ class ApprovalDecisionRequest(BaseModel):
     note: Optional[str] = Field(default=None, max_length=2000)
 
 
+class WorkspaceWriteDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["approve", "reject"]
+
+
 class TaskResponse(BaseModel):
     task_id: str
     agent_id: str

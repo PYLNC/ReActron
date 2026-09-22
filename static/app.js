@@ -1678,6 +1678,54 @@ async function loadApprovals() {
       }
       approvalList.appendChild(item);
     }
+    if (agentTree.find((agent) => agent.agent_id === agentId)?.agent_role !== "supervisor") return;
+    const workspaceData = await apiJson("/api/approvals/workspace-writes");
+    if (agentId !== activeSessionId) return;
+    for (const approval of workspaceData.approvals || []) {
+      const item = document.createElement("li");
+      const label = document.createElement("span");
+      label.textContent = "写入审批 · " + approval.relative_path + " · Worker " +
+        approval.source_agent_id + " · " + approval.content_bytes + " 字节";
+      item.appendChild(label);
+      const expiry = Date.parse(approval.expires_at);
+      const expired = !Number.isFinite(expiry) || expiry <= Date.now() || approval.status !== "pending";
+      const deadline = document.createElement("small");
+      deadline.textContent = expired ? "已过期或不可处理；需创建新任务" :
+        "有效期至 " + new Date(expiry).toLocaleString("zh-CN") + " · SHA-256 " +
+        approval.content_sha256;
+      item.appendChild(deadline);
+      const details = document.createElement("details");
+      const heading = document.createElement("summary");
+      heading.textContent = "查看拟写入内容（" + approval.workspace_id + " / " +
+        approval.task_id + " / Run " + approval.run_id + " / attempt " +
+        approval.attempt + " / call " + approval.tool_call_id + ")";
+      const content = document.createElement("pre");
+      content.textContent = approval.content;
+      details.appendChild(heading);
+      details.appendChild(content);
+      item.appendChild(details);
+      if (!expired) for (const decision of ["approve", "reject"]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = decision === "approve" ? "批准一次" : "拒绝";
+        button.addEventListener("click", async () => {
+          if (!window.confirm((decision === "approve" ? "批准" : "拒绝") +
+              "这次写入？\n" + approval.relative_path + "\nSHA-256 " + approval.content_sha256)) return;
+          for (const control of item.querySelectorAll("button")) control.disabled = true;
+          try {
+            await apiJson("/api/approvals/" + encodeURIComponent(approval.approval_id) +
+              "/workspace-decision", {method: "POST", headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({decision})});
+            await loadApprovals();
+          } catch (err) {
+            appendNote("写入审批失败（可能已过期）: " + err.message);
+            await loadApprovals();
+          }
+        });
+        item.appendChild(button);
+      }
+      approvalList.appendChild(item);
+    }
   } catch (err) {
     appendNote("读取审批失败: " + err.message);
   }

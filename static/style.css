@@ -358,6 +358,8 @@ button {
 .run-bar button, .task-list button, #approvalList button { margin: 2px; }
 .task-list, #approvalList, #eventList { padding-left: 18px; margin: 8px 0; }
 .task-list li, #approvalList li, #eventList li { margin-bottom: 8px; overflow-wrap: anywhere; }
+#approvalList small { display: block; color: var(--secondary); }
+#approvalList pre { max-height: 240px; overflow: auto; white-space: pre-wrap; }
 .task-panel h3 { font-size: 12px; color: var(--secondary); }
 .run-bar button:focus-visible, .task-list button:focus-visible,
 #approvalList button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

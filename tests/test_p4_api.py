@@ -1,0 +1,164 @@
+"""P4 workspace write approval stays in its root-only, one-shot host lane."""
+
+import json
+import shutil
+import subprocess
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.testclient import TestClient
+
+from backend import api
+from backend.app import validation_error_handler
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class WorkspaceWriteApprovalApiTest(unittest.TestCase):
+    def test_root_only_lane_and_old_approval_route_is_closed(self):
+        database = Mock()
+        root = {"id": "root-1", "archived_at": None}
+        database.get_supervisor.return_value = root
+        database.get_session.return_value = root
+        database.get_run.return_value = {
+            "id": "run-1", "task_id": "task-1", "session_id": "worker-1",
+        }
+        approval = {
+            "id": "approval-1", "run_id": "run-1", "tool_call_id": "call-1",
+            "kind": "workspace_write_text", "status": "pending",
+            "expires_at": "9999-01-01T00:00:00.000Z",
+            "request_summary_json": json.dumps({
+                "attempt": 1, "workspace_id": "ws-1", "relative_path": "src/a.py",
+                "content": "print('hello')", "content_sha256": "sha-1",
+                "content_bytes": 14, "arguments_hash": "arguments-1",
+                "boot_nonce": "server-only",
+            }),
+        }
+        database.list_approvals.return_value = [approval]
+        database.get_approval.return_value = approval
+        database.list_workspace_write_approvals.return_value = [approval]
+        database.decide_workspace_write_approval.return_value = {
+            "id": "approval-1", "status": "resolved",
+        }
+        runner = Mock(approval_nonce="nonce-1")
+        app = FastAPI()
+        app.include_router(api.router)
+        app.dependency_overrides[api._require_local_session] = lambda: SimpleNamespace(
+            actor_id="local-host"
+        )
+        app.add_exception_handler(RequestValidationError, validation_error_handler)
+        with patch.object(api, "db", database), patch.object(
+            api, "_workspace_approval_runner", return_value=runner
+        ):
+            client = TestClient(app)
+            legacy_list = client.get("/api/approvals")
+            legacy_decision = client.post("/api/approvals/approval-1/decision",
+                                          json={"decision": "approve"})
+            listed = client.get("/api/approvals/workspace-writes")
+            injected = client.post("/api/approvals/approval-1/workspace-decision",
+                                   json={"decision": "approve", "actor": "worker-1"})
+            invalid = client.post("/api/approvals/approval-1/workspace-decision",
+                                  json={"decision": "explicit_retry"})
+            decided = client.post("/api/approvals/approval-1/workspace-decision",
+                                  json={"decision": "approve"})
+            with patch.object(api, "_workspace_approval_runner", return_value=None):
+                unavailable = client.post("/api/approvals/approval-1/workspace-decision",
+                                          json={"decision": "approve"})
+
+        self.assertEqual((legacy_list.json(), legacy_decision.status_code),
+                         ({"approvals": []}, 404))
+        self.assertEqual((listed.status_code, decided.status_code), (200, 200))
+        self.assertEqual((injected.status_code, invalid.status_code,
+                          unavailable.status_code), (422, 422, 503))
+        visible = listed.json()["approvals"][0]
+        self.assertEqual((visible["source_agent_id"], visible["content"],
+                          visible["expires_at"]),
+                         ("worker-1", "print('hello')", "9999-01-01T00:00:00.000Z"))
+        self.assertNotIn("server-only", listed.text)
+        database.list_workspace_write_approvals.assert_called_once_with(
+            "root-1", "nonce-1", 50
+        )
+        database.decide_workspace_write_approval.assert_called_once_with(
+            "approval-1", "root-1", "nonce-1", "approve", decided_by="local-host"
+        )
+        database.decide_approval.assert_not_called()
+        runner.wake.assert_called_once_with()
+
+
+class WorkspaceWriteApprovalUiTest(unittest.TestCase):
+    def test_root_inbox_content_expiry_and_one_shot_decision(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is unavailable")
+        script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+const nodes = new Map();
+let confirmation = 0, posted = null, writes = 0, decided = false;
+function node() {
+  return {children: [], value: '', textContent: '', hidden: false, disabled: false,
+    style: {}, listeners: {}, classList: {add() {}, remove() {}, toggle() {}, contains() {return false;}},
+    addEventListener(name, callback) {this.listeners[name] = callback;},
+    appendChild(child) {this.children.push(child); return child;},
+    replaceChildren() {this.children = [];},
+    querySelectorAll(tag) {return this.children.filter((child) => child.tag === tag);}};
+}
+const content = '<script>alert(1)</script>';
+const request = {approval_id:'approval-1', relative_path:'src/a.py', source_agent_id:'worker-1',
+  content_bytes:content.length, content_sha256:'sha-1', content, workspace_id:'ws-1',
+  task_id:'task-1', run_id:'run-1', attempt:1, tool_call_id:'call-1', status:'pending',
+  expires_at:'9999-01-01T00:00:00.000Z'};
+const context = {document: {
+  getElementById(id) {if (!nodes.has(id)) nodes.set(id, node()); return nodes.get(id);},
+  createElement(tag) {const item=node(); item.tag=tag; return item;}, querySelectorAll() {return [];}},
+  window: {confirm() {confirmation++; return true;}, prompt() {return null;}},
+  localStorage: {getItem() {return null;}, setItem() {}, removeItem() {}},
+  fetch: async (url, options) => {
+    if (url.startsWith('/api/approvals?')) return {ok:true, json:async()=>({approvals:[]})};
+    if (url === '/api/approvals/workspace-writes') {
+      writes++;
+      return {ok:true, json:async()=>({approvals:decided ? [] :
+        [request, {...request, approval_id:'expired', expires_at:'2000-01-01T00:00:00.000Z'}]})};
+    }
+    if (url.endsWith('/workspace-decision')) {
+      posted = {url, body:JSON.parse(options.body)}; decided=true;
+      return {ok:true, json:async()=>({status:'resolved'})};
+    }
+    return {ok:false, status:500, json:async()=>({})};
+  }, console: {log() {}}, setTimeout() {}};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+(async () => {
+  vm.runInContext("agentTree=[{agent_id:'root-1',agent_role:'supervisor'}," +
+    "{agent_id:'worker-1',agent_role:'worker'}];activeSessionId='root-1'", context);
+  await vm.runInContext('loadApprovals()', context);
+  const list = nodes.get('approvalList');
+  assert.strictEqual(list.children.length, 2);
+  assert.strictEqual(list.children[0].children[2].children[1].textContent, content);
+  assert.strictEqual(list.children[0].children.length, 5);
+  assert.strictEqual(list.children[1].children.length, 3);
+  assert(list.children[1].children[1].textContent.includes('已过期'));
+  await list.children[0].children[3].listeners.click();
+  assert.deepStrictEqual(posted, {url:'/api/approvals/approval-1/workspace-decision',
+    body:{decision:'approve'}});
+  assert.strictEqual(confirmation, 1);
+  assert.strictEqual(list.children.length, 0);
+  vm.runInContext("activeSessionId='worker-1'", context);
+  await vm.runInContext('loadApprovals()', context);
+  assert.strictEqual(writes, 2);
+})().catch((error) => {process.stderr.write(String(error)); process.exitCode=1;});
+"""
+        result = subprocess.run(
+            ["node", "-e", script, str(ROOT / "static" / "app.js")],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
