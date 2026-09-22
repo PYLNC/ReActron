@@ -41,6 +41,12 @@ class WorkspacePathTest(unittest.TestCase):
             self.assertTrue((state / "worktrees").is_dir())
             self.assertTrue((state / "artifacts").is_dir())
 
+            missing_parent_state = Path(temporary) / "new-data" / "state"
+            with patch("backend.workspace.STATE_ROOT", missing_parent_state):
+                initialize_workspace_state()
+            self.assertTrue((missing_parent_state / "worktrees").is_dir())
+            self.assertTrue((missing_parent_state / "artifacts").is_dir())
+
             (state / "artifacts").rmdir()
             (state / "artifacts").write_text("not a directory", encoding="utf-8")
             with patch("backend.workspace.STATE_ROOT", state), \

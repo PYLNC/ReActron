@@ -80,6 +80,8 @@ def _checked_root(raw_root) -> Path:
 def initialize_workspace_state() -> None:
     """Create the two fixed host-owned state directories, never a supplied path."""
     try:
+        _checked_root(STATE_ROOT.parent.parent)
+        STATE_ROOT.parent.mkdir(exist_ok=True)
         _checked_root(STATE_ROOT.parent)
         STATE_ROOT.mkdir(exist_ok=True)
         state = _checked_root(STATE_ROOT)
