@@ -86,12 +86,15 @@ class AppLifespanTest(unittest.TestCase):
         from backend import db as db_module
         from backend import runtime as runtime_module
 
+        startup_order = []
+
         class FakeDatabase:
             initialized = False
             closed = False
 
             def initialize(self):
                 self.initialized = True
+                startup_order.append("database")
 
             def close(self):
                 self.closed = True
@@ -101,15 +104,24 @@ class AppLifespanTest(unittest.TestCase):
 
             async def refresh_registry(self):
                 self.assert_database_ready()
-                assert fake_runner.started
+                assert not fake_runner.started
+                startup_order.append("mcp")
                 self.refreshed = True
                 return {"server_count": 0, "tool_count": 0, "errors": []}
+
+            def clear_registry(self):
+                raise AssertionError("successful refresh must not clear registry")
 
             def assert_database_ready(self):
                 assert fake_db.initialized
 
+        class OrderedRunner(_FakeRunner):
+            async def start(self):
+                startup_order.append("runner")
+                await super().start()
+
         fake_db = FakeDatabase()
-        fake_runner = _FakeRunner()
+        fake_runner = OrderedRunner()
         fake_manager = FakeManager()
         with (
             patch.object(db_module, "db", fake_db),
@@ -147,10 +159,60 @@ class AppLifespanTest(unittest.TestCase):
         self.assertNotIn(marker, "\n".join(logs.output))
         validate_secret_key.assert_called_once_with()
         self.assertTrue(fake_manager.refreshed)
+        self.assertEqual(startup_order, ["database", "mcp", "runner"])
         self.assertTrue(fake_db.initialized)
         self.assertTrue(fake_runner.started)
         self.assertTrue(fake_runner.closed)
         self.assertTrue(fake_db.closed)
+
+    def test_failed_mcp_refresh_clears_before_runner_starts(self):
+        from backend import app as app_module
+        from backend import db as db_module
+        from backend import runtime as runtime_module
+
+        order = []
+
+        class FakeDatabase:
+            def initialize(self):
+                order.append("database")
+
+            def close(self):
+                order.append("database.close")
+
+        class FakeManager:
+            async def refresh_registry(self):
+                order.append("mcp.refresh")
+                raise RuntimeError("offline")
+
+            def clear_registry(self):
+                order.append("mcp.clear")
+
+        class FakeRunner(_FakeRunner):
+            async def start(self):
+                order.append("runner")
+                await super().start()
+
+            async def close(self):
+                order.append("runner.close")
+                await super().close()
+
+        fake_db, fake_runner = FakeDatabase(), FakeRunner()
+        with (
+            patch.object(db_module, "db", fake_db),
+            patch.object(runtime_module, "get_runner", return_value=fake_runner, create=True),
+            patch("backend.security.validate_secret_key"),
+            patch("backend.mcp.manager.get_manager", return_value=FakeManager()),
+            patch.dict(sys.modules, {"backend.auth": SimpleNamespace(
+                issue_bootstrap_secret=lambda: "test-secret",
+                require_host_session=lambda request: None,
+            )}),
+            self.assertLogs("agent.app", level="WARNING"),
+            TestClient(app_module.app),
+        ):
+            pass
+
+        self.assertEqual(order, ["database", "mcp.refresh", "mcp.clear", "runner",
+                                 "runner.close", "database.close"])
 
     def test_invalid_secret_fails_before_database_or_mcp_import(self):
         with tempfile.TemporaryDirectory() as temp_dir:

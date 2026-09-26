@@ -14,7 +14,8 @@ from types import MappingProxyType
 from backend.agent import AgentStep
 from backend.context import build_context
 from backend.db import EventLimitExceeded, InvalidRunTransition, ResourceNotFound, db, _json
-from backend.tool_gateway import (ToolOutcome, _started_workspace_write,
+from backend.tool_gateway import (ToolOutcome, _started_mcp_call,
+                                  _started_workspace_write,
                                   execute_tool, prepare_workspace_write)
 from backend.workspace import WorkspaceError
 
@@ -109,6 +110,7 @@ class TaskRunner:
             return
         self._owner = f"runner-{uuid.uuid4()}"
         self.database.reconcile_workspace_write_approvals(self.approval_nonce)
+        self.database.reconcile_mcp_tool_approvals(self.approval_nonce)
         self.database.recover_expired_leases()
         await self._coordinate_workspaces(force=True)
         self._closing = False
@@ -145,6 +147,7 @@ class TaskRunner:
 
     async def run_once(self):
         self.database.reconcile_workspace_write_approvals(self.approval_nonce)
+        self.database.reconcile_mcp_tool_approvals(self.approval_nonce)
         await self._coordinate_workspaces()
         self.database.schedule_pending_tasks()
         run = self.database.claim_next_run(self._owner, lease_seconds=RUN_LEASE_SECONDS)
@@ -284,7 +287,9 @@ class TaskRunner:
                 visible_tools = {
                     name: spec for name, spec in context.tool_specs.items()
                     if spec.effects <= context.grants and
-                    (spec.approval == "never" or name == "workspace_write_text")
+                    (spec.approval == "never" or name == "workspace_write_text" or
+                     (spec.origin.startswith("mcp:") and
+                      spec.effects == {"mcp.write"} and spec.approval == "always"))
                 }
                 result = await asyncio.wait_for(model(
                     messages, run_id=run_id, round_index=round_index,
@@ -398,6 +403,8 @@ class TaskRunner:
             context.budget.tool_calls = max(0, context.budget.tool_calls - 1)
         effect = "effectful" if spec and spec.effects - {"read_only", "filesystem.read"} else "read_only"
         prepared_write = None
+        approved_mcp = None
+        approved_mcp_hash = None
         approval = None
         if name == "workspace_write_text" and not started:
             try:
@@ -418,6 +425,16 @@ class TaskRunner:
                 return self.database.request_workspace_write_approval(
                     run["id"], run["version"], self._owner, run["lease_epoch"],
                     call_id, self.approval_nonce)[0]
+        is_mcp_write = (spec is not None and spec.origin.startswith("mcp:") and
+                        spec.effects == {"mcp.write"} and spec.approval == "always")
+        if is_mcp_write and not started:
+            approval = self.database.get_mcp_tool_approval(
+                run["id"], call_id, self.approval_nonce)
+            if approval is None:
+                return self.database.request_mcp_tool_approval(
+                    run["id"], run["version"], self._owner, run["lease_epoch"],
+                    call_id, self.approval_nonce)[0]
+            approved_mcp_hash = approval["action_hash"]
         cfg = self.provider_config(run)
         context = replace(context, secrets=(cfg.api_key,))
         if not started:
@@ -426,13 +443,20 @@ class TaskRunner:
                 call_id, name, effect,
                 approval["action_hash"] if approval else action_hash,
                 **({"boot_nonce": self.approval_nonce} if approval else {}))
+        if approved_mcp_hash:
+            approved_mcp = _started_mcp_call(name, arguments, spec, approved_mcp_hash)
         if prepared_write:
             context = self._trusted_context(run, context)
         invocation = replace(context, call_id=call_id)
-        outcome = (await self.tool_executor(invocation, name, arguments,
-                                            approved_write=_started_workspace_write(prepared_write))
-                   if prepared_write else
-                   await self.tool_executor(invocation, name, arguments))
+        if prepared_write:
+            outcome = await self.tool_executor(
+                invocation, name, arguments,
+                approved_write=_started_workspace_write(prepared_write))
+        elif approved_mcp:
+            outcome = await self.tool_executor(
+                invocation, name, arguments, approved_mcp=approved_mcp)
+        else:
+            outcome = await self.tool_executor(invocation, name, arguments)
         if outcome.call_id != call_id:
             raise ValueError("ToolOutcome call_id mismatch")
         run = self.database.get_run(run["id"])
@@ -472,6 +496,7 @@ class TaskRunner:
         approval = self.database.get_approval(approval_id)
         if not approval:
             raise ResourceNotFound("Approval 不存在")
+        self.wake()
         return self.database.get_run(approval["run_id"])
 
     async def wait_for_change(self, run_id, after_id, timeout=15):

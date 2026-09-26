@@ -30,6 +30,7 @@ P2_HOST_GRANT_CEILING = frozenset({
     "read_only", "control.delegate_task", "control.send_agent_message",
     "control.get_task_status", "control.wait_for_tasks", "control.cancel_task",
     "control.request_human_approval", "filesystem.read", "filesystem.write",
+    "mcp.write",
 })
 _BUILTIN_POLICY = {
     "get_current_time": ("read_only", (), "never"),
@@ -125,11 +126,32 @@ class PreparedWorkspaceWrite:
 
 
 _STARTED_WRITE_TOKEN = object()
+_STARTED_MCP_TOKEN = object()
 
 
 def _started_workspace_write(prepared: PreparedWorkspaceWrite):
     """Only Runner calls this after the durable start transaction succeeds."""
     return (_STARTED_WRITE_TOKEN, prepared)
+
+
+def _started_mcp_call(name: str, arguments: str | dict, spec: ToolSpec,
+                      action_hash: str):
+    """Only Runner calls this after approval consumption and tool.started commit."""
+    value = json.loads(arguments) if isinstance(arguments, str) else arguments
+    binding = (
+        name,
+        hashlib.sha256(json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")).hexdigest(),
+        spec.origin,
+        hashlib.sha256(json.dumps(
+            spec.schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")).hexdigest(),
+        action_hash,
+    )
+    return (_STARTED_MCP_TOKEN, binding)
 
 
 def prepare_workspace_write(context: RunContext, arguments: str | dict) -> PreparedWorkspaceWrite:
@@ -263,7 +285,7 @@ def make_builtin_run_context(run_id: str, task_id: str = "", actor_id: str = "lo
 
 
 def make_frozen_run_context(run_row: dict) -> RunContext:
-    """只恢复与当前审核内建规格完全一致的 Run 快照能力。"""
+    """只恢复与当前审核规格完全一致的 Run 快照能力。"""
     if not isinstance(run_row, dict):
         return make_run_context("")
     context = make_run_context(run_row.get("id", ""), run_row.get("task_id", ""))
@@ -280,6 +302,11 @@ def make_frozen_run_context(run_row: dict) -> RunContext:
                 or not all(isinstance(grant, str) for grant in grants)):
             return context
         current = {**snapshot_builtin_tools(), **snapshot_internal_tools()}
+        try:
+            from backend.mcp.manager import get_manager
+            current.update(get_manager().snapshot_tool_specs())
+        except Exception:
+            logger.warning("MCP snapshot unavailable while restoring Run")
         allowed = {name: spec for name, spec in current.items() if frozen.get(name) == {
             "schema": spec.schema,
             "effects": sorted(spec.effects),
@@ -294,6 +321,9 @@ def make_frozen_run_context(run_row: dict) -> RunContext:
             task_id=context.task_id,
             tool_specs=MappingProxyType(allowed),
             grants=frozenset(grants) & P2_HOST_GRANT_CEILING,
+            mcp_tools=frozenset(
+                name for name, spec in allowed.items() if spec.origin.startswith("mcp:")
+            ),
         )
     except (KeyError, TypeError, ValueError):
         return context
@@ -376,7 +406,8 @@ def _outcome(context: RunContext, status: str, effect: str, code: str | None = N
 
 
 async def execute_tool(run_context: RunContext, tool_name: str, arguments: str | dict,
-                       *, approved_write: tuple[object, PreparedWorkspaceWrite] | None = None) -> ToolOutcome:
+                       *, approved_write: tuple[object, PreparedWorkspaceWrite] | None = None,
+                       approved_mcp: tuple[object, tuple] | None = None) -> ToolOutcome:
     """只返回安全摘要；拒绝时不调用 handler，异常正文不外送。"""
     started = time.monotonic()
     effect = "read_only"
@@ -403,6 +434,7 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
     if spec.origin == "internal" and spec != snapshot_internal_tools().get(tool_name):
         return _outcome(run_context, "error", effect, "tool_not_granted")
     effect = "read_only" if spec.effects <= {"read_only", "filesystem.read"} else (
+        "effectful" if spec.origin.startswith("mcp:") else
         "idempotent" if spec.idempotent else "effectful"
     )
     try:
@@ -440,6 +472,9 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
     if spec.origin not in {"builtin", "internal"}:
         if not spec.origin.startswith("mcp:") or tool_name not in run_context.mcp_tools:
             return _outcome(run_context, "error", effect, "mcp_not_approved")
+        if not ((spec.effects == {"read_only"} and spec.approval == "never") or
+                (spec.effects == {"mcp.write"} and spec.approval == "always")):
+            return _outcome(run_context, "error", effect, "mcp_not_approved")
     if not run_context.budget.reserve(mcp=spec.origin.startswith("mcp:")):
         return _outcome(run_context, "error", effect, "limit_exceeded")
 
@@ -449,6 +484,7 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
     ).encode("utf-8")).hexdigest()
     call_hash = hashlib.sha256(str(run_context.call_id).encode("utf-8")).hexdigest()[:16]
     prepared_write = None
+    prepared_mcp = None
     if (spec.approval == "always" and tool_name == "workspace_write_text" and
             isinstance(approved_write, tuple) and len(approved_write) == 2 and
             approved_write[0] is _STARTED_WRITE_TOKEN):
@@ -458,11 +494,22 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
             return _outcome(run_context, "error", effect, "approval_unavailable")
         if prepared_write != approved_write[1]:
             return _outcome(run_context, "error", effect, "approval_unavailable")
+    elif (spec.origin.startswith("mcp:") and spec.approval == "always" and
+          isinstance(approved_mcp, tuple) and len(approved_mcp) == 2 and
+          approved_mcp[0] is _STARTED_MCP_TOKEN):
+        try:
+            prepared_mcp = _started_mcp_call(
+                tool_name, arguments, spec, approved_mcp[1][-1]
+            )[1]
+        except Exception:
+            return _outcome(run_context, "error", effect, "approval_unavailable")
+        if prepared_mcp != approved_mcp[1]:
+            return _outcome(run_context, "error", effect, "approval_unavailable")
     elif spec.approval in {"always", "on_risk"}:
         logger.info("tool rejected run=%s call_hash=%s name=%s code=approval_unavailable hash=%s",
                     run_context.run_id, call_hash, tool_name, action_hash)
         return _outcome(run_context, "error", effect, "approval_unavailable")
-    if spec.approval != "never" and prepared_write is None:
+    if spec.approval != "never" and prepared_write is None and prepared_mcp is None:
         return _outcome(run_context, "error", effect, "approval_unavailable")
 
     async_task = None
@@ -504,7 +551,7 @@ async def execute_tool(run_context: RunContext, tool_name: str, arguments: str |
     except Exception:
         logger.warning("tool failed run=%s call_hash=%s name=%s hash=%s code=tool_failed",
                        run_context.run_id, call_hash, tool_name, action_hash)
-        if prepared_write is not None:
+        if prepared_write is not None or prepared_mcp is not None:
             return _outcome(run_context, "outcome_unknown", effect,
                             "unconfirmed_effect", quiesced=False)
         return _outcome(run_context, "error", effect, "tool_failed")

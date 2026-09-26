@@ -63,7 +63,7 @@ _api_router_loaded = False
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """按配置、数据库、Runner、MCP 顺序启动，反序关闭。"""
+    """先冻结 MCP 注册表再启动 Runner，关闭时按相反顺序。"""
     global _api_router_loaded
 
     cfg = load_config()
@@ -87,18 +87,20 @@ async def lifespan(application: FastAPI):
 
     logger.info("应用启动：max_rounds=%d，db=%s", cfg.max_rounds, DB_PATH)
 
-    from backend.runtime import get_runner
+    from backend.mcp.manager import get_manager
+    manager = get_manager()
+    try:
+        await manager.refresh_registry()
+        logger.info("MCP 启动刷新完成")
+    except Exception:
+        # A partial/failed refresh must never leave executable MCP specs visible.
+        manager.clear_registry()
+        logger.warning("MCP 启动刷新失败；本次启动禁用全部 MCP 工具")
 
+    from backend.runtime import get_runner
     runner = get_runner()
     try:
         await runner.start()
-        from backend.mcp.manager import get_manager
-
-        try:
-            await get_manager().refresh_registry()
-            logger.info("MCP 启动刷新完成")
-        except Exception:
-            logger.warning("MCP 启动刷新失败")
         from backend.auth import issue_bootstrap_secret
 
         secret = issue_bootstrap_secret()

@@ -69,6 +69,7 @@ HOST_GRANTS = frozenset({
     "read_only", "control.delegate_task", "control.send_agent_message",
     "control.get_task_status", "control.wait_for_tasks", "control.cancel_task",
     "control.request_human_approval", "filesystem.read", "filesystem.write",
+    "mcp.write",
 })
 
 
@@ -1190,6 +1191,34 @@ class Database:
             )
             return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone())
 
+    def set_agent_mcp_write_capability(self, agent_id, enabled):
+        """Change only future MCP write grants; frozen Runs remain unchanged."""
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled 必须为 bool")
+        with self._write() as conn:
+            agent = conn.execute(
+                "SELECT * FROM sessions WHERE id=? AND archived_at IS NULL", (agent_id,)
+            ).fetchone()
+            if not agent or agent["agent_role"] is None:
+                raise ResourceNotFound("Agent 不存在或已归档")
+            grants = set(json.loads(agent["capabilities_json"])["grants"])
+            grants.discard("mcp.write")
+            if enabled:
+                if agent["agent_role"] == "worker":
+                    parent = conn.execute(
+                        "SELECT capabilities_json FROM sessions WHERE id=?",
+                        (agent["parent_session_id"],),
+                    ).fetchone()
+                    if not parent or "mcp.write" not in json.loads(
+                            parent["capabilities_json"])["grants"]:
+                        raise AgentHierarchyError("Worker MCP 写能力超过父 Agent")
+                grants.add("mcp.write")
+            conn.execute(
+                "UPDATE sessions SET capabilities_json=?,updated_at=? WHERE id=?",
+                (_json({"grants": sorted(grants)}), _utc_now(), agent_id),
+            )
+            return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (agent_id,)).fetchone())
+
     def list_agent_tree(self, root_agent_id=None, include_archived=False):
         root = self.get_supervisor() if root_agent_id is None else self.get_session(root_agent_id)
         if not root or root["agent_role"] != "supervisor":
@@ -2257,6 +2286,72 @@ class Database:
         return hashlib.sha256(_json(binding).encode("utf-8")).hexdigest(), summary
 
     @staticmethod
+    def _mcp_tool_binding_tx(conn, run, call_id, *, boot_nonce=None,
+                             boot_nonce_hash=None):
+        """Rebuild a mutating MCP proposal only from the durable Run snapshot/call."""
+        if ((boot_nonce is None) == (boot_nonce_hash is None) or
+                boot_nonce is not None and (not isinstance(boot_nonce, str) or not boot_nonce)):
+            raise ValueError("无效 MCP 审批启动身份")
+        nonce_hash = (boot_nonce_hash if boot_nonce_hash is not None else
+                      hashlib.sha256(boot_nonce.encode("utf-8")).hexdigest())
+        if not isinstance(nonce_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", nonce_hash):
+            raise ValueError("无效 MCP 审批启动身份")
+        checkpoint = json.loads(run["checkpoint_json"] or "{}")
+        if checkpoint.get("phase") != "tool_pending":
+            raise InvalidRunTransition("Run 不在工具调用检查点")
+        message = conn.execute("SELECT * FROM messages WHERE id=?", (
+            checkpoint.get("assistant_message_id"),)).fetchone()
+        if not message or message["run_id"] != run["id"] or message["role"] != "assistant":
+            raise InvalidRunTransition("缺少已持久化工具调用")
+        calls = json.loads(message["tool_calls_json"] or "[]")
+        index = checkpoint.get("next_tool_index")
+        if not isinstance(index, int) or not 0 <= index < len(calls):
+            raise InvalidRunTransition("工具调用检查点无效")
+        call = calls[index]
+        function = call.get("function", {})
+        name = function.get("name")
+        if (call.get("id") != call_id or not isinstance(name, str)):
+            raise InvalidRunTransition("MCP 调用与检查点不一致")
+        arguments = function.get("arguments")
+        try:
+            arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+            arguments_json = _json(arguments)
+        except (TypeError, ValueError):
+            raise InvalidRunTransition("MCP 参数无效") from None
+        if not isinstance(arguments, dict):
+            raise InvalidRunTransition("MCP 参数无效")
+        snapshot = json.loads(run["tool_snapshot_json"])
+        frozen = snapshot.get("specs", {}).get(name)
+        if (not isinstance(frozen, dict) or frozen.get("effects") != ["mcp.write"] or
+                frozen.get("approval") != "always" or frozen.get("path_fields") != [] or
+                "mcp.write" not in json.loads(run["effective_grant_json"])["grants"]):
+            raise InvalidRunTransition("Run 无 MCP 写权限")
+        origin = frozen.get("origin")
+        parts = origin.split(":", 2) if isinstance(origin, str) else []
+        if (len(parts) != 3 or parts[0] != "mcp" or not parts[1] or
+                not re.fullmatch(r"[0-9a-f]{64}", parts[2])):
+            raise InvalidRunTransition("MCP 来源无效")
+        schema = frozen.get("schema")
+        if not isinstance(schema, dict):
+            raise InvalidRunTransition("MCP Schema 无效")
+        from backend.tool_gateway import _redact
+        summary = {
+            "approval_type": "mcp_tool",
+            "tool_name": name,
+            "name": name,
+            "run_id": run["id"],
+            "attempt": run["attempt"],
+            "call_id": call_id,
+            "server_id": parts[1],
+            "config_hash": parts[2],
+            "schema_hash": hashlib.sha256(_json(schema).encode("utf-8")).hexdigest(),
+            "arguments_hash": hashlib.sha256(arguments_json.encode("utf-8")).hexdigest(),
+            "arguments": _redact(arguments, ()),
+            "boot_nonce_hash": nonce_hash,
+        }
+        return hashlib.sha256(_json(summary).encode("utf-8")).hexdigest(), summary
+
+    @staticmethod
     def _validated_result(value):
         if isinstance(value, str):
             if len(value) > 8000:
@@ -2443,6 +2538,11 @@ class Database:
         specs = dict(tool_gateway.snapshot_builtin_tools())
         if hasattr(tool_gateway, "snapshot_internal_tools"):
             specs.update(tool_gateway.snapshot_internal_tools())
+        try:
+            from backend.mcp.manager import get_manager
+            specs.update(get_manager().snapshot_tool_specs())
+        except Exception:
+            logger.warning("MCP snapshot unavailable while creating Run")
         tools = {name: {
             "schema": spec.schema,
             "effects": sorted(spec.effects),
@@ -2452,7 +2552,10 @@ class Database:
             "timeout_seconds": spec.timeout_seconds,
             "origin": spec.origin,
         } for name, spec in specs.items()}
-        return config, {"v": 1, "specs": tools, "grants": sorted(grants)}
+        snapshot = {"v": 1, "specs": tools, "grants": sorted(grants)}
+        if len(_json(snapshot).encode("utf-8")) > 64 * 1024:
+            raise ValueError("tool_snapshot_too_large")
+        return config, snapshot
 
     @staticmethod
     def _effective_grants_tx(conn, task):
@@ -3232,6 +3335,13 @@ class Database:
             """, (run_id, call_id)).fetchone()
             if started:
                 raise InvalidRunTransition("tool_call_id 已启动；必须先核实结果")
+            frozen = json.loads(run["tool_snapshot_json"] or "{}").get("specs", {}).get(name)
+            is_mcp_write = (isinstance(frozen, dict) and
+                            isinstance(frozen.get("origin"), str) and
+                            frozen["origin"].startswith("mcp:") and
+                            frozen.get("effects") == ["mcp.write"] and
+                            frozen.get("approval") == "always")
+            approval = None
             if name == "workspace_write_text":
                 if effect != "effectful" or not isinstance(boot_nonce, str) or not boot_nonce:
                     raise InvalidRunTransition("写入工具必须绑定本次启动身份及副作用")
@@ -3250,18 +3360,39 @@ class Database:
                         "consumed_at" in decision or
                         json.loads(approval["request_summary_json"]) != summary):
                     raise InvalidRunTransition("写入审批不存在、失效或未批准")
+            elif is_mcp_write:
+                if effect != "effectful" or not isinstance(boot_nonce, str) or not boot_nonce:
+                    raise InvalidRunTransition("MCP 写工具必须绑定本次启动身份及副作用")
+                bound_hash, summary = self._mcp_tool_binding_tx(
+                    conn, run, call_id, boot_nonce=boot_nonce)
+                if name != summary["tool_name"] or action_hash != bound_hash:
+                    raise InvalidRunTransition("MCP 工具或参数已变化")
+                approval = conn.execute("""
+                    SELECT * FROM approvals WHERE run_id=? AND tool_call_id=?
+                        AND kind='pre_execution' AND action_hash=?
+                """, (run_id, call_id, bound_hash)).fetchone()
+                decision = json.loads(approval["decision_json"] or "{}") if approval else {}
+                if (not approval or approval["status"] != "resolved" or
+                        approval["expires_at"] <= _utc_now() or
+                        decision.get("decision") != "approve" or
+                        "consumed_at" in decision or
+                        json.loads(approval["request_summary_json"]) != summary):
+                    raise InvalidRunTransition("MCP 审批不存在、失效或未批准")
             self._append_event_tx(conn, run_id, "tool.started", {
                 "call_id": call_id, "name": name, "effect": effect,
                 "action_hash": action_hash,
+                **({"approval_id": approval["id"]} if approval else {}),
             }, f"{run_id}:{call_id}:tool.started")
             used = conn.execute("SELECT event_bytes_written FROM runs WHERE id=?",
                                 (run_id,)).fetchone()[0]
             if used + min_result_bytes > MAX_RUN_EVENT_BYTES - TERMINAL_EVENT_RESERVE:
                 raise EventLimitExceeded("工具结果 Event 空间不足，拒绝调用")
             now = _utc_now()
-            if name == "workspace_write_text":
+            if approval:
+                decision = json.loads(approval["decision_json"] or "{}")
+                decision["consumed_at"] = now
                 conn.execute("UPDATE approvals SET decision_json=? WHERE id=?", (
-                    _json({"decision": "approve", "consumed_at": now}), approval["id"]))
+                    _json(decision), approval["id"]))
             conn.execute("UPDATE runs SET version=version+1,updated_at=? WHERE id=?",
                          (now, run_id))
             return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
@@ -3324,6 +3455,62 @@ class Database:
                 "kind": "workspace_write_text", "action_hash": action_hash,
             })
             # Only an unstarted write can yield its directory writer lease.
+            conn.execute("DELETE FROM workspace_writer_leases WHERE task_id=?", (run["task_id"],))
+            return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), dict(
+                conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone())
+
+    def request_mcp_tool_approval(self, run_id, expected_version, lease_owner,
+                                  lease_epoch, call_id, boot_nonce, ttl_seconds=3600):
+        """Freeze an unstarted mutating MCP call and yield the Run for Host review."""
+        if (not isinstance(boot_nonce, str) or not 1 <= len(boot_nonce) <= 200 or
+                not isinstance(call_id, str) or
+                not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", call_id) or
+                not isinstance(ttl_seconds, int) or not 1 <= ttl_seconds <= 86400):
+            raise ValueError("无效 MCP 审批参数")
+        with self._write() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise ResourceNotFound("Run 不存在")
+            now = _utc_now()
+            if (run["status"] != "running" or run["version"] != expected_version or
+                    run["lease_owner"] != lease_owner or run["lease_epoch"] != lease_epoch or
+                    run["lease_until"] <= now or run["control_requested"]):
+                raise InvalidRunTransition("Run lease/version/control 已变化")
+            if conn.execute("""
+                SELECT 1 FROM events WHERE run_id=? AND type='tool.started'
+                    AND json_extract(payload_json,'$.call_id')=?
+            """, (run_id, call_id)).fetchone():
+                raise InvalidRunTransition("工具已启动，不能请求预执行审批")
+            if conn.execute("""
+                SELECT 1 FROM approvals WHERE run_id=? AND tool_call_id=?
+                    AND kind='pre_execution'
+                    AND json_extract(request_summary_json,'$.approval_type')='mcp_tool'
+            """, (run_id, call_id)).fetchone():
+                raise InvalidRunTransition("MCP 调用已有审批记录")
+            action_hash, summary = self._mcp_tool_binding_tx(
+                conn, run, call_id, boot_nonce=boot_nonce)
+            summary_json = _json(summary)
+            if len(summary_json.encode("utf-8")) > MAX_EVENT_BYTES:
+                raise ValueError("MCP 审批摘要过大")
+            expires_at = (datetime.now(timezone.utc) + timedelta(
+                seconds=ttl_seconds)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            approval_id = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO approvals
+                    (id,run_id,tool_call_id,kind,action_hash,request_summary_json,
+                     status,expires_at,created_at)
+                VALUES (?,?,?,'pre_execution',?,?,'pending',?,?)
+            """, (approval_id, run_id, call_id, action_hash, summary_json,
+                  expires_at, now))
+            conn.execute("""
+                UPDATE runs SET status='waiting',wait_reason='approval',
+                    lease_owner=NULL,lease_until=NULL,control_requested=NULL,
+                    version=version+1,updated_at=? WHERE id=? AND version=?
+            """, (now, run_id, expected_version))
+            self._append_event_tx(conn, run_id, "approval.requested", {
+                "approval_id": approval_id, "call_id": call_id,
+                "kind": "mcp_tool", "action_hash": action_hash,
+            })
             conn.execute("DELETE FROM workspace_writer_leases WHERE task_id=?", (run["task_id"],))
             return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), dict(
                 conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone())
@@ -3443,6 +3630,25 @@ class Database:
             decision = json.loads(row["decision_json"] or "{}")
             if (summary.get("tool_name") == "workspace_write_text" and
                     summary.get("boot_nonce") == boot_nonce and
+                    decision.get("decision") == "approve" and
+                    "consumed_at" not in decision):
+                return row
+        return None
+
+    def get_mcp_tool_approval(self, run_id, call_id, boot_nonce):
+        if not isinstance(boot_nonce, str) or not boot_nonce:
+            raise ValueError("无效 MCP 审批启动身份")
+        nonce_hash = hashlib.sha256(boot_nonce.encode("utf-8")).hexdigest()
+        rows = self._query_all("""
+            SELECT * FROM approvals WHERE run_id=? AND tool_call_id=?
+                AND kind='pre_execution' AND status='resolved' AND expires_at>?
+            ORDER BY decided_at DESC
+        """, (run_id, call_id, _utc_now()))
+        for row in rows:
+            summary = json.loads(row["request_summary_json"])
+            decision = json.loads(row["decision_json"] or "{}")
+            if (summary.get("approval_type") == "mcp_tool" and
+                    summary.get("boot_nonce_hash") == nonce_hash and
                     decision.get("decision") == "approve" and
                     "consumed_at" not in decision):
                 return row
@@ -3586,6 +3792,46 @@ class Database:
                 expired.append(row["id"])
         return expired
 
+    def reconcile_mcp_tool_approvals(self, boot_nonce, now=None):
+        """Fail unstarted MCP approvals from another boot or beyond their TTL."""
+        if not isinstance(boot_nonce, str) or not boot_nonce:
+            raise ValueError("无效本次启动身份")
+        nonce_hash = hashlib.sha256(boot_nonce.encode("utf-8")).hexdigest()
+        now = now or _utc_now()
+        expired = []
+        with self._write() as conn:
+            rows = conn.execute("""
+                SELECT approvals.*,runs.status AS run_status,runs.task_id
+                FROM approvals JOIN runs ON runs.id=approvals.run_id
+                WHERE approvals.kind='pre_execution'
+                    AND approvals.status IN ('pending','resolved','expired')
+                    AND json_extract(approvals.request_summary_json,'$.approval_type')='mcp_tool'
+                    AND runs.status IN ('queued','running','waiting','paused')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM events WHERE events.run_id=approvals.run_id
+                            AND events.type='tool.started'
+                            AND json_extract(events.payload_json,'$.call_id')=approvals.tool_call_id)
+                ORDER BY approvals.created_at,approvals.id
+            """).fetchall()
+            for row in rows:
+                summary = json.loads(row["request_summary_json"])
+                decision = json.loads(row["decision_json"] or "{}")
+                if (row["status"] == "resolved" and
+                        decision.get("decision") not in {"approve", "deny"}):
+                    continue
+                if (row["status"] != "expired" and row["expires_at"] > now and
+                        summary.get("boot_nonce_hash") == nonce_hash):
+                    continue
+                conn.execute("UPDATE approvals SET status='expired' WHERE id=?", (row["id"],))
+                run = conn.execute("SELECT * FROM runs WHERE id=?", (row["run_id"],)).fetchone()
+                if run["status"] in {"completed", "failed", "cancelled"}:
+                    continue
+                reason = ("mcp_approval_expired" if row["expires_at"] <= now
+                          else "mcp_approval_stale")
+                self._finish_rejected_write_tx(conn, run, row["id"], reason, now)
+                expired.append(row["id"])
+        return expired
+
     def list_approvals(self, run_id=None, status="pending", limit=50):
         if status not in {"pending", "resolved", "expired", None} or not 1 <= limit <= 100:
             raise ValueError("无效 Approval 查询")
@@ -3608,9 +3854,9 @@ class Database:
             row = conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
             if not row:
                 raise ResourceNotFound("Approval 不存在")
+            summary = json.loads(row["request_summary_json"])
             if (row["kind"] == "pre_execution" and
-                    json.loads(row["request_summary_json"]).get("tool_name") ==
-                    "workspace_write_text"):
+                    summary.get("tool_name") == "workspace_write_text"):
                 raise InvalidRunTransition("Workspace 写入必须使用专用审批入口")
             if decision not in allowed[row["kind"]]:
                 raise ValueError("该 Approval 不接受此 decision")
@@ -3619,6 +3865,23 @@ class Database:
                 return dict(row)
             if row["status"] != "pending" or row["expires_at"] <= _utc_now():
                 raise InvalidRunTransition("Approval 已决定或已过期")
+            run = None
+            is_mcp = (row["kind"] == "pre_execution" and
+                      summary.get("approval_type") == "mcp_tool")
+            if is_mcp:
+                run = conn.execute("SELECT * FROM runs WHERE id=?", (row["run_id"],)).fetchone()
+                if (not run or run["status"] != "waiting" or
+                        run["wait_reason"] != "approval" or
+                        conn.execute("""
+                            SELECT 1 FROM events WHERE run_id=? AND type='tool.started'
+                                AND json_extract(payload_json,'$.call_id')=?
+                        """, (row["run_id"], row["tool_call_id"])).fetchone()):
+                    raise InvalidRunTransition("MCP 审批已失效")
+                bound_hash, current = self._mcp_tool_binding_tx(
+                    conn, run, row["tool_call_id"],
+                    boot_nonce_hash=summary.get("boot_nonce_hash"))
+                if bound_hash != row["action_hash"] or current != summary:
+                    raise InvalidRunTransition("MCP 审批内容已变化")
             now = _utc_now()
             updated = conn.execute("""
                 UPDATE approvals SET status='resolved',decided_at=?,decided_by=?,
@@ -3626,7 +3889,22 @@ class Database:
             """, (now, decided_by, decision_json, approval_id))
             if updated.rowcount != 1:
                 raise InvalidRunTransition("Approval 已决定")
-            # Decision is evidence only. In particular, explicit_retry never calls a tool.
+            if is_mcp:
+                if decision == "approve":
+                    resumed = conn.execute("""
+                        UPDATE runs SET status='queued',wait_reason=NULL,
+                            version=version+1,updated_at=?
+                        WHERE id=? AND status='waiting' AND wait_reason='approval'
+                    """, (now, run["id"]))
+                    if resumed.rowcount != 1:
+                        raise InvalidRunTransition("MCP 审批 Run 已变化")
+                    self._append_event_tx(conn, run["id"], "approval.decided", {
+                        "approval_id": approval_id, "decision": decision,
+                    })
+                else:
+                    self._finish_rejected_write_tx(
+                        conn, run, approval_id, "mcp_tool_rejected", now)
+            # Non-MCP decisions remain evidence only; explicit_retry never calls a tool.
             return dict(conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone())
 
     def expire_approvals(self, now=None):
@@ -3730,8 +4008,10 @@ class Database:
             elif old == "waiting" and run["wait_reason"] == "approval" and action == "cancel":
                 approval = conn.execute("""
                     SELECT * FROM approvals WHERE run_id=? AND kind='pre_execution'
-                        AND status='pending'
-                        AND json_extract(request_summary_json,'$.tool_name')='workspace_write_text'
+                        AND status='pending' AND (
+                            json_extract(request_summary_json,'$.tool_name')='workspace_write_text'
+                            OR json_extract(request_summary_json,'$.approval_type')='mcp_tool'
+                        )
                     ORDER BY created_at DESC LIMIT 1
                 """, (run_id,)).fetchone()
                 if not approval:
