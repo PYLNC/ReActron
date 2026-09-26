@@ -87,6 +87,8 @@ let currentSessionHasMessages = false;
 let streaming = false;
 let typingEl = null;
 let activeToolCard = null;
+let mcpServers = [];
+const mcpDiscoveryByServer = new Map();
 
 
 // 统一输出到浏览器控制台，方便观察 SSE 事件流
@@ -825,6 +827,12 @@ function renderAgentTree() {
       filesystem.textContent = "文件能力";
       filesystem.addEventListener("click", () => updateAgentFilesystemCapability(agent));
       item.appendChild(filesystem);
+      const mcpWrite = document.createElement("button");
+      mcpWrite.type = "button";
+      mcpWrite.textContent = "MCP 写: " +
+        ((agent.capability_grants || []).includes("mcp.write") ? "开" : "关");
+      mcpWrite.addEventListener("click", () => updateAgentMcpWriteCapability(agent));
+      item.appendChild(mcpWrite);
     }
     if (!agent.archived_at && agent.can_delegate && agent.depth < 2 &&
         (agent.capability_grants || []).includes("control.delegate_task")) {
@@ -939,6 +947,23 @@ async function updateAgentFilesystemCapability(agent) {
     await loadAgentTree();
   } catch (err) {
     appendNote("更新文件能力失败: " + err.message);
+  }
+}
+
+
+async function updateAgentMcpWriteCapability(agent) {
+  const enabled = (agent.capability_grants || []).includes("mcp.write");
+  if (!window.confirm((enabled ? "关闭" : "开启") +
+      "此 Agent 的 MCP 副作用工具能力？每次调用仍需宿主批准。")) return;
+  try {
+    await apiJson("/api/agents/" + encodeURIComponent(agent.agent_id) +
+      "/mcp-write-capability", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mcp_write: !enabled }),
+      });
+    await loadAgentTree();
+  } catch (err) {
+    appendNote("更新 MCP 写能力失败: " + err.message);
   }
 }
 
@@ -1355,28 +1380,88 @@ async function ensureSession(title) {
 
 
 function renderMcpServers(data) {
-  mcpServerList.innerHTML = "";
-  const statusById = {};
-  for (const item of data.status || []) {
-    statusById[item.id] = item;
-  }
-  for (const server of data.servers || []) {
+  const stateLabels = {
+    pending: "待发现/审批", approved_disabled: "已批准/待启用", enabled: "已启用",
+    drift: "审批已漂移", error: "连接错误",
+  };
+  mcpServers = data.servers || [];
+  mcpServerList.replaceChildren();
+  for (const server of mcpServers) {
     const li = document.createElement("li");
     li.className = "mcp-server-item";
 
-    const info = document.createElement("span");
+    const info = document.createElement("div");
     info.className = "mcp-server-info";
-    const toolCount = statusById[server.id] ? statusById[server.id].tool_count : 0;
-    info.textContent = server.name + " · " + server.transport + " · " + toolCount + " tools";
+    const heading = document.createElement("strong");
+    heading.textContent = server.name + " · " + server.transport;
+    const status = document.createElement("small");
+    status.textContent = (stateLabels[server.status] || server.status) +
+      " · " + (server.enabled ? "已启用" : "已禁用") +
+      " · " + (server.tool_count || 0) + " 个工具" +
+      (server.last_error ? " · " + server.last_error : "");
+    info.appendChild(heading);
+    info.appendChild(status);
+
+    const actions = document.createElement("div");
+    actions.className = "mcp-server-actions";
+
+    const discoverBtn = document.createElement("button");
+    discoverBtn.type = "button";
+    discoverBtn.textContent = "发现";
+    discoverBtn.addEventListener("click", () => discoverMcpServer(server));
+    actions.appendChild(discoverBtn);
+
+    if (server.approved) {
+      const enabledBtn = document.createElement("button");
+      enabledBtn.type = "button";
+      enabledBtn.textContent = server.enabled ? "禁用" : "启用";
+      enabledBtn.addEventListener("click", () => setMcpServerEnabled(server, !server.enabled));
+      actions.appendChild(enabledBtn);
+    }
 
     const removeBtn = document.createElement("button");
     removeBtn.className = "session-delete";
     removeBtn.type = "button";
     removeBtn.textContent = "删除";
     removeBtn.addEventListener("click", () => deleteMcpServer(server.id));
+    actions.appendChild(removeBtn);
 
     li.appendChild(info);
-    li.appendChild(removeBtn);
+    li.appendChild(actions);
+
+    const discovery = mcpDiscoveryByServer.get(server.id);
+    if (discovery && discovery.tools && discovery.tools.length) {
+      const tools = document.createElement("ul");
+      tools.className = "mcp-tool-list";
+      for (const tool of discovery.tools) {
+        const toolItem = document.createElement("li");
+        const label = document.createElement("label");
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.value = tool.name;
+        checkbox.checked = (server.approved_tools || []).includes(tool.name);
+        const annotations = tool.annotations || {};
+        const policy = annotations.read_only ? "只读" : "副作用/逐次批准";
+        const hints = [
+          annotations.destructive ? "可能破坏" : "",
+          annotations.idempotent ? "幂等" : "",
+          annotations.open_world ? "访问外部世界" : "",
+        ].filter(Boolean);
+        label.appendChild(checkbox);
+        label.appendChild(document.createTextNode(
+          " " + tool.name + " · " + policy + (hints.length ? " · " + hints.join(" · ") : ""),
+        ));
+        if (tool.description) label.title = tool.description;
+        toolItem.appendChild(label);
+        tools.appendChild(toolItem);
+      }
+      const approveBtn = document.createElement("button");
+      approveBtn.type = "button";
+      approveBtn.textContent = "批准所选工具（仍禁用）";
+      approveBtn.addEventListener("click", () => approveMcpTools(server, tools));
+      li.appendChild(tools);
+      li.appendChild(approveBtn);
+    }
     mcpServerList.appendChild(li);
   }
 }
@@ -1384,9 +1469,7 @@ function renderMcpServers(data) {
 
 async function loadMcpServers() {
   try {
-    const response = await fetch("/api/mcp/servers");
-    if (!response.ok) return;
-    const data = await response.json();
+    const data = await apiJson("/api/mcp/servers");
     renderMcpServers(data);
   } catch (err) {
     log("加载 MCP 失败: " + err.message);
@@ -1397,12 +1480,7 @@ async function loadMcpServers() {
 async function refreshMcp() {
   mcpStatus.textContent = "刷新中";
   try {
-    const response = await fetch("/api/mcp/refresh", { method: "POST" });
-    if (!response.ok) {
-      const data = await response.json().catch(() => null);
-      throw new Error(errorMessage(data, "刷新失败"));
-    }
-    const data = await response.json();
+    const data = await apiJson("/api/mcp/refresh", { method: "POST" });
     mcpStatus.textContent = "工具 " + data.tool_count + " 个";
     await loadMcpServers();
     await loadRuntimeInfo();
@@ -1415,7 +1493,8 @@ async function refreshMcp() {
 
 async function addMcpServer() {
   let args = [];
-  if (mcpArgsInput.value.trim()) {
+  const transport = mcpTransportInput.value;
+  if (transport === "stdio" && mcpArgsInput.value.trim()) {
     try {
       args = JSON.parse(mcpArgsInput.value.trim());
       if (!Array.isArray(args)) throw new Error("args must be array");
@@ -1427,31 +1506,31 @@ async function addMcpServer() {
 
   const payload = {
     name: mcpNameInput.value.trim(),
-    transport: mcpTransportInput.value,
-    command: mcpCommandInput.value.trim(),
-    args,
-    url: mcpUrlInput.value.trim(),
+    transport,
   };
+  if (transport === "stdio") {
+    payload.command = mcpCommandInput.value.trim();
+    payload.args = args;
+  } else {
+    payload.url = mcpUrlInput.value.trim();
+  }
   if (!payload.name) {
     mcpStatus.textContent = "请输入服务器名称";
     return;
   }
 
   try {
-    const response = await fetch("/api/mcp/servers", {
+    await apiJson("/api/mcp/servers", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    if (!response.ok) {
-      const data = await response.json().catch(() => null);
-      throw new Error(errorMessage(data, "添加失败"));
-    }
     mcpNameInput.value = "";
     mcpCommandInput.value = "";
     mcpArgsInput.value = "";
     mcpUrlInput.value = "";
-    await refreshMcp();
+    mcpStatus.textContent = "已添加，等待发现";
+    await loadMcpServers();
   } catch (err) {
     mcpStatus.textContent = "添加失败";
     log("添加 MCP 失败: " + err.message);
@@ -1459,14 +1538,85 @@ async function addMcpServer() {
 }
 
 
+async function discoverMcpServer(server) {
+  const warning = server.transport === "stdio"
+    ? "发现会立即启动该本地可执行文件。确认信任并继续？"
+    : "发现会连接该远程 endpoint。确认持续信任并继续？";
+  if (!window.confirm(warning)) return;
+  mcpStatus.textContent = "发现中";
+  try {
+    const data = await apiJson("/api/mcp/servers/" + encodeURIComponent(server.id) +
+      "/discover", { method: "POST" });
+    mcpDiscoveryByServer.set(server.id, data);
+    mcpStatus.textContent = "发现 " + data.tool_count + " 个工具，请选择批准";
+    await loadMcpServers();
+  } catch (err) {
+    mcpStatus.textContent = "发现失败";
+    log("发现 MCP 失败: " + err.message);
+  }
+}
+
+
+async function approveMcpTools(server, toolList) {
+  const selected = Array.from(toolList.querySelectorAll('input[type="checkbox"]:checked'))
+    .map((input) => input.value);
+  if (!selected.length) {
+    mcpStatus.textContent = "至少选择一个工具";
+    return;
+  }
+  const trust = server.transport === "stdio" ? "该可执行文件" : "该远程 endpoint";
+  if (!window.confirm("批准表示持续信任" + trust + "及所选工具策略；批准后仍保持禁用。继续？")) return;
+  try {
+    const data = await apiJson("/api/mcp/servers/" + encodeURIComponent(server.id) +
+      "/approve", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tool_names: selected }),
+      });
+    mcpDiscoveryByServer.set(server.id, data);
+    mcpStatus.textContent = "审批已保存，服务器仍禁用";
+    await loadMcpServers();
+  } catch (err) {
+    mcpStatus.textContent = "审批失败";
+    log("审批 MCP 失败: " + err.message);
+  }
+}
+
+
+async function setMcpServerEnabled(server, enabled) {
+  if (enabled && !window.confirm("启用前会重新连接并校验审批；之后工具可进入新 Run。继续？")) return;
+  try {
+    await apiJson("/api/mcp/servers/" + encodeURIComponent(server.id) + "/enabled", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    mcpStatus.textContent = enabled ? "已启用" : "已禁用";
+    await loadMcpServers();
+    await loadRuntimeInfo();
+  } catch (err) {
+    mcpStatus.textContent = enabled ? "启用失败" : "禁用失败";
+    log("切换 MCP 失败: " + err.message);
+  }
+}
+
+
 async function deleteMcpServer(serverId) {
   if (!window.confirm("删除这个 MCP Server？")) return;
   try {
-    await fetch("/api/mcp/servers/" + serverId, { method: "DELETE" });
-    await refreshMcp();
+    await apiJson("/api/mcp/servers/" + encodeURIComponent(serverId), { method: "DELETE" });
+    mcpDiscoveryByServer.delete(serverId);
+    await loadMcpServers();
+    await loadRuntimeInfo();
   } catch (err) {
     log("删除 MCP 失败: " + err.message);
   }
+}
+
+
+function syncMcpTransportFields() {
+  const stdio = mcpTransportInput.value === "stdio";
+  mcpCommandInput.disabled = !stdio;
+  mcpArgsInput.disabled = !stdio;
+  mcpUrlInput.disabled = stdio;
 }
 
 
@@ -1651,14 +1801,31 @@ async function loadApprovals() {
       const item = document.createElement("li");
       const summary = approval.request_summary || {};
       const label = document.createElement("span");
-      label.textContent = (summary.tool || summary.name || approval.kind) + " · " + approval.kind;
+      label.textContent = (summary.tool_name || summary.tool || summary.name || approval.kind) +
+        " · " + approval.kind;
       item.appendChild(label);
+      if (approval.kind === "pre_execution" && summary.approval_type === "mcp_tool") {
+        const meta = document.createElement("small");
+        meta.textContent = "server " + (summary.server_id || "?") + " · attempt " +
+          (summary.attempt ?? "?") + " · call " + (summary.call_id || approval.tool_call_id) +
+          " · 有效期至 " + new Date(approval.expires_at).toLocaleString("zh-CN");
+        item.appendChild(meta);
+        const details = document.createElement("details");
+        const heading = document.createElement("summary");
+        heading.textContent = "查看调用参数";
+        const argumentsJson = document.createElement("pre");
+        argumentsJson.textContent = JSON.stringify(summary.arguments || {}, null, 2);
+        details.appendChild(heading);
+        details.appendChild(argumentsJson);
+        item.appendChild(details);
+      }
       const decisions = approval.kind === "resolve_unknown_outcome"
         ? ["occurred", "not_occurred", "explicit_retry", "cancel"] : ["approve", "deny"];
       for (const decision of decisions) {
         const button = document.createElement("button");
         button.type = "button";
-        button.textContent = decision;
+        button.textContent = approval.kind === "pre_execution" && decision === "approve"
+          ? "批准一次" : decision;
         button.addEventListener("click", async () => {
           button.disabled = true;
           try {
@@ -1666,7 +1833,9 @@ async function loadApprovals() {
               method: "POST", headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ decision }),
             });
-            appendNote("决议已记录；Run 仍需等待运行器确认，不会自动重试未知副作用。");
+            appendNote(approval.kind === "resolve_unknown_outcome"
+              ? "决议已记录；Run 仍需等待运行器确认，不会自动重试未知副作用。"
+              : (decision === "approve" ? "本次调用已批准，Run 将恢复。" : "本次调用已拒绝。"));
             await loadApprovals();
             if (activeRunId) await loadRunSnapshot(activeRunId);
           } catch (err) {
@@ -1946,6 +2115,7 @@ closeSettingsBtn.addEventListener("click", closeSettings);
 settingsForm.addEventListener("submit", saveSettings);
 addMcpBtn.addEventListener("click", addMcpServer);
 refreshMcpBtn.addEventListener("click", refreshMcp);
+mcpTransportInput.addEventListener("change", syncMcpTransportFields);
 refreshDelegationsBtn.addEventListener("click", loadDelegations);
 refreshAgentMessagesBtn.addEventListener("click", loadAgentMessages);
 settingsModal.addEventListener("click", (event) => {
@@ -1968,6 +2138,7 @@ document.querySelectorAll(".info-section-toggle").forEach((button) => {
 // 恢复上次的抽屉展开状态
 setPanelState("sessions", localStorage.getItem("countboter_panel_sessions") !== "0");
 setPanelState("info", localStorage.getItem("countboter_panel_info") !== "0");
+syncMcpTransportFields();
 
 bootstrapIfNeeded().then((ready) => {
   if (ready) {

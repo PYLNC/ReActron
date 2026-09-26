@@ -640,7 +640,7 @@ class UploadCleanupTest(unittest.TestCase):
 
 
 class MCPCreateContractTest(unittest.TestCase):
-    def test_new_server_stays_disabled_even_when_request_enables_it(self):
+    def test_new_server_stays_disabled(self):
         from backend import api
         from backend.db import Database
 
@@ -651,7 +651,6 @@ class MCPCreateContractTest(unittest.TestCase):
                     response = asyncio.run(api.create_mcp_server(
                         api.MCPServerCreateRequest(
                             name="new", transport="stdio", command="C:\\tools\\fake.exe",
-                            enabled=True,
                         )
                     ))
                 stored = database.get_mcp_server(response["id"])

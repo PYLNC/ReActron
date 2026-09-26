@@ -1,8 +1,9 @@
 """Pydantic 请求与响应模型。"""
 
 from typing import Any, Dict, List, Literal, Optional
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, model_validator
 from typing import Annotated
 
 
@@ -162,6 +163,14 @@ class AgentFilesystemCapabilityRequest(BaseModel):
     filesystem_write: StrictBool
 
 
+class AgentMCPWriteCapabilityRequest(BaseModel):
+    """Narrow update for the side-effecting MCP grant."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mcp_write: StrictBool
+
+
 class SupervisorCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -312,12 +321,59 @@ class SessionProjectRequest(BaseModel):
 class MCPServerCreateRequest(BaseModel):
     """创建 MCP Server 的请求体。"""
 
-    name: str = Field(min_length=1)
-    transport: str = Field(default="stdio", pattern="^(stdio|sse)$")
-    command: Optional[str] = None
-    args: Optional[List[str]] = None
-    url: Optional[str] = None
-    enabled: bool = False
+    model_config = ConfigDict(extra="forbid")
+
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]
+    transport: Literal["stdio", "streamable_http", "sse"] = "stdio"
+    command: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)] | None = None
+    args: List[Annotated[str, StringConstraints(max_length=4096)]] = Field(
+        default_factory=list, max_length=64,
+    )
+    url: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)] | None = None
+
+    @model_validator(mode="after")
+    def validate_transport_fields(self):
+        if self.transport == "stdio":
+            if not self.command or self.url is not None:
+                raise ValueError("stdio 仅接受 command/args")
+            return self
+        if self.command is not None or self.args or not self.url:
+            raise ValueError("HTTP/SSE 仅接受 url")
+        if (any(char.isspace() for char in self.url) or "\\" in self.url or
+                "?" in self.url or "#" in self.url):
+            raise ValueError("MCP URL 无效")
+        try:
+            parsed = urlsplit(self.url)
+            if (parsed.scheme not in {"http", "https"} or not parsed.hostname or
+                    parsed.username is not None or parsed.password is not None or
+                    parsed.query or parsed.fragment):
+                raise ValueError("MCP URL 仅接受无凭据、query 和 fragment 的 http(s) endpoint")
+            parsed.port
+        except ValueError as exc:
+            raise ValueError("MCP URL 无效") from exc
+        return self
+
+
+class MCPServerApprovalRequest(BaseModel):
+    """客户端只选择工具；所有审批摘要均由服务端生成。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool_names: List[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]] = Field(
+        min_length=1, max_length=64,
+    )
+
+    @model_validator(mode="after")
+    def reject_duplicate_tools(self):
+        if len(set(self.tool_names)) != len(self.tool_names):
+            raise ValueError("tool_names 不能重复")
+        return self
+
+
+class MCPServerEnabledRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: StrictBool
 
 
 class HealthResponse(BaseModel):

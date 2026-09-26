@@ -236,16 +236,18 @@
         </div>
         <ul id="mcpServerList" class="mcp-server-list"></ul>
         <div class="mcp-form">
-          <input id="mcpNameInput" type="text" placeholder="名称">
-          <select id="mcpTransportInput">
-            <option value="stdio">stdio</option>
-            <option value="sse">sse</option>
+          <input id="mcpNameInput" type="text" maxlength="80" placeholder="名称" aria-label="MCP Server 名称">
+          <select id="mcpTransportInput" aria-label="MCP transport">
+            <option value="stdio">stdio（本地进程）</option>
+            <option value="streamable_http">Streamable HTTP（推荐）</option>
+            <option value="sse">SSE（兼容）</option>
           </select>
-          <input id="mcpCommandInput" type="text" placeholder="命令，例如 npx">
-          <input id="mcpArgsInput" type="text" placeholder='参数 JSON，例如 ["-y", "server"]'>
-          <input id="mcpUrlInput" type="text" placeholder="SSE URL">
+          <input id="mcpCommandInput" type="text" placeholder="可执行文件绝对路径" aria-label="stdio 可执行文件">
+          <input id="mcpArgsInput" type="text" placeholder='参数 JSON，例如 ["server.js"]' aria-label="stdio 参数 JSON">
+          <input id="mcpUrlInput" type="url" placeholder="https://example.com/mcp" aria-label="远程 MCP URL" disabled>
+          <p class="mcp-trust-note">发现 stdio 会立即启动本地程序；远程发现会连接该 endpoint。只发现你信任的配置，批准后仍需单独启用。</p>
           <div class="mcp-actions">
-            <button id="addMcpBtn" type="button">添加并刷新</button>
+            <button id="addMcpBtn" type="button">添加（保持禁用）</button>
             <button id="refreshMcpBtn" type="button">重新发现</button>
           </div>
         </div>

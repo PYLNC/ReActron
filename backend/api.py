@@ -13,10 +13,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from backend.db import DATA_DIR, WorkspaceUnavailable, db
 from backend.file_parser import parse_uploaded_file
 from backend.harness import get_harness, run_self_tests
-from backend.mcp.manager import get_manager
+from backend.mcp.manager import MCPNotApproved, get_manager
 from backend.schemas import (
     AgentFilesystemCapabilityRequest,
     AgentListResponse,
+    AgentMCPWriteCapabilityRequest,
     AgentRenameRequest,
     ApprovalDecisionRequest,
     WorkspaceWriteDecisionRequest,
@@ -26,7 +27,9 @@ from backend.schemas import (
     HealthResponse,
     HostDelegateRequest,
     HumanReplyRequest,
+    MCPServerApprovalRequest,
     MCPServerCreateRequest,
+    MCPServerEnabledRequest,
     ProjectCreateRequest,
     ProjectRenameRequest,
     RunCreateRequest,
@@ -103,8 +106,18 @@ SAFE_AGENT_GRANTS = frozenset({
     "read_only", "control.delegate_task", "control.send_agent_message",
     "control.get_task_status", "control.wait_for_tasks", "control.cancel_task",
     "control.request_human_approval", "filesystem.read", "filesystem.write",
+    "mcp.write",
 })
 MAX_DIFF_BYTES = 256 * 1024
+MCP_STATES = frozenset({"pending", "approved_disabled", "enabled", "drift", "error"})
+MCP_ERROR_CODES = frozenset({
+    "not_found", "mcp_invalid_config", "mcp_not_approved", "mcp_schema_changed",
+    "mcp_name_conflict", "limit_exceeded", "mcp_unavailable", "mcp_timeout",
+    "mcp_tool_error", "mcp_invalid_arguments",
+})
+APPROVAL_SECRET_FIELDS = frozenset({
+    "authorization", "cookie", "api_key", "token", "secret", "password",
+})
 
 def _error_response(status_code: int, code: str, message: str, details=None):
     return JSONResponse(
@@ -116,6 +129,139 @@ def _error_response(status_code: int, code: str, message: str, details=None):
             "trace_id": uuid.uuid4().hex,
         },
     )
+
+
+def _mcp_tool_response(tool: dict) -> dict | None:
+    """Allowlist discovery metadata; hashes and input schemas stay server-side."""
+    if not isinstance(tool, dict):
+        return None
+    name = tool.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    raw_effects = tool.get("effects")
+    effects = [
+        effect for effect in (raw_effects if isinstance(raw_effects, list) else [])
+        if effect in {"read_only", "mcp.write"}
+    ]
+    approval = tool.get("approval") if tool.get("approval") in {"never", "always"} else "always"
+    description = tool.get("description")
+    source_annotations = tool.get("annotations")
+    source_annotations = source_annotations if isinstance(source_annotations, dict) else {}
+    read_only = effects == ["read_only"]
+    return {
+        "name": name,
+        "model_name": tool.get("model_name") if isinstance(tool.get("model_name"), str) else None,
+        "description": description[:2000] if isinstance(description, str) else "",
+        "effects": effects,
+        "approval": approval,
+        "annotations": {
+            "read_only": read_only,
+            "destructive": bool(source_annotations.get("destructiveHint", not read_only)),
+            "idempotent": bool(tool.get("idempotent") or source_annotations.get("idempotentHint")),
+            "open_world": bool(source_annotations.get("openWorldHint")),
+            "requires_approval": approval == "always",
+        },
+    }
+
+
+def _mcp_catalog_response(result: dict) -> dict:
+    server = result.get("server") if isinstance(result, dict) else {}
+    tools = [
+        safe for safe in (_mcp_tool_response(tool) for tool in result.get("tools", []))
+        if safe is not None
+    ] if isinstance(result, dict) and isinstance(result.get("tools", []), list) else []
+    return {
+        "server": {
+            "id": server.get("id"),
+            "name": server.get("name"),
+            "transport": server.get("transport"),
+            "enabled": bool(server.get("enabled")),
+            "status": server.get("status") if server.get("status") in MCP_STATES else "pending",
+        },
+        "tool_count": len(tools),
+        "tools": tools,
+    }
+
+
+def _mcp_server_response(row: dict, status: dict | None = None) -> dict:
+    """Project a stored server without executable arguments or endpoint details."""
+    status = status or {}
+    try:
+        approved = json.loads(row.get("approved_tools_json") or "{}")
+    except (TypeError, ValueError):
+        approved = {}
+    if not isinstance(approved, dict):
+        approved = {}
+    state = status.get("status")
+    if state not in MCP_STATES:
+        state = "approved_disabled" if row.get("approved_config_hash") else "pending"
+    last_error = status.get("last_error")
+    if last_error not in MCP_ERROR_CODES:
+        last_error = None
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "transport": row["transport"],
+        "enabled": state == "enabled",
+        "approved": bool(row.get("approved_config_hash")),
+        "status": state,
+        "last_error": last_error,
+        "tool_count": status.get("tool_count") if isinstance(status.get("tool_count"), int) else len(approved),
+        "approved_tools": sorted(approved),
+    }
+
+
+def _mcp_operation_error(exc: Exception):
+    code = getattr(exc, "code", None)
+    if isinstance(exc, MCPNotApproved) and code is None:
+        code = str(exc) if str(exc) in MCP_ERROR_CODES else "mcp_not_approved"
+    if code == "not_found":
+        return _error_response(404, "not_found", "MCP Server 不存在")
+    if code in {"mcp_invalid_config", "mcp_invalid_arguments"}:
+        return _error_response(422, code, "MCP 配置或工具选择无效")
+    if code in {"mcp_not_approved", "mcp_schema_changed", "mcp_name_conflict"}:
+        return _error_response(409, code, "MCP 配置、工具审批或名称已失效")
+    if code == "limit_exceeded":
+        return _error_response(413, code, "MCP 配置或工具目录超过限制")
+    if code == "mcp_timeout":
+        return _error_response(504, code, "MCP Server 响应超时")
+    if code in {"mcp_unavailable", "mcp_tool_error"}:
+        return _error_response(502, code, "MCP Server 不可用")
+    if isinstance(exc, ValueError):
+        return _error_response(422, "mcp_invalid_config", "MCP 配置或工具选择无效")
+    if isinstance(exc, TimeoutError):
+        return _error_response(504, "mcp_timeout", "MCP Server 响应超时")
+    if isinstance(exc, (OSError, ConnectionError, RuntimeError)):
+        return _error_response(502, "mcp_unavailable", "MCP Server 不可用")
+    raise exc
+
+
+def _redact_approval_arguments(value):
+    """Redact credential-shaped fields before approval details reach the browser."""
+    if isinstance(value, dict):
+        return {
+            key: "[redacted]" if any(
+                marker in str(key).lower() for marker in APPROVAL_SECRET_FIELDS
+            ) else _redact_approval_arguments(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_approval_arguments(item) for item in value]
+    return value
+
+
+def _safe_approval_summary(row: dict) -> dict:
+    summary = json.loads(row["request_summary_json"])
+    if summary.get("approval_type") != "mcp_tool":
+        return summary
+    return {
+        "approval_type": "mcp_tool",
+        "tool_name": summary.get("tool_name"),
+        "server_id": summary.get("server_id"),
+        "attempt": summary.get("attempt"),
+        "call_id": summary.get("call_id"),
+        "arguments": _redact_approval_arguments(summary.get("arguments", {})),
+    }
 
 
 def _repository_error(exc: Exception):
@@ -594,7 +740,7 @@ def _approval_response(row: dict, run: dict) -> dict:
         "approval_id": row["id"], "run_id": row["run_id"],
         "agent_id": run["session_id"], "tool_call_id": row["tool_call_id"],
         "kind": row["kind"], "action_hash": row["action_hash"],
-        "request_summary": json.loads(row["request_summary_json"]),
+        "request_summary": _safe_approval_summary(row),
         "status": row["status"], "expires_at": row["expires_at"],
         "decided_at": row["decided_at"],
         "decision": json.loads(row["decision_json"]) if row["decision_json"] else None,
@@ -851,6 +997,19 @@ async def update_agent_filesystem_capability(
     return await _tree_agent(row)
 
 
+@router.put("/agents/{agent_id}/mcp-write-capability")
+async def update_agent_mcp_write_capability(
+    agent_id: str, payload: AgentMCPWriteCapabilityRequest,
+):
+    try:
+        row = await asyncio.to_thread(
+            db.set_agent_mcp_write_capability, agent_id, payload.mcp_write,
+        )
+    except Exception as exc:
+        return _repository_error(exc)
+    return await _tree_agent(row)
+
+
 @router.delete("/agents/{agent_id}")
 async def archive_worker(agent_id: str):
     try:
@@ -1019,56 +1178,106 @@ async def harness_audit():
 
 @router.get("/mcp/servers")
 async def list_mcp_servers():
-    """返回 MCP Server 配置和连接状态。"""
+    """Return only non-sensitive MCP configuration state."""
     manager = get_manager()
-    manager.load_configs()
+    statuses = {
+        item.get("id"): item for item in manager.server_status()
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
     return {
-        "servers": db.list_mcp_servers(),
-        "status": manager.server_status(),
+        "servers": [
+            _mcp_server_response(row, statuses.get(row["id"]))
+            for row in db.list_mcp_servers()
+        ],
     }
 
 
-@router.post("/mcp/servers")
+@router.post("/mcp/servers", status_code=201)
 async def create_mcp_server(payload: MCPServerCreateRequest):
-    """新增 MCP Server 配置。"""
-    row = db.create_mcp_server(
-        name=payload.name,
-        transport=payload.transport,
-        command=payload.command,
-        args=payload.args or [],
-        url=payload.url,
-        enabled=False,
-    )
+    """Store an inert server; discovery is a separate Host trust action."""
+    try:
+        row = db.create_mcp_server(
+            name=payload.name,
+            transport=payload.transport,
+            command=payload.command,
+            args=payload.args,
+            url=payload.url,
+            enabled=False,
+        )
+    except Exception as exc:
+        return _mcp_operation_error(exc)
     logger.info("创建 MCP Server：%s", row["id"])
-    return row
+    return _mcp_server_response(row)
+
+
+@router.post("/mcp/servers/{server_id}/discover")
+@router.post("/mcp/servers/{server_id}/test", include_in_schema=False)
+async def discover_mcp_server(server_id: str):
+    """Host-triggered discovery may execute a configured stdio program."""
+    if not db.get_mcp_server(server_id):
+        return _error_response(404, "not_found", "MCP Server 不存在")
+    try:
+        result = await get_manager().discover_server(server_id)
+    except Exception as exc:
+        return _mcp_operation_error(exc)
+    return _mcp_catalog_response(result)
+
+
+@router.post("/mcp/servers/{server_id}/approve")
+async def approve_mcp_server(server_id: str, payload: MCPServerApprovalRequest):
+    """Rediscover and persist exact server-side config/schema policy hashes."""
+    if not db.get_mcp_server(server_id):
+        return _error_response(404, "not_found", "MCP Server 不存在")
+    try:
+        result = await get_manager().approve_server(server_id, payload.tool_names)
+    except Exception as exc:
+        return _mcp_operation_error(exc)
+    return _mcp_catalog_response(result)
+
+
+@router.put("/mcp/servers/{server_id}/enabled")
+async def set_mcp_server_enabled(server_id: str, payload: MCPServerEnabledRequest):
+    """Enable only after manager live-verifies the persisted approval."""
+    if not db.get_mcp_server(server_id):
+        return _error_response(404, "not_found", "MCP Server 不存在")
+    manager = get_manager()
+    try:
+        if payload.enabled:
+            await manager.enable_server(server_id)
+        else:
+            await manager.disable_server(server_id)
+        await manager.refresh_registry()
+    except Exception as exc:
+        return _mcp_operation_error(exc)
+    row = db.get_mcp_server(server_id)
+    statuses = {item.get("id"): item for item in manager.server_status() if isinstance(item, dict)}
+    return {"server": _mcp_server_response(row, statuses.get(server_id))}
 
 
 @router.delete("/mcp/servers/{server_id}")
 async def delete_mcp_server(server_id: str):
     """删除 MCP Server 配置。"""
     if not db.get_mcp_server(server_id):
-        raise HTTPException(status_code=404, detail="MCP Server 不存在")
+        return _error_response(404, "not_found", "MCP Server 不存在")
+    manager = get_manager()
+    try:
+        await manager.disable_server(server_id)
+    except Exception as exc:
+        return _mcp_operation_error(exc)
     db.delete_mcp_server(server_id)
+    await manager.refresh_registry()
     return {"ok": True}
 
 
 @router.post("/mcp/refresh")
 async def refresh_mcp():
     """重新连接所有 MCP Server 并注册工具。"""
-    result = await get_manager().refresh_registry()
+    try:
+        result = await get_manager().refresh_registry()
+    except Exception as exc:
+        return _mcp_operation_error(exc)
     logger.info("MCP 刷新完成")
     return result
-
-
-@router.post("/mcp/servers/{server_id}/test")
-async def test_mcp_server(server_id: str):
-    """测试指定 MCP Server 连接并列出工具。"""
-    manager = get_manager()
-    manager.load_configs()
-    config = manager.get_config(server_id)
-    if not config:
-        raise HTTPException(status_code=404, detail="MCP Server 不存在")
-    return await manager.test_server(config)
 
 
 @router.get("/config", response_model=ConfigResponse)
