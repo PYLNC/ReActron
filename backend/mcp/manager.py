@@ -484,6 +484,8 @@ class MCPManager:
             return tools, entries
         except (MCPError, MCPNotApproved):
             raise
+        except TimeoutError as exc:
+            raise MCPError("mcp_timeout") from exc
         except Exception as exc:
             raise MCPError("mcp_unavailable") from exc
 
@@ -666,9 +668,13 @@ class MCPManager:
                 self._unpublish_server(server_id, exc)
             raise
         except TimeoutError as exc:
-            raise MCPError("mcp_timeout") from exc
+            error = MCPError("mcp_timeout")
+            self._unpublish_server(server_id, error)
+            raise error from exc
         except Exception as exc:
-            raise MCPError("mcp_unavailable") from exc
+            error = MCPError("mcp_unavailable")
+            self._unpublish_server(server_id, error)
+            raise error from exc
         finally:
             with self._state_lock:
                 active_calls = dict(self._active_calls)
@@ -712,6 +718,8 @@ class MCPManager:
                 name = entry["model_name"]
                 if name in specs:
                     raise MCPError("mcp_name_conflict")
+                if len(specs) >= MAX_TOOLS:
+                    raise MCPError("limit_exceeded")
                 spec = ToolSpec(
                     name=name, schema=entry["input_schema"],
                     handler=self._handler(self, config.id, entry["name"]),

@@ -8,6 +8,7 @@ import os
 import tempfile
 import threading
 import unittest
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -548,6 +549,27 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
 
 
 class MCPTest(unittest.IsolatedAsyncioTestCase):
+    async def test_discovery_timeout_uses_stable_error_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "server.exe"
+            executable.write_bytes(b"server")
+            database = Database(Path(tmp) / "mcp.db")
+            try:
+                row = database.create_mcp_server("test", "stdio", command=str(executable))
+                manager = MCPManager(database)
+
+                @asynccontextmanager
+                async def timed_out(_config):
+                    raise TimeoutError
+                    yield
+
+                with patch.object(manager, "_open_session", timed_out):
+                    with self.assertRaises(MCPError) as caught:
+                        await manager.discover_server(row["id"])
+                self.assertEqual(caught.exception.code, "mcp_timeout")
+            finally:
+                database.close()
+
     async def test_pending_invalid_config_is_visible_and_never_spawns(self):
         with tempfile.TemporaryDirectory() as tmp:
             database = Database(Path(tmp) / "mcp.db")

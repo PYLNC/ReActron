@@ -37,7 +37,7 @@ class MCPApiTest(unittest.TestCase):
         }
         self.manager = Mock()
         self.manager.server_status.return_value = [{
-            "id": "server-1", "status": "drift", "tool_count": 1,
+            "id": "server-1", "status": "drift", "enabled": True, "tool_count": 1,
         }]
         catalog = {
             "server": {
@@ -96,6 +96,7 @@ class MCPApiTest(unittest.TestCase):
             args=[], url=None, enabled=False,
         )
         self.assertEqual(listed.json()["servers"][0]["status"], "drift")
+        self.assertTrue(listed.json()["servers"][0]["enabled"])
         for marker in ("private-command", "private-arg", "private.invalid",
                        "private-config-hash", "private-schema-hash"):
             self.assertNotIn(marker, listed.text)
@@ -198,7 +199,8 @@ class MCPApiTest(unittest.TestCase):
             "arguments": {"path": "safe.txt", "api_token": "[redacted]"},
         })
         for marker in ("private-config-hash", "private-schema-hash",
-                       "private-arguments-hash", "private-nonce", "private-token"):
+                       "private-arguments-hash", "private-nonce", "private-token",
+                       "action-hash"):
             self.assertNotIn(marker, response.text)
 
 

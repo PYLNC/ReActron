@@ -202,7 +202,7 @@ def _mcp_server_response(row: dict, status: dict | None = None) -> dict:
         "id": row["id"],
         "name": row["name"],
         "transport": row["transport"],
-        "enabled": state == "enabled",
+        "enabled": bool(status["enabled"]) if "enabled" in status else bool(row.get("enabled")),
         "approved": bool(row.get("approved_config_hash")),
         "status": state,
         "last_error": last_error,
@@ -736,15 +736,18 @@ async def get_message(message_id: int):
 
 
 def _approval_response(row: dict, run: dict) -> dict:
-    return {
+    summary = _safe_approval_summary(row)
+    response = {
         "approval_id": row["id"], "run_id": row["run_id"],
         "agent_id": run["session_id"], "tool_call_id": row["tool_call_id"],
-        "kind": row["kind"], "action_hash": row["action_hash"],
-        "request_summary": _safe_approval_summary(row),
+        "kind": row["kind"], "request_summary": summary,
         "status": row["status"], "expires_at": row["expires_at"],
         "decided_at": row["decided_at"],
         "decision": json.loads(row["decision_json"]) if row["decision_json"] else None,
     }
+    if summary.get("approval_type") != "mcp_tool":
+        response["action_hash"] = row["action_hash"]
+    return response
 
 
 def _workspace_write_approval_response(row: dict, run: dict) -> dict:
