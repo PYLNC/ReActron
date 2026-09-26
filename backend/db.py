@@ -17,7 +17,7 @@ from backend.config import BASE_DIR
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "countboter.db"
 logger = logging.getLogger("agent.db")
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MAX_EVENT_BYTES = 64 * 1024
 MAX_RUN_EVENT_BYTES = 4 * 1024 * 1024
 TERMINAL_EVENT_RESERVE = 8 * 1024
@@ -162,6 +162,9 @@ class Database:
             if version == 4 and SCHEMA_VERSION >= 5:
                 self._migrate_4_to_5()
                 version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == 5 and SCHEMA_VERSION >= 6:
+                self._migrate_5_to_6()
+                version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
                 raise RuntimeError(f"不支持的数据库版本：{version}")
             if version >= 5:
@@ -185,7 +188,7 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             # 另一个进程可能已在等待 writer lock 时完成同一迁移。
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version in (1, 2, 3, 4, SCHEMA_VERSION):
+            if version in (1, 2, 3, 4, 5, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 0:
@@ -411,7 +414,7 @@ class Database:
         try:
             conn.execute("BEGIN IMMEDIATE")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version in (2, 3, 4, SCHEMA_VERSION):
+            if version in (2, 3, 4, 5, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 1:
@@ -433,7 +436,7 @@ class Database:
         try:
             conn.execute("BEGIN IMMEDIATE")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version in (3, 4, SCHEMA_VERSION):
+            if version in (3, 4, 5, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 2:
@@ -609,7 +612,7 @@ class Database:
         conn.execute("BEGIN IMMEDIATE")
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version in (4, SCHEMA_VERSION):
+            if version in (4, 5, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 3:
@@ -918,6 +921,46 @@ class Database:
             if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise sqlite3.DatabaseError("数据库完整性检查失败")
             conn.execute("PRAGMA user_version = 5")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _migrate_5_to_6(self):
+        """Persist host-approved MCP configuration and per-tool fingerprints."""
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == 6:
+                conn.commit()
+                return
+            if version != 5:
+                raise RuntimeError(f"不支持的数据库版本：{version}")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS mcp_servers (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    transport TEXT NOT NULL,
+                    command TEXT,
+                    args_json TEXT,
+                    url TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(mcp_servers)")}
+            if "approved_config_hash" not in columns:
+                conn.execute("ALTER TABLE mcp_servers ADD COLUMN approved_config_hash TEXT")
+            if "approved_tools_json" not in columns:
+                conn.execute(
+                    "ALTER TABLE mcp_servers ADD COLUMN approved_tools_json "
+                    "TEXT NOT NULL DEFAULT '{}'"
+                )
+            # Existing enabled rows predate approval evidence and must fail closed.
+            conn.execute("UPDATE mcp_servers SET enabled=0 WHERE approved_config_hash IS NULL")
+            conn.execute("PRAGMA user_version = 6")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1542,7 +1585,8 @@ class Database:
 
     def list_mcp_servers(self):
         return self._query_all("""
-            SELECT id, name, transport, command, args_json, url, enabled, created_at, updated_at
+            SELECT id, name, transport, command, args_json, url, enabled,
+                   approved_config_hash, approved_tools_json, created_at, updated_at
             FROM mcp_servers
             ORDER BY created_at DESC
         """)
@@ -1550,7 +1594,8 @@ class Database:
     def get_mcp_server(self, server_id):
         return self._query_one(
             """
-            SELECT id, name, transport, command, args_json, url, enabled, created_at, updated_at
+            SELECT id, name, transport, command, args_json, url, enabled,
+                   approved_config_hash, approved_tools_json, created_at, updated_at
             FROM mcp_servers
             WHERE id = ?
             """,
@@ -1564,30 +1609,88 @@ class Database:
         command=None,
         args=None,
         url=None,
-        enabled=True,
+        enabled=False,
     ):
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
+            raise ValueError("MCP Server 名称长度必须为 1-80")
+        if transport not in {"stdio", "streamable_http", "sse"}:
+            raise ValueError("不支持的 MCP transport")
+        if not isinstance(args or [], list) or any(not isinstance(arg, str) for arg in (args or [])):
+            raise ValueError("MCP args 必须为字符串数组")
         server_id = str(uuid.uuid4())
         now = self._now()
-        args_json = json.dumps(args or [], ensure_ascii=False)
+        args_json = _json(args or [])
         self._execute(
             """
             INSERT INTO mcp_servers
-                (id, name, transport, command, args_json, url, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, name, transport, command, args_json, url, enabled,
+                 approved_config_hash, approved_tools_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 0, NULL, '{}', ?, ?)
             """,
             (
                 server_id,
-                name,
+                name.strip(),
                 transport,
                 command,
                 args_json,
                 url,
-                1 if enabled else 0,
                 now,
                 now,
             ),
         )
         logger.info("DB 创建 MCP Server：server_id=%s，name=%s", server_id, name)
+        return self.get_mcp_server(server_id)
+
+    def approve_mcp_server(self, server_id, approved_config_hash, approved_tools):
+        if (not isinstance(approved_config_hash, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", approved_config_hash)):
+            raise ValueError("MCP 配置摘要无效")
+        if not isinstance(approved_tools, dict) or not approved_tools:
+            raise ValueError("至少批准一个 MCP 工具")
+        for remote_name, approved in approved_tools.items():
+            if not isinstance(remote_name, str) or not remote_name or not isinstance(approved, dict):
+                raise ValueError("MCP 工具审批无效")
+            effects = approved.get("effects")
+            approval = approved.get("approval")
+            if ((effects != ["read_only"] or approval != "never") and
+                    (effects != ["mcp.write"] or approval != "always")):
+                raise ValueError("MCP 工具策略无效")
+            if (not re.fullmatch(r"[0-9a-f]{64}", approved.get("schema_hash", ""))
+                    or not re.fullmatch(r"[0-9a-f]{64}", approved.get("fingerprint", ""))
+                    or not isinstance(approved.get("annotations"), dict)
+                    or type(approved.get("idempotent")) is not bool
+                    or not isinstance(approved.get("model_name"), str)
+                    or not 1 <= len(approved["model_name"]) <= 80):
+                raise ValueError("MCP 工具审批无效")
+        encoded = _json(approved_tools)
+        if len(encoded.encode("utf-8")) > 64 * 1024:
+            raise ValueError("MCP 工具审批超过大小限制")
+        cursor = self._execute(
+            """
+            UPDATE mcp_servers
+            SET enabled=0, approved_config_hash=?, approved_tools_json=?, updated_at=?
+            WHERE id=?
+            """,
+            (approved_config_hash, encoded, self._now(), server_id),
+        )
+        if cursor.rowcount != 1:
+            raise ResourceNotFound("MCP Server 不存在")
+        return self.get_mcp_server(server_id)
+
+    def set_mcp_server_enabled(self, server_id, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("enabled 必须为布尔值")
+        cursor = self._execute(
+            """
+            UPDATE mcp_servers SET enabled=?, updated_at=?
+            WHERE id=? AND (?=0 OR (approved_config_hash IS NOT NULL AND approved_tools_json<>'{}'))
+            """,
+            (1 if enabled else 0, self._now(), server_id, 1 if enabled else 0),
+        )
+        if cursor.rowcount != 1:
+            if not self.get_mcp_server(server_id):
+                raise ResourceNotFound("MCP Server 不存在")
+            raise ValueError("MCP Server 尚未批准")
         return self.get_mcp_server(server_id)
 
     def delete_mcp_server(self, server_id):

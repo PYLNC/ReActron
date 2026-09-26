@@ -18,7 +18,8 @@ from fastapi import HTTPException, Response
 from starlette.requests import Request
 
 from backend import auth, file_parser, harness, tool_gateway
-from backend.mcp.manager import MCPManager, MCPNotApproved, MCPServerConfig, config_hash, schema_hash
+from backend.db import Database
+from backend.mcp.manager import MCPError, MCPManager, _catalog_entry
 from backend.tool_gateway import (
     MAX_RAW_BYTES,
     RunContext,
@@ -547,15 +548,22 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
 
 
 class MCPTest(unittest.IsolatedAsyncioTestCase):
-    async def test_pending_config_never_spawns_or_discovers(self):
-        manager = MCPManager()
-        config = MCPServerConfig(id="one", name="test", command="relative.exe", enabled=True)
-        with patch.object(manager, "_open_session", new_callable=AsyncMock) as connect:
-            with self.assertRaises(MCPNotApproved):
-                await manager.discover(config)
-            with self.assertRaises(MCPNotApproved):
-                await manager.test_server(config)
-            connect.assert_not_called()
+    async def test_pending_invalid_config_is_visible_and_never_spawns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Database(Path(tmp) / "mcp.db")
+            try:
+                row = database.create_mcp_server("test", "stdio", command="relative.exe")
+                manager = MCPManager(database)
+                manager.load_configs()
+                self.assertEqual(manager.server_status()[0]["status"], "pending")
+                with patch.object(manager, "_open_session", new_callable=AsyncMock) as connect:
+                    with self.assertRaises(MCPError) as caught:
+                        await manager.discover_server(row["id"])
+                    self.assertEqual(caught.exception.code, "mcp_invalid_config")
+                    connect.assert_not_called()
+                self.assertEqual(manager.server_status()[0]["status"], "drift")
+            finally:
+                database.close()
 
     async def test_env_enabled_flag_is_ignored(self):
         manager = MCPManager()
@@ -565,36 +573,48 @@ class MCPTest(unittest.IsolatedAsyncioTestCase):
             manager.load_env_configs()
         self.assertFalse(manager.get_config("one").enabled)
 
-    async def test_config_change_and_unallowlisted_tool_never_connect(self):
-        manager = MCPManager()
+    async def test_approval_enable_snapshot_and_config_drift_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            executable = Path(tmp) / "server.exe"
-            executable.write_bytes(b"original")
-            config = MCPServerConfig(id="one", name="test", command=str(executable), enabled=True)
-            config.approved_config_hash = config_hash(config)
-            schema = {"type": "object", "properties": {}}
-            tool = type("Tool", (), {"name": "remote", "inputSchema": schema})()
-            manager._discovered[config.id] = [tool]
-            with patch.object(manager, "_open_session", new_callable=AsyncMock) as connect:
-                with self.assertRaises(MCPNotApproved):
-                    await manager.call(config, "remote", {})
-                connect.assert_not_called()
-                config.approved_tools["remote"] = {
-                    "schema_hash": schema_hash(schema), "effects": ["read_only"], "approval": "never"
-                }
-                executable.write_bytes(b"changed")
-                with self.assertRaises(MCPNotApproved):
-                    await manager.call(config, "remote", {})
-                connect.assert_not_called()
+            database = Database(Path(tmp) / "mcp.db")
+            try:
+                executable = Path(tmp) / "server.exe"
+                executable.write_bytes(b"original")
+                row = database.create_mcp_server("test", "stdio", command=str(executable))
+                manager = MCPManager(database)
+                manager.load_configs()
+                config = manager.get_config(row["id"])
+                tool = type("Tool", (), {
+                    "name": "remote", "description": "read", "annotations": {"readOnlyHint": True},
+                    "input_schema": {"type": "object", "properties": {}},
+                })()
+                entry = _catalog_entry(config, tool)
+                with patch.object(manager, "_discover", AsyncMock(return_value=([tool], [entry]))):
+                    approved = await manager.approve_server(row["id"], ["remote"])
+                    self.assertEqual(approved["server"]["status"], "approved_disabled")
+                    enabled = await manager.enable_server(row["id"])
+                self.assertEqual(enabled["server"]["status"], "enabled")
+                specs = manager.snapshot_tool_specs()
+                self.assertEqual(tuple(specs), (entry["model_name"],))
 
-    async def test_url_transport_disabled_without_connection_policy_hook(self):
-        manager = MCPManager()
-        config = MCPServerConfig(id="url", name="test", transport="sse", url="https://example.com", enabled=True,
-                                 approved_config_hash="claimed")
-        with patch.object(manager, "_open_session", new_callable=AsyncMock) as connect:
-            with self.assertRaises(MCPNotApproved):
-                await manager.discover(config)
-            connect.assert_not_called()
+                # Holding the ordinary DB Lock proves snapshots cannot query SQLite.
+                values = []
+                thread = threading.Thread(target=lambda: values.append(manager.snapshot_tool_specs()))
+                with database._lock:
+                    thread.start()
+                    thread.join(timeout=1)
+                    self.assertFalse(thread.is_alive(), "snapshot_tool_specs touched the DB")
+                thread.join(timeout=1)
+                self.assertIs(values[0], specs)
+
+                executable.write_bytes(b"changed")
+                with patch.object(manager, "_open_session", new_callable=AsyncMock) as connect:
+                    with self.assertRaises(PermissionError):
+                        await manager.call(row["id"], "remote", {})
+                    connect.assert_not_called()
+                self.assertEqual(manager.snapshot_tool_specs(), {})
+                self.assertEqual(manager.server_status()[0]["status"], "drift")
+            finally:
+                database.close()
 
 
 class HarnessAuditTest(unittest.TestCase):
