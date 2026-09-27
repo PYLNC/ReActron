@@ -64,6 +64,12 @@ countboter/
 └── README.md
 ```
 
+## 架构与流程文档
+
+- [RAG 与 MCP 端到端工作流](WORKFLOW_RAG_MCP.md)：Task、Run、Context、知识索引、引用和 MCP 审批执行链。
+- [RAG 设计](RAG_DESIGN.md)：Project 级知识库的数据模型、安全边界与验收细节。
+- [MCP 计划](MCP_PLAN.md)：MCP 信任模型、分阶段实现与验收清单。
+
 ## 环境变量
 
 把 `.env.example` 复制为 `.env` 并填写自己的密钥，或者直接在页面右上角“设置”里填写。
