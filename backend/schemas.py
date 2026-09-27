@@ -3,7 +3,15 @@
 from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StringConstraints,
+    model_validator,
+)
 from typing import Annotated
 
 
@@ -308,6 +316,51 @@ class ProjectRenameRequest(BaseModel):
     """重命名项目请求体。"""
 
     name: str = Field(min_length=1)
+
+
+class RAGEnabledRequest(BaseModel):
+    """Project RAG switches are host-only and never accept truthy coercion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: StrictBool
+
+
+class KnowledgeSearchRequest(BaseModel):
+    """Bounded host preview query; the server still owns MATCH generation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)]
+    top_k: StrictInt = Field(default=6, ge=1, le=10)
+
+
+class KnowledgeDocumentResponse(BaseModel):
+    document_id: str
+    title: str
+    size: int = Field(ge=0)
+    mime_type: Optional[str] = None
+    status: Literal["pending", "indexing", "ready", "failed", "deleting", "deleted"]
+    error_code: Optional[str] = None
+    chunk_count: int = Field(default=0, ge=0)
+    indexed_at: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class KnowledgeSourceResponse(BaseModel):
+    citation_id: str
+    chunk_id: str
+    title: str
+    locator: Dict[str, Any] = Field(default_factory=dict)
+    available: StrictBool
+    unavailable_reason: Optional[str] = None
+
+
+class KnowledgeSourcesResponse(BaseModel):
+    run_id: str
+    project_id: Optional[str] = None
+    sources: List[KnowledgeSourceResponse] = Field(default_factory=list)
 
 
 class SessionProjectRequest(BaseModel):

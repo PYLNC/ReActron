@@ -98,6 +98,7 @@ class AppLifespanTest(unittest.TestCase):
 
             def close(self):
                 self.closed = True
+                startup_order.append("database.close")
 
         class FakeManager:
             refreshed = False
@@ -120,14 +121,35 @@ class AppLifespanTest(unittest.TestCase):
                 startup_order.append("runner")
                 await super().start()
 
+            async def close(self):
+                startup_order.append("runner.close")
+                await super().close()
+
+        class FakeIndexer:
+            started = False
+            closed = False
+
+            async def start(self):
+                assert fake_db.initialized
+                assert fake_manager.refreshed
+                assert not fake_runner.started
+                startup_order.append("rag")
+                self.started = True
+
+            async def close(self):
+                startup_order.append("rag.close")
+                self.closed = True
+
         fake_db = FakeDatabase()
         fake_runner = OrderedRunner()
         fake_manager = FakeManager()
+        fake_indexer = FakeIndexer()
         with (
             patch.object(db_module, "db", fake_db),
             patch.object(runtime_module, "get_runner", return_value=fake_runner, create=True),
             patch("backend.security.validate_secret_key") as validate_secret_key,
             patch("backend.mcp.manager.get_manager", return_value=fake_manager),
+            patch("backend.rag.get_indexer", return_value=fake_indexer),
             patch.dict(sys.modules, {"backend.auth": SimpleNamespace(
                 issue_bootstrap_secret=lambda: "test-secret",
                 require_host_session=lambda request: None,
@@ -159,10 +181,15 @@ class AppLifespanTest(unittest.TestCase):
         self.assertNotIn(marker, "\n".join(logs.output))
         validate_secret_key.assert_called_once_with()
         self.assertTrue(fake_manager.refreshed)
-        self.assertEqual(startup_order, ["database", "mcp", "runner"])
+        self.assertEqual(startup_order, [
+            "database", "mcp", "rag", "runner", "runner.close", "rag.close",
+            "database.close",
+        ])
         self.assertTrue(fake_db.initialized)
         self.assertTrue(fake_runner.started)
         self.assertTrue(fake_runner.closed)
+        self.assertTrue(fake_indexer.started)
+        self.assertTrue(fake_indexer.closed)
         self.assertTrue(fake_db.closed)
 
     def test_failed_mcp_refresh_clears_before_runner_starts(self):
@@ -196,12 +223,21 @@ class AppLifespanTest(unittest.TestCase):
                 order.append("runner.close")
                 await super().close()
 
+        class FailedIndexer:
+            async def start(self):
+                order.append("rag.start")
+                raise RuntimeError("offline")
+
+            async def close(self):
+                raise AssertionError("failed indexer must not be closed as active")
+
         fake_db, fake_runner = FakeDatabase(), FakeRunner()
         with (
             patch.object(db_module, "db", fake_db),
             patch.object(runtime_module, "get_runner", return_value=fake_runner, create=True),
             patch("backend.security.validate_secret_key"),
             patch("backend.mcp.manager.get_manager", return_value=FakeManager()),
+            patch("backend.rag.get_indexer", return_value=FailedIndexer()),
             patch.dict(sys.modules, {"backend.auth": SimpleNamespace(
                 issue_bootstrap_secret=lambda: "test-secret",
                 require_host_session=lambda request: None,
@@ -211,7 +247,7 @@ class AppLifespanTest(unittest.TestCase):
         ):
             pass
 
-        self.assertEqual(order, ["database", "mcp.refresh", "mcp.clear", "runner",
+        self.assertEqual(order, ["database", "mcp.refresh", "mcp.clear", "rag.start", "runner",
                                  "runner.close", "database.close"])
 
     def test_invalid_secret_fails_before_database_or_mcp_import(self):
@@ -493,7 +529,9 @@ class Wave3RouteTest(unittest.TestCase):
             self.assertNotIn("lease_owner", response.text)
         self.assertEqual(fetched.status_code, 200)
         self.assertEqual(self.database.create_run.call_count, 2)
-        self.database.create_run.assert_called_with("task-1", "key-1")
+        self.database.create_run.assert_called_with(
+            "task-1", "key-1", None, None, None, "goal",
+        )
 
     def test_missing_key_extra_identity_invalid_limit_and_missing_resources(self):
         with patch.object(self.api, "db", self.database):

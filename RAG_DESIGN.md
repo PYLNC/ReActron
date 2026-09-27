@@ -26,7 +26,7 @@ Host 上传文档
 ### 2.1 P0 目标
 
 - 文档只能被同一个 Project 下的 Agent/Run 检索。
-- 支持现有解析能力覆盖的 `.txt`、`.md`、`.json`、`.log`、`.csv`、`.xlsx`、`.pptx`。
+- 支持 `.txt`、`.md`、`.json`、`.log`、`.csv`、`.xlsx`、`.pptx`、`.docx` 和含文本层的 `.pdf`。
 - 上传后异步索引，状态可见，进程重启后能够恢复。
 - 中文、英文和代码内容均可进行本地关键词检索。
 - 创建 Run 时冻结检索引用，避免同一个 Run 因索引变化得到不同来源。
@@ -42,17 +42,17 @@ Host 上传文档
 - 不实现 LLM 查询改写、LLM 重排或自动摘要索引。
 - 不抓取网页、Git 仓库、MCP Resources 或远程知识源。
 - 不保证模型生成的每个事实都带引用；P0 只提供来源与引用协议。
-- 不在 P0 支持 PDF、DOCX、扫描件 OCR。
+- 不在 P0 支持扫描件 OCR；无文本层的 PDF 以 `document_no_text` 失败关闭。
 - 不把普通聊天附件自动加入知识库；知识库上传必须是显式 Host 操作。
 
 ## 3. 当前工程锚点
 
 | 现有能力 | 复用方式 | 当前限制 |
 | --- | --- | --- |
-| `backend/db.py` | 新增 v7 migration、知识 CRUD、持久化索引领取 | 当前 schema v6，无知识表 |
+| `backend/db.py` | v7 migration、知识 CRUD、持久化索引领取 | v7 已加入知识表、FTS capability 和冻结引用 |
 | `projects` / `sessions.project_id` | 作为唯一检索隔离边界 | 普通 `uploaded_files` 是全局附件，知识文件不能写入该表 |
-| `backend/file_parser.py` | 复用 ZIP 炸弹检查和 Office 解析库 | 当前只产生预览，Excel/PPT/CSV 都会截断 |
-| `backend/context.py` | 注入冻结的检索片段并继续执行 64,000 字符检查 | 当前只组装消息历史和 Task 输入 |
+| `backend/file_parser.py` / `backend/rag_extract.py` | 复用 ZIP 炸弹检查并在子进程执行有界全文提取 | DOCX 与数字 PDF 已覆盖，OCR 未覆盖 |
+| `backend/context.py` | 注入冻结的检索片段并继续执行 64,000 字符检查 | 预算不足时先移除低排名资料，不截断可信核心消息 |
 | `runs.*_snapshot_json` | 沿用不可变、可核验的 Run 快照模式 | 需要独立 `rag_snapshot_json`，不能混入 Provider 快照 |
 | `backend/app.py` lifespan | 启停一个索引 Worker并执行崩溃恢复 | 必须在 DB 关闭前停止 Worker |
 | Exact Origin + Host cookie | 保护知识管理 API | 不新增匿名或模型可调用的管理入口 |
@@ -130,14 +130,16 @@ CREATE TABLE knowledge_documents (
 );
 
 CREATE UNIQUE INDEX uq_knowledge_document_content
-ON knowledge_documents(project_id, content_sha256, parser_version)
+ON knowledge_documents(project_id, content_sha256)
 WHERE deleted_at IS NULL;
 
 CREATE INDEX idx_knowledge_document_queue
 ON knowledge_documents(status, lease_until, created_at);
 ```
 
-相同 Project、相同文件哈希、相同 parser version 的重复上传返回已有 Document，不重复索引。知识文件使用 `data/knowledge/{document_id}` 下的服务端随机名称，不登记到全局 `uploaded_files`；否则现有 `read_uploaded_file(file_id)` 会绕过 Project 边界。物理文件删除后将 `stored_path` 置空，只保留不含正文和路径的 Document tombstone。
+相同 Project、相同文件哈希的重复上传返回已有 Document，不因 `parser_version` 不同而复制同一份活动内容。`parser_version` 只记录首次索引所用解析器版本；升级解析器不会绕过去重约束，重建必须走后续显式流程。知识文件使用 `data/knowledge/{document_id}` 下的服务端随机名称，不登记到全局 `uploaded_files`；否则现有 `read_uploaded_file(file_id)` 会绕过 Project 边界。物理文件删除后将 `stored_path` 置空，只保留不含正文和路径的 Document tombstone。
+
+早期开发版 v7 曾短暂使用 `(project_id, content_sha256, parser_version)`。启动时会检查索引列，保留每组最早活动 Document，把其余重复项原子标记为 `deleting`，再重建二列唯一索引；这只是同版本开发数据修复，不改变正式 schema 版本。
 
 ### 5.3 Chunk 与 FTS5
 
@@ -220,6 +222,8 @@ locator: dict
 | CSV | 所有受限行，保留表头 | `row_start`, `row_end` |
 | XLSX | 所有受限工作表，`read_only=True` | `sheet`, `row_start`, `row_end` |
 | PPTX | 所有受限幻灯片文本 | `slide` |
+| DOCX | 正文、表格、页眉页脚与脚注，保留标题层级 | `part`, `paragraph_*`, `table`, `row_*` |
+| 数字 PDF | 逐页读取已有文本层，不执行 OCR | `page` |
 
 统一硬上限：
 
@@ -228,6 +232,7 @@ locator: dict
 - Excel 最多 20 个 Sheet、每 Sheet 20,000 行、每行 256 单元格。
 - CSV 最多 100,000 行、每行 256 列。
 - JSON 最大深度 32、最大节点数 200,000。
+- PPTX 与 PDF 最多 2,000 页/幻灯片；加密 PDF 和无文本层 PDF 使用固定错误码失败。
 - 超限统一失败为 `document_limit_exceeded`，不静默截断后标记 ready。
 
 ### 6.3 规范化与 Chunk
@@ -261,14 +266,13 @@ locator: dict
 ```text
 DB ordinary-table migration
 -> RAG capability check / ensure_rag_fts
--> expired lease recovery
--> RAGIndexer.start
 -> MCP refresh
+-> expired RAG lease recovery / RAGIndexer.start
 -> TaskRunner.start
 -> app ready
 ```
 
-关闭顺序相反，数据库最后关闭。
+关闭时先停 TaskRunner，再停 RAGIndexer，数据库最后关闭。FTS capability 缺失或 RAGIndexer 启动失败只关闭本次 RAG 能力：聊天、Runner 与 MCP 继续启动；上传/启用/检索返回稳定 `rag_unavailable` 或保留为可恢复的 pending，不把解析器异常正文暴露给 Host。
 
 ## 8. 检索设计
 
@@ -282,7 +286,7 @@ goal + acceptance + current input
 
 - NFKC 规范化。
 - 总查询最多 4,000 字符。
-- 服务端从标点/空白边界提取最多 32 个、长度 3..64 的中文、英文和代码片段；去重后把片段内部 `"` 双写、逐个用双引号包裹，并只用固定的 `OR` 连接。
+- 服务端从标点/空白边界提取最多 32 个、长度 3..64 的英文和代码片段；连续长中文按重叠三元组拆分，因此整句中文不依赖空格也能命中。代码标识符保留 `_./:#@+-`，并补充 camelCase、PascalCase、数字子词；去重后把片段内部 `"` 双写、逐个用双引号包裹，并只用固定的 `OR` 连接。
 - 最终 MATCH 字符串整体作为绑定参数传入；原始输入不能成为列过滤、运算符或括号。
 - 只有不足 3 字符且无可用长片段时，才对当前 Project 使用受限 `instr(content, ?)` fallback。
 
@@ -381,6 +385,7 @@ RAG 消息、历史消息、当前输入、Provider 快照和工具快照共同�
 ### 10.1 API
 
 ```text
+GET    /api/rag/status
 GET    /api/projects/{project_id}/knowledge
 POST   /api/projects/{project_id}/knowledge          multipart upload
 GET    /api/projects/{project_id}/knowledge/{id}
@@ -389,14 +394,16 @@ POST   /api/projects/{project_id}/knowledge/{id}/retry
 PUT    /api/projects/{project_id}/rag-enabled        {"enabled": true}
 POST   /api/projects/{project_id}/knowledge/search   Host 调试检索
 GET    /api/runs/{run_id}/knowledge-sources
+GET    /api/runs/{run_id}/knowledge-sources/{Kx}
 ```
 
 约束：
 
 - 每个路由先校验 Project 存在，再执行严格 Project 条件查询。
 - search 请求只接受 `query` 和 `top_k<=10`，不会成为模型工具。
-- 列表不返回绝对路径或全文。
-- 详情只返回固定长度预览、locator、状态和安全错误码。
+- status/list 返回 capability、队列深度、各状态数量与容量使用，不返回 query、绝对路径、哈希或全文。
+- 单文件上限 20 MiB；单 Project 最多 500 个活动文档、512 MiB 源文件。超限文件和数据库登记失败都会尽力清理本次随机存储文件；清理失败只记录安全日志，不能覆盖原 API 响应或原始异常。
+- Document 详情只返回安全元数据；Run citation detail 重新核验冻结 Project/chunk/hash 后最多返回 1,200 字符预览，删除或漂移时只返回 `unavailable_reason`。
 - `retry` 只允许 failed；ready 重建留到 P1。
 - 删除使用 `202` 或返回 deleting 状态，不假装磁盘文件已同步清除。
 
@@ -411,6 +418,9 @@ GET    /api/runs/{run_id}/knowledge-sources
 - failed 提供 retry，所有删除均需确认。
 - Host 检索预览：输入 query，显示 `[K1]`、标题、locator 和短片段。
 - Run 详情显示“本次引用来源”，与模型正文分离。
+- 来源映射明确区分 `available`、`unavailable` 和回答中存在但快照未知的 `[Kx]`。
+- 会话历史为每条消息返回其自身 `run_id`；前端按 Run 隔离来源缓存，历史回答绝不借用当前 Run 的同名 `[Kx]`。
+- 引用详情点击后调用 citation detail 端点读取有界 preview；切换 Run 会使旧请求失效，迟到响应不能覆盖新 Run 的详情。
 
 ## 11. 删除、更新与 Project 生命周期
 
@@ -426,11 +436,11 @@ GET    /api/runs/{run_id}/knowledge-sources
 
 ### 11.2 更新与重建
 
-P0 的 Document 内容不可原地覆盖，也不自动重建 ready 文档。新文件产生新 Document；相同内容去重。parser version 只影响此后上传的文档，现有 ready 文档保持原版本，避免引入双 generation 状态机。在线原子重建放到 P1。
+P0 的 Document 内容不可原地覆盖，也不自动重建 ready 文档。不同内容产生新 Document；相同内容始终返回现有活动 Document，并保留其 `parser_version` 元数据。解析器升级不会隐式制造同内容副本；需要重新解析时由后续显式重建流程替换索引 generation。
 
 ### 11.3 删除 Project
 
-现有 Project 是组织文件夹，删除非默认 Project 会把 Session 移到默认 Project。知识文档必须在同一事务中一并移动到默认 Project；复合外键通过 `ON UPDATE CASCADE` 同步 Chunk 的 Project。若目标 Project 已有相同哈希与 parser version，先删除来源 Document 的 Chunk并设为 `deleting, deleted_at=now`，再移动该记录及其余文档，最后删除原 Project；提交后由删除 Worker 清理物理文件并转为 deleted tombstone。旧 Run 始终使用自己的冻结 Project，因此不会因 Session 被移动而改读默认 Project。UI 明确显示该行为，不能静默跨 Project 暴露。
+现有 Project 是组织文件夹，删除非默认 Project 会把 Session 移到默认 Project。知识文档必须在同一事务中一并移动到默认 Project；复合外键通过 `ON UPDATE CASCADE` 同步 Chunk 的 Project。若目标 Project 已有相同内容哈希，无论双方 parser version 是否相同，都先删除来源 Document 的 Chunk并设为 `deleting, deleted_at=now`，再移动该记录及其余文档，最后删除原 Project；提交后由删除 Worker清理物理文件并转为 deleted tombstone。旧 Run 始终使用自己的冻结 Project，因此不会因 Session 被移动而改读默认 Project。删除确认必须明确告知“会话和知识文档迁移到默认 Project、重复知识合并、历史内容无法撤回”，不能静默跨 Project 暴露。
 
 ## 12. 安全模型
 
@@ -440,7 +450,7 @@ P0 的 Document 内容不可原地覆盖，也不自动重建 ready 文档。新
 | Prompt injection | 固定不可信资料说明，JSON 包装，资料不能生成 grant/tool spec |
 | SQL/FTS 注入 | 服务端分词和绑定参数，不接受原始 MATCH 语法 |
 | ZIP/解析炸弹 | 复用 ZIP 检查并增加文本/行/节点硬上限 |
-| 路径逃逸 | 只读取 DB 登记、位于 upload root 的规范路径和普通文件 |
+| 路径逃逸 | 索引和删除时都复验 DB 路径必须是 `data/knowledge/` 的直接普通文件；拒绝目录外路径、目录、符号链接和 junction |
 | 敏感信息进入日志 | 日志仅记录 document/chunk ID、字节数和固定错误码 |
 | 删除后继续召回 | deleting 立即过滤；snapshot 只存 ID/hash；context 再核验 |
 | 崩溃产生半索引 | lease 恢复；Chunk+FTS+ready 单事务提交 |
@@ -465,7 +475,8 @@ static/
   app.js            上传、状态、检索预览、Run来源
   style.css         仅增加现有风格所需状态样式
 tests/
-  test_rag.py       DB、提取、切块、检索、冻结、恢复、删除
+  test_rag_db.py    DB、检索、冻结、恢复、删除与开发版 v7 修复
+  test_rag_core.py  提取、切块与索引 Worker
   test_rag_api.py   Project隔离、Host认证、投影与UI契约
 RAG_DESIGN.md       本文档
 README.md           P0完成后才更新运行说明
@@ -502,7 +513,7 @@ CHANGELOG.md        P0完成后记录行为变化
 
 ### P1：有数据证明需要后再做
 
-- PDF、DOCX；扫描件 OCR 仍单独评估。
+- 扫描件 PDF/图片 OCR；当前数字 PDF 和 DOCX 不需要等待 P1。
 - 可选语义向量与 FTS Reciprocal Rank Fusion。
 - 单独的 embedding endpoint/model/API key；密钥 Fernet 加密并绑定 endpoint origin。
 - 每个 Project 显式 opt-in 后才允许把文档正文和检索 query 发送给 embedding Provider；UI 必须同时说明两类数据外送。
@@ -525,9 +536,9 @@ CHANGELOG.md        P0完成后记录行为变化
 
 只保留六组参数化回归，不为每个函数复制测试：
 
-- v6 -> v7 migration；FTS/trigram 缺失时 RAG unavailable、聊天仍启动。
-- 各格式正常提取与统一硬上限；Chunk 确定性和重复上传去重。
-- 中文、英文、代码检索；Project 隔离；特殊字符不能改变 MATCH 语法。
+- v6 -> v7 migration；早期 v7 三列去重索引自修复；FTS/trigram 缺失时 RAG unavailable、聊天仍启动。
+- 文本、表格、Office、DOCX 和数字 PDF 正常提取及统一硬上限；Chunk 确定性和跨 parser version 内容去重。
+- 长中文、英文、camelCase/路径/代码检索；Project 隔离；特殊字符不能改变 MATCH 语法。
 - Worker claim/lease/失败恢复；事务索引；删除后 FTS 无孤儿。
 - Run 快照不含正文/路径/查询/秘密；重试稳定；删除或 hash 漂移后正文不可读；总 Context 不超 64,000 字符。
 - API Host/Origin/Project 投影，以及恶意文档不能绕过 Gateway、审批或前端 `textContent`。
@@ -552,7 +563,7 @@ CHANGELOG.md        P0完成后记录行为变化
 - 检索候选数、最终数量、耗时、是否触发短词 fallback。
 - Context 中跳过的 missing/hash-mismatch Chunk 数。
 
-SQLite 备份必须连同 `data/knowledge/` 一起执行。只恢复数据库或只恢复知识文件目录都应把受影响 Document 标记为 failed，而不是索引空内容。
+当前只实现 schema 升级前的 SQLite 文件备份，没有实现数据库与 `data/knowledge/` 的一致性快照或自动恢复校验。运维备份必须在应用停止后同时复制数据库及知识目录；在线一致性备份、缺文件扫描和自动标记 failed 仍是待交付项，本文不把它们计入已完成能力。
 
 ## 17. 完成定义
 

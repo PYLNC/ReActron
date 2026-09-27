@@ -1159,6 +1159,117 @@ button {
   border: 1px solid var(--border);
 }
 
+.knowledge-capability-row,
+.knowledge-actions,
+.knowledge-search > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.knowledge-capability-row {
+  justify-content: space-between;
+}
+
+.knowledge-state {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.knowledge-state.available { color: var(--green); }
+.knowledge-state.unavailable { color: var(--red); }
+.knowledge-state.unknown { color: var(--orange); }
+
+.knowledge-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+}
+
+.knowledge-disclosure,
+.knowledge-capacity {
+  margin: 0;
+  color: var(--secondary);
+  font-size: 11px;
+}
+
+.knowledge-actions button {
+  flex: 1;
+}
+
+.knowledge-list,
+.knowledge-results {
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.knowledge-list li,
+.knowledge-results li {
+  padding: 7px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+}
+
+.knowledge-list small,
+.knowledge-results small {
+  display: block;
+  color: var(--secondary);
+}
+
+.knowledge-search {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11px;
+}
+
+.knowledge-search input {
+  min-width: 0;
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+}
+
+.citation-detail {
+  max-height: 220px;
+  margin: 0;
+  padding: 8px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--secondary);
+  font: inherit;
+  font-size: 11px;
+}
+
+.citation-map {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 5px;
+}
+
+.citation-map button {
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.citation-map button.unavailable,
+.citation-map button.unknown {
+  color: var(--red);
+}
+
 @media (max-width: 760px) {
   .layout {
     grid-template-columns: 1fr;

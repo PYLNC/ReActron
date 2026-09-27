@@ -6,6 +6,7 @@ import logging
 import re
 import sqlite3
 import threading
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -17,9 +18,13 @@ from backend.config import BASE_DIR
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "countboter.db"
 logger = logging.getLogger("agent.db")
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MAX_EVENT_BYTES = 64 * 1024
 MAX_RUN_EVENT_BYTES = 4 * 1024 * 1024
+MAX_RAG_SNAPSHOT_BYTES = 64 * 1024
+MAX_RAG_CONTEXT_CHARS = 12_000
+MAX_RAG_SEARCH_CANDIDATES = 40
+MAX_RAG_CHUNKS_PER_DOCUMENT = 50_000
 TERMINAL_EVENT_RESERVE = 8 * 1024
 CHILD_RECEIPT_RESERVE = 4096
 TERMINAL_EVENTS = frozenset({"run.completed", "run.failed", "run.cancelled"})
@@ -90,6 +95,7 @@ class Database:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._existing_file = self.db_path.exists()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._rag_fts_available = False
         try:
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA busy_timeout = 5000")
@@ -97,6 +103,7 @@ class Database:
             self._conn.execute("PRAGMA synchronous = NORMAL")
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._init_tables()
+            self._rag_fts_available = self.ensure_rag_fts()
         except Exception:
             self._conn.close()
             raise
@@ -165,8 +172,13 @@ class Database:
             if version == 5 and SCHEMA_VERSION >= 6:
                 self._migrate_5_to_6()
                 version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == 6 and SCHEMA_VERSION >= 7:
+                self._migrate_6_to_7()
+                version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
                 raise RuntimeError(f"不支持的数据库版本：{version}")
+            if version >= 7:
+                self._ensure_rag_content_dedupe_index()
             if version >= 5:
                 self._conn.execute("""
                     CREATE TRIGGER IF NOT EXISTS trg_task_terminal_retain_worktree
@@ -724,7 +736,7 @@ class Database:
         conn.execute("BEGIN IMMEDIATE")
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version == 5:
+            if version in (5, 6, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 4:
@@ -932,7 +944,7 @@ class Database:
         conn.execute("BEGIN IMMEDIATE")
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version == 6:
+            if version in (6, SCHEMA_VERSION):
                 conn.commit()
                 return
             if version != 5:
@@ -966,6 +978,162 @@ class Database:
             conn.rollback()
             raise
 
+    def _migrate_6_to_7(self):
+        """Add project-scoped RAG storage; FTS remains a runtime capability."""
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == SCHEMA_VERSION:
+                conn.commit()
+                return
+            if version != 6:
+                raise RuntimeError(f"不支持的数据库版本：{version}")
+            conn.execute(
+                "ALTER TABLE projects ADD COLUMN rag_enabled INTEGER NOT NULL "
+                "DEFAULT 0 CHECK (rag_enabled IN (0,1))"
+            )
+            conn.execute(
+                "ALTER TABLE runs ADD COLUMN rag_snapshot_json TEXT NOT NULL "
+                "DEFAULT '{\"v\":1,\"chunks\":[]}' "
+                "CHECK (length(CAST(rag_snapshot_json AS BLOB)) BETWEEN 1 AND 65536) "
+                "CHECK (json_valid(rag_snapshot_json) AND json_type(rag_snapshot_json)='object')"
+            )
+            conn.execute("""
+                CREATE TABLE knowledge_documents (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES projects(id) ON DELETE RESTRICT,
+                    title TEXT NOT NULL
+                        CHECK (length(trim(title)) BETWEEN 1 AND 500),
+                    stored_path TEXT,
+                    size INTEGER NOT NULL CHECK (size >= 0),
+                    mime_type TEXT,
+                    content_sha256 TEXT NOT NULL
+                        CHECK (length(content_sha256) = 64 AND
+                               content_sha256 NOT GLOB '*[^0-9a-f]*'),
+                    parser_version INTEGER NOT NULL CHECK (parser_version >= 1),
+                    status TEXT NOT NULL CHECK (status IN
+                        ('pending','indexing','ready','failed','deleting','deleted')),
+                    error_code TEXT,
+                    chunk_count INTEGER NOT NULL DEFAULT 0
+                        CHECK (chunk_count BETWEEN 0 AND 50000),
+                    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+                    lease_owner TEXT,
+                    lease_until TEXT,
+                    indexed_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    deleted_at TEXT,
+                    UNIQUE (id, project_id),
+                    CHECK (status = 'deleted' OR stored_path IS NOT NULL),
+                    CHECK ((status = 'indexing' AND lease_owner IS NOT NULL AND
+                            lease_until IS NOT NULL) OR
+                           (status <> 'indexing' AND lease_owner IS NULL AND
+                            lease_until IS NULL)),
+                    CHECK (status NOT IN ('deleting','deleted') OR deleted_at IS NOT NULL)
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX uq_knowledge_document_content
+                ON knowledge_documents(project_id,content_sha256)
+                WHERE deleted_at IS NULL
+            """)
+            conn.execute("""
+                CREATE INDEX idx_knowledge_document_queue
+                ON knowledge_documents(status,lease_until,created_at,id)
+            """)
+            conn.execute("""
+                CREATE TABLE knowledge_chunks (
+                    rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
+                    document_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL
+                        REFERENCES projects(id) ON DELETE RESTRICT,
+                    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                    title TEXT NOT NULL,
+                    section TEXT NOT NULL DEFAULT '',
+                    content TEXT NOT NULL CHECK (length(content) > 0),
+                    content_sha256 TEXT NOT NULL
+                        CHECK (length(content_sha256) = 64 AND
+                               content_sha256 NOT GLOB '*[^0-9a-f]*'),
+                    locator_json TEXT NOT NULL
+                        CHECK (json_valid(locator_json) AND json_type(locator_json)='object'),
+                    char_count INTEGER NOT NULL CHECK (char_count > 0),
+                    UNIQUE (document_id, ordinal),
+                    FOREIGN KEY (document_id, project_id)
+                        REFERENCES knowledge_documents(id, project_id)
+                        ON UPDATE CASCADE ON DELETE CASCADE
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX idx_knowledge_chunks_project_document
+                ON knowledge_chunks(project_id,document_id,ordinal)
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_run_rag_snapshot_immutable
+                BEFORE UPDATE OF rag_snapshot_json ON runs
+                WHEN NEW.rag_snapshot_json IS NOT OLD.rag_snapshot_json AND
+                     OLD.rag_snapshot_json <> '{"v":1,"chunks":[]}'
+                BEGIN SELECT RAISE(ABORT,'run RAG snapshot is immutable'); END
+            """)
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError(
+                    f"数据库外键检查失败：{[tuple(row) for row in violations]}"
+                )
+            conn.execute("PRAGMA user_version = 7")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _ensure_rag_content_dedupe_index(self):
+        """Repair prerelease v7 databases that briefly keyed dedupe by parser version."""
+        columns = [
+            row["name"] for row in self._conn.execute(
+                "PRAGMA index_info(uq_knowledge_document_content)"
+            )
+        ]
+        if columns == ["project_id", "content_sha256"]:
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self._conn.execute("""
+                SELECT id,project_id,content_sha256
+                FROM knowledge_documents
+                WHERE deleted_at IS NULL
+                ORDER BY project_id,content_sha256,created_at,id
+            """).fetchall()
+            seen, duplicates = set(), []
+            for row in rows:
+                key = (row["project_id"], row["content_sha256"])
+                if key in seen:
+                    duplicates.append(row["id"])
+                else:
+                    seen.add(key)
+            now = _utc_now()
+            for document_id in duplicates:
+                self._conn.execute(
+                    "DELETE FROM knowledge_chunks WHERE document_id=?", (document_id,)
+                )
+                self._conn.execute("""
+                    UPDATE knowledge_documents
+                    SET status='deleting',deleted_at=?,lease_owner=NULL,lease_until=NULL,
+                        chunk_count=0,error_code=NULL,updated_at=?
+                    WHERE id=?
+                """, (now, now, document_id))
+            self._conn.execute("DROP INDEX IF EXISTS uq_knowledge_document_content")
+            self._conn.execute("""
+                CREATE UNIQUE INDEX uq_knowledge_document_content
+                ON knowledge_documents(project_id,content_sha256)
+                WHERE deleted_at IS NULL
+            """)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def _verify_integrity(self):
         violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
@@ -975,6 +1143,112 @@ class Database:
         integrity = self._conn.execute("PRAGMA integrity_check").fetchone()[0]
         if integrity != "ok":
             raise sqlite3.DatabaseError(f"数据库完整性检查失败：{integrity}")
+
+    def ensure_rag_fts(self):
+        """Probe FTS5/trigram and install the external-content index if available."""
+        trigger_names = {
+            "trg_knowledge_chunks_fts_insert",
+            "trg_knowledge_chunks_fts_delete",
+            "trg_knowledge_chunks_fts_update",
+        }
+
+        def disable_sync_triggers(conn):
+            """Keep ordinary RAG writes usable after an FTS capability downgrade."""
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for name in trigger_names:
+                    conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+                conn.commit()
+            except sqlite3.Error:
+                conn.rollback()
+
+        with self._lock:
+            conn = self._conn
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge_chunks'"
+            ).fetchone() is None:
+                self._rag_fts_available = False
+                return False
+            try:
+                conn.execute("DROP TABLE IF EXISTS temp.__rag_fts_probe")
+                conn.execute("""
+                    CREATE VIRTUAL TABLE temp.__rag_fts_probe
+                    USING fts5(content, tokenize='trigram')
+                """)
+                conn.execute("DROP TABLE temp.__rag_fts_probe")
+                conn.commit()
+            except sqlite3.Error as exc:
+                conn.rollback()
+                disable_sync_triggers(conn)
+                logger.warning("RAG FTS5/trigram 不可用：%s", type(exc).__name__)
+                self._rag_fts_available = False
+                return False
+
+            existed = conn.execute("""
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='knowledge_chunks_fts'
+            """).fetchone() is not None
+            existing_triggers = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' "
+                    "AND name LIKE 'trg_knowledge_chunks_fts_%'"
+                ).fetchall()
+            }
+            needs_rebuild = not existed or not trigger_names.issubset(existing_triggers)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(
+                        title,
+                        section,
+                        content,
+                        content='knowledge_chunks',
+                        content_rowid='rowid',
+                        tokenize='trigram'
+                    )
+                """)
+                conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS trg_knowledge_chunks_fts_insert
+                    AFTER INSERT ON knowledge_chunks BEGIN
+                        INSERT INTO knowledge_chunks_fts(rowid,title,section,content)
+                        VALUES (new.rowid,new.title,new.section,new.content);
+                    END
+                """)
+                conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS trg_knowledge_chunks_fts_delete
+                    AFTER DELETE ON knowledge_chunks BEGIN
+                        INSERT INTO knowledge_chunks_fts(
+                            knowledge_chunks_fts,rowid,title,section,content
+                        ) VALUES ('delete',old.rowid,old.title,old.section,old.content);
+                    END
+                """)
+                conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS trg_knowledge_chunks_fts_update
+                    AFTER UPDATE ON knowledge_chunks BEGIN
+                        INSERT INTO knowledge_chunks_fts(
+                            knowledge_chunks_fts,rowid,title,section,content
+                        ) VALUES ('delete',old.rowid,old.title,old.section,old.content);
+                        INSERT INTO knowledge_chunks_fts(rowid,title,section,content)
+                        VALUES (new.rowid,new.title,new.section,new.content);
+                    END
+                """)
+                if needs_rebuild:
+                    conn.execute(
+                        "INSERT INTO knowledge_chunks_fts(knowledge_chunks_fts) "
+                        "VALUES ('rebuild')"
+                    )
+                conn.commit()
+            except sqlite3.Error as exc:
+                conn.rollback()
+                disable_sync_triggers(conn)
+                logger.warning("RAG FTS 初始化失败，主应用继续启动：%s", type(exc).__name__)
+                self._rag_fts_available = False
+                return False
+        self._rag_fts_available = True
+        return True
+
+    def rag_fts_available(self):
+        return bool(self._rag_fts_available)
 
     @staticmethod
     def _now():
@@ -1398,22 +1672,25 @@ class Database:
         )
 
     def list_projects(self):
-        return self._query_all("""
+        rag_column = "p.rag_enabled" if self._project_has_rag() else "0 AS rag_enabled"
+        return self._query_all(f"""
             SELECT
                 p.id,
                 p.name,
                 p.created_at,
                 p.updated_at,
                 p.is_default,
+                {rag_column},
                 (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id) AS session_count
             FROM projects p
             ORDER BY p.updated_at DESC
         """)
 
     def _get_or_create_default_project(self):
+        rag_column = "rag_enabled" if self._project_has_rag() else "0 AS rag_enabled"
         project = self._query_one(
-            """
-            SELECT id, name, created_at, updated_at, is_default
+            f"""
+            SELECT id, name, created_at, updated_at, is_default, {rag_column}
             FROM projects
             WHERE is_default = 1
             """
@@ -1423,10 +1700,19 @@ class Database:
         return project
 
     def get_project(self, project_id):
+        rag_column = "rag_enabled" if self._project_has_rag() else "0 AS rag_enabled"
         return self._query_one(
-            "SELECT id, name, created_at, updated_at, is_default FROM projects WHERE id = ?",
+            f"SELECT id, name, created_at, updated_at, is_default, {rag_column} "
+            "FROM projects WHERE id = ?",
             (project_id,),
         )
+
+    def _project_has_rag(self):
+        with self._lock:
+            return any(
+                row["name"] == "rag_enabled"
+                for row in self._conn.execute("PRAGMA table_info(projects)")
+            )
 
     def create_project(self, name):
         project_id = str(uuid.uuid4())
@@ -1462,6 +1748,31 @@ class Database:
                 ).fetchone()
                 if not default_project:
                     raise RuntimeError("默认项目不存在")
+                now = _utc_now()
+                conflicts = self._conn.execute("""
+                    SELECT source.id
+                    FROM knowledge_documents AS source
+                    JOIN knowledge_documents AS target
+                     ON target.project_id=?
+                     AND target.content_sha256=source.content_sha256
+                     AND target.deleted_at IS NULL
+                    WHERE source.project_id=? AND source.deleted_at IS NULL
+                """, (default_project["id"], project_id)).fetchall()
+                for conflict in conflicts:
+                    self._conn.execute(
+                        "DELETE FROM knowledge_chunks WHERE document_id=?",
+                        (conflict["id"],),
+                    )
+                    self._conn.execute("""
+                        UPDATE knowledge_documents
+                        SET status='deleting',deleted_at=?,lease_owner=NULL,
+                            lease_until=NULL,chunk_count=0,error_code=NULL,updated_at=?
+                        WHERE id=?
+                    """, (now, now, conflict["id"]))
+                self._conn.execute("""
+                    UPDATE knowledge_documents SET project_id=?,updated_at=?
+                    WHERE project_id=?
+                """, (default_project["id"], now, project_id))
                 self._conn.execute(
                     "UPDATE sessions SET project_id = ? WHERE project_id = ?",
                     (default_project["id"], project_id),
@@ -1473,6 +1784,675 @@ class Database:
                 raise
         logger.info("DB 删除项目：project_id=%s", project_id)
         return True
+
+    @staticmethod
+    def _rag_hash(value, field="content_sha256"):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            raise ValueError(f"{field} 必须是 64 位 SHA-256")
+        return value.lower()
+
+    @staticmethod
+    def _rag_error_code(value):
+        if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", value):
+            raise ValueError("error_code 必须是 1..64 位小写标识")
+        return value
+
+    def register_rag_document(self, project_id, title, stored_path, size, mime_type,
+                              content_sha256, parser_version=1, document_id=None):
+        """Register one immutable source file, deduplicated within its Project."""
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("project_id 不能为空")
+        if not isinstance(title, str) or not 1 <= len(title.strip()) <= 500:
+            raise ValueError("title 必须为 1..500 字符")
+        path = str(stored_path).strip() if stored_path is not None else ""
+        if not 1 <= len(path) <= 32768:
+            raise ValueError("stored_path 无效")
+        if type(size) is not int or size < 0:
+            raise ValueError("size 必须是非负整数")
+        if mime_type is not None and (
+            not isinstance(mime_type, str) or len(mime_type) > 200
+        ):
+            raise ValueError("mime_type 无效")
+        if type(parser_version) is not int or parser_version < 1:
+            raise ValueError("parser_version 必须是正整数")
+        digest = self._rag_hash(content_sha256)
+        if document_id is None:
+            document_id = str(uuid.uuid4())
+        if not isinstance(document_id, str) or not 1 <= len(document_id) <= 200:
+            raise ValueError("document_id 无效")
+        now = _utc_now()
+        try:
+            with self._write() as conn:
+                if not conn.execute(
+                    "SELECT 1 FROM projects WHERE id=?", (project_id,)
+                ).fetchone():
+                    raise ResourceNotFound("Project 不存在")
+                existing = conn.execute("""
+                    SELECT * FROM knowledge_documents
+                    WHERE project_id=? AND content_sha256=?
+                      AND deleted_at IS NULL
+                """, (project_id, digest)).fetchone()
+                if existing:
+                    return dict(existing), False
+                conn.execute("""
+                    INSERT INTO knowledge_documents
+                        (id,project_id,title,stored_path,size,mime_type,content_sha256,
+                         parser_version,status,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,'pending',?,?)
+                """, (document_id, project_id, title.strip(), path, size, mime_type,
+                      digest, parser_version, now, now))
+                row = conn.execute(
+                    "SELECT * FROM knowledge_documents WHERE id=?", (document_id,)
+                ).fetchone()
+        except sqlite3.IntegrityError:
+            # Another process may win the content-deduplication race.
+            existing = self._query_one("""
+                SELECT * FROM knowledge_documents
+                WHERE project_id=? AND content_sha256=?
+                  AND deleted_at IS NULL
+            """, (project_id, digest))
+            if existing:
+                return existing, False
+            raise
+        return dict(row), True
+
+    def list_rag_documents(self, project_id, *, include_deleted=False,
+                           limit=500, offset=0):
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("limit 必须为 1..500")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset 必须是非负整数")
+        if not self.get_project(project_id):
+            raise ResourceNotFound("Project 不存在")
+        deleted_filter = "" if include_deleted else "AND deleted_at IS NULL"
+        return self._query_all(f"""
+            SELECT * FROM knowledge_documents
+            WHERE project_id=? {deleted_filter}
+            ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?
+        """, (project_id, limit, offset))
+
+    def get_rag_document(self, project_id, document_id, *, include_deleted=True):
+        deleted_filter = "" if include_deleted else "AND deleted_at IS NULL"
+        return self._query_one(f"""
+            SELECT * FROM knowledge_documents
+            WHERE id=? AND project_id=? {deleted_filter}
+        """, (document_id, project_id))
+
+    def set_project_rag_enabled(self, project_id, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("enabled 必须是布尔值")
+        now = _utc_now()
+        with self._write() as conn:
+            updated = conn.execute("""
+                UPDATE projects SET rag_enabled=?,updated_at=? WHERE id=?
+            """, (int(enabled), now, project_id))
+            if updated.rowcount != 1:
+                raise ResourceNotFound("Project 不存在")
+            return dict(conn.execute(
+                "SELECT id,name,created_at,updated_at,is_default,rag_enabled "
+                "FROM projects WHERE id=?", (project_id,)
+            ).fetchone())
+
+    def retry_rag_document(self, project_id, document_id):
+        now = _utc_now()
+        with self._write() as conn:
+            row = conn.execute("""
+                SELECT * FROM knowledge_documents WHERE id=? AND project_id=?
+            """, (document_id, project_id)).fetchone()
+            if not row:
+                raise ResourceNotFound("知识文档不存在")
+            if row["status"] != "failed" or row["deleted_at"] is not None:
+                raise InvalidRunTransition("只有 failed 知识文档可以重试")
+            conn.execute("""
+                UPDATE knowledge_documents
+                SET status='pending',attempt=0,error_code=NULL,updated_at=?
+                WHERE id=?
+            """, (now, document_id))
+            return dict(conn.execute(
+                "SELECT * FROM knowledge_documents WHERE id=?", (document_id,)
+            ).fetchone())
+
+    def soft_delete_rag_document(self, project_id, document_id):
+        """Immediately remove a document from retrieval; file cleanup is separate."""
+        now = _utc_now()
+        with self._write() as conn:
+            row = conn.execute("""
+                SELECT * FROM knowledge_documents WHERE id=? AND project_id=?
+            """, (document_id, project_id)).fetchone()
+            if not row:
+                raise ResourceNotFound("知识文档不存在")
+            if row["status"] not in {"deleting", "deleted"}:
+                conn.execute("DELETE FROM knowledge_chunks WHERE document_id=?", (document_id,))
+                conn.execute("""
+                    UPDATE knowledge_documents
+                    SET status='deleting',deleted_at=?,chunk_count=0,error_code=NULL,
+                        lease_owner=NULL,lease_until=NULL,updated_at=?
+                    WHERE id=?
+                """, (now, now, document_id))
+            return dict(conn.execute(
+                "SELECT * FROM knowledge_documents WHERE id=?", (document_id,)
+            ).fetchone())
+
+    def list_deleting_rag_documents(self, limit=100):
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("limit 必须为 1..500")
+        return self._query_all("""
+            SELECT * FROM knowledge_documents WHERE status='deleting'
+            ORDER BY deleted_at,id LIMIT ?
+        """, (limit,))
+
+    def finalize_rag_document_delete(self, document_id):
+        now = _utc_now()
+        with self._write() as conn:
+            updated = conn.execute("""
+                UPDATE knowledge_documents
+                SET status='deleted',stored_path=NULL,error_code=NULL,updated_at=?
+                WHERE id=? AND status='deleting'
+            """, (now, document_id))
+            if updated.rowcount != 1:
+                row = conn.execute(
+                    "SELECT * FROM knowledge_documents WHERE id=?", (document_id,)
+                ).fetchone()
+                if not row:
+                    raise ResourceNotFound("知识文档不存在")
+                if row["status"] != "deleted":
+                    raise InvalidRunTransition("知识文档不在 deleting 状态")
+                return dict(row)
+            return dict(conn.execute(
+                "SELECT * FROM knowledge_documents WHERE id=?", (document_id,)
+            ).fetchone())
+
+    def claim_next_rag_document(self, owner, lease_seconds=60):
+        if not isinstance(owner, str) or not 1 <= len(owner) <= 200:
+            raise ValueError("owner 不能为空且不能超过 200 字符")
+        deadline, now = self._lease_deadline(lease_seconds), _utc_now()
+        with self._write() as conn:
+            row = conn.execute("""
+                SELECT * FROM knowledge_documents
+                WHERE status='pending' AND deleted_at IS NULL AND attempt<3
+                ORDER BY created_at,id LIMIT 1
+            """).fetchone()
+            if not row:
+                return None
+            updated = conn.execute("""
+                UPDATE knowledge_documents
+                SET status='indexing',lease_owner=?,lease_until=?,attempt=attempt+1,
+                    error_code=NULL,updated_at=?
+                WHERE id=? AND status='pending' AND deleted_at IS NULL
+            """, (owner, deadline, now, row["id"]))
+            if updated.rowcount != 1:
+                return None
+            return dict(conn.execute(
+                "SELECT * FROM knowledge_documents WHERE id=?", (row["id"],)
+            ).fetchone())
+
+    def renew_rag_lease(self, document_id, owner, lease_seconds=60):
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("owner 不能为空")
+        now, deadline = _utc_now(), self._lease_deadline(lease_seconds)
+        with self._write() as conn:
+            updated = conn.execute("""
+                UPDATE knowledge_documents SET lease_until=?,updated_at=?
+                WHERE id=? AND status='indexing' AND lease_owner=? AND lease_until>?
+            """, (deadline, now, document_id, owner, now))
+            return updated.rowcount == 1
+
+    def recover_expired_rag_leases(self, now=None):
+        now = now or _utc_now()
+        recovered = []
+        with self._write() as conn:
+            rows = conn.execute("""
+                SELECT id,attempt FROM knowledge_documents
+                WHERE status='indexing' AND lease_until<=?
+                ORDER BY lease_until,id
+            """, (now,)).fetchall()
+            for row in rows:
+                status = "failed" if row["attempt"] >= 3 else "pending"
+                error_code = "index_retry_exhausted" if status == "failed" else "lease_expired"
+                conn.execute("""
+                    UPDATE knowledge_documents
+                    SET status=?,error_code=?,lease_owner=NULL,lease_until=NULL,updated_at=?
+                    WHERE id=? AND status='indexing'
+                """, (status, error_code, now, row["id"]))
+                recovered.append(row["id"])
+        return recovered
+
+    def fail_rag_document(self, document_id, owner, error_code):
+        code, now = self._rag_error_code(error_code), _utc_now()
+        with self._write() as conn:
+            row = conn.execute("""
+                SELECT * FROM knowledge_documents
+                WHERE id=? AND status='indexing' AND lease_owner=? AND lease_until>?
+            """, (document_id, owner, now)).fetchone()
+            if not row:
+                raise InvalidRunTransition("RAG 索引 lease 已失效")
+            status = "failed" if row["attempt"] >= 3 else "pending"
+            conn.execute("""
+                UPDATE knowledge_documents
+                SET status=?,error_code=?,lease_owner=NULL,lease_until=NULL,updated_at=?
+                WHERE id=?
+            """, (status, code, now, document_id))
+            return dict(conn.execute(
+                "SELECT * FROM knowledge_documents WHERE id=?", (document_id,)
+            ).fetchone())
+
+    @classmethod
+    def _validated_rag_chunks(cls, document, chunks):
+        if not isinstance(chunks, (list, tuple)):
+            raise ValueError("chunks 必须是数组")
+        if len(chunks) > MAX_RAG_CHUNKS_PER_DOCUMENT:
+            raise ValueError("Chunk 数超过限制")
+        result, ordinals, total_chars = [], set(), 0
+        for index, item in enumerate(chunks):
+            if not isinstance(item, dict):
+                raise ValueError("Chunk 必须是对象")
+            ordinal = item.get("ordinal", index)
+            if type(ordinal) is not int or ordinal < 0 or ordinal in ordinals:
+                raise ValueError("Chunk ordinal 无效或重复")
+            ordinals.add(ordinal)
+            content = item.get("content")
+            if not isinstance(content, str) or not 1 <= len(content) <= 1600:
+                raise ValueError("Chunk content 必须为 1..1600 字符")
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            supplied_digest = item.get("content_sha256")
+            if supplied_digest is not None and cls._rag_hash(supplied_digest) != digest:
+                raise ValueError("Chunk content_sha256 与正文不匹配")
+            title = item.get("title", document["title"])
+            section = item.get("section", "")
+            if not isinstance(title, str) or not 1 <= len(title) <= 500:
+                raise ValueError("Chunk title 无效")
+            if not isinstance(section, str) or len(section) > 1000:
+                raise ValueError("Chunk section 无效")
+            locator = item.get("locator", {})
+            if not isinstance(locator, dict):
+                raise ValueError("Chunk locator 必须是对象")
+            locator_json = _json(locator)
+            if len(locator_json.encode("utf-8")) > 4096:
+                raise ValueError("Chunk locator 超过限制")
+            chunk_id = item.get("id") or hashlib.sha256(
+                f"{document['id']}\0{document['parser_version']}\0{ordinal}\0{digest}".encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            if not isinstance(chunk_id, str) or not 1 <= len(chunk_id) <= 200:
+                raise ValueError("Chunk id 无效")
+            total_chars += len(content)
+            if total_chars > 2_000_000:
+                raise ValueError("文档规范化文本超过限制")
+            result.append((
+                chunk_id, document["id"], document["project_id"], ordinal,
+                title, section, content, digest, locator_json, len(content),
+            ))
+        return result
+
+    def complete_rag_document(self, document_id, owner, chunks):
+        """Atomically replace one document's chunks and publish it as ready."""
+        now = _utc_now()
+        with self._write() as conn:
+            document = conn.execute("""
+                SELECT * FROM knowledge_documents
+                WHERE id=? AND status='indexing' AND lease_owner=? AND lease_until>?
+            """, (document_id, owner, now)).fetchone()
+            if not document:
+                raise InvalidRunTransition("RAG 索引 lease 已失效")
+            normalized = self._validated_rag_chunks(document, chunks)
+            active_count = conn.execute("""
+                SELECT COUNT(*) FROM knowledge_chunks AS c
+                JOIN knowledge_documents AS d ON d.id=c.document_id
+                WHERE c.project_id=? AND c.document_id<>?
+                  AND d.status='ready' AND d.deleted_at IS NULL
+            """, (document["project_id"], document_id)).fetchone()[0]
+            if active_count + len(normalized) > MAX_RAG_CHUNKS_PER_DOCUMENT:
+                raise ValueError("Project 活动 Chunk 数超过限制")
+            conn.execute("DELETE FROM knowledge_chunks WHERE document_id=?", (document_id,))
+            conn.executemany("""
+                INSERT INTO knowledge_chunks
+                    (id,document_id,project_id,ordinal,title,section,content,
+                     content_sha256,locator_json,char_count)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, normalized)
+            conn.execute("""
+                UPDATE knowledge_documents
+                SET status='ready',chunk_count=?,error_code=NULL,lease_owner=NULL,
+                    lease_until=NULL,indexed_at=?,updated_at=?
+                WHERE id=?
+            """, (len(normalized), now, now, document_id))
+            return dict(conn.execute(
+                "SELECT * FROM knowledge_documents WHERE id=?", (document_id,)
+            ).fetchone())
+
+    @staticmethod
+    def _rag_query_terms(query):
+        if not isinstance(query, str):
+            raise ValueError("RAG query 必须是字符串")
+        query = unicodedata.normalize("NFKC", query)[:4000]
+        long_terms, short_terms, seen = [], [], set()
+
+        def add(term, target):
+            term = term.strip()
+            key = term.casefold()
+            if term and key not in seen:
+                seen.add(key)
+                target.append(term)
+
+        parts = re.findall(r"[\u3400-\u9fff]+|[A-Za-z0-9_./:#@+\-]+", query)
+        for part in parts:
+            if re.fullmatch(r"[\u3400-\u9fff]+", part):
+                if len(part) < 3:
+                    add(part, short_terms)
+                else:
+                    for index in range(len(part) - 2):
+                        add(part[index:index + 3], long_terms)
+                        if len(long_terms) >= 32:
+                            break
+            elif len(part) >= 3:
+                add(part[:64], long_terms)
+                for subpart in re.findall(
+                    r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+", part.replace("_", " ")
+                ):
+                    if len(subpart) >= 3:
+                        add(subpart[:64], long_terms)
+            else:
+                add(part, short_terms)
+            if len(long_terms) >= 32:
+                break
+        return long_terms[:32], short_terms[:8]
+
+    def _search_rag_chunks_tx(self, conn, project_id, query,
+                              limit=MAX_RAG_SEARCH_CANDIDATES):
+        if type(limit) is not int or not 1 <= limit <= MAX_RAG_SEARCH_CANDIDATES:
+            raise ValueError(f"limit 必须为 1..{MAX_RAG_SEARCH_CANDIDATES}")
+        long_terms, short_terms = self._rag_query_terms(query)
+        rows = []
+        if long_terms:
+            if not self._rag_fts_available:
+                return []
+            match_query = " OR ".join(
+                f'"{term.replace(chr(34), chr(34) * 2)}"' for term in long_terms
+            )
+            rows = list(conn.execute("""
+                SELECT c.*,d.title AS document_title,d.mime_type,
+                       bm25(knowledge_chunks_fts,5.0,2.0,1.0) AS score
+                FROM knowledge_chunks_fts
+                JOIN knowledge_chunks AS c ON c.rowid=knowledge_chunks_fts.rowid
+                JOIN knowledge_documents AS d
+                  ON d.id=c.document_id AND d.project_id=c.project_id
+                WHERE knowledge_chunks_fts MATCH ?
+                  AND c.project_id=? AND d.project_id=?
+                  AND d.status='ready' AND d.deleted_at IS NULL
+                ORDER BY score,c.rowid LIMIT ?
+            """, (match_query, project_id, project_id, limit)).fetchall())
+        if long_terms or not short_terms:
+            return [dict(row) for row in rows]
+        clauses, params = [], []
+        for term in short_terms:
+            clauses.append(
+                "(instr(lower(c.title),lower(?))>0 OR "
+                "instr(lower(c.section),lower(?))>0 OR "
+                "instr(lower(c.content),lower(?))>0)"
+            )
+            params.extend((term, term, term))
+        short_rows = conn.execute(f"""
+            SELECT c.*,d.title AS document_title,d.mime_type,0.0 AS score
+            FROM knowledge_chunks AS c
+            JOIN knowledge_documents AS d
+              ON d.id=c.document_id AND d.project_id=c.project_id
+            WHERE c.project_id=? AND d.project_id=?
+              AND d.status='ready' AND d.deleted_at IS NULL
+              AND ({' OR '.join(clauses)})
+            ORDER BY c.document_id,c.ordinal,c.rowid LIMIT ?
+        """, (project_id, project_id, *params, limit - len(rows))).fetchall()
+        seen = {row["rowid"] for row in rows}
+        rows.extend(row for row in short_rows if row["rowid"] not in seen)
+        return [dict(row) for row in rows]
+
+    def search_rag_chunks(self, project_id, query,
+                          limit=MAX_RAG_SEARCH_CANDIDATES):
+        with self._lock:
+            if not self._conn.execute(
+                "SELECT 1 FROM projects WHERE id=?", (project_id,)
+            ).fetchone():
+                raise ResourceNotFound("Project 不存在")
+            return self._search_rag_chunks_tx(self._conn, project_id, query, limit)
+
+    @staticmethod
+    def _rag_snapshot_json(snapshot):
+        encoded = _json(snapshot)
+        if len(encoded.encode("utf-8")) > MAX_RAG_SNAPSHOT_BYTES:
+            raise ValueError("RAG snapshot 超过 64 KiB")
+        return encoded
+
+    @classmethod
+    def _parse_rag_snapshot(cls, value):
+        if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_RAG_SNAPSHOT_BYTES:
+            raise ValueError("RAG snapshot 无效")
+        try:
+            snapshot = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("RAG snapshot 无效") from exc
+        if not isinstance(snapshot, dict) or type(snapshot.get("v")) is not int or snapshot["v"] != 1:
+            raise ValueError("RAG snapshot 版本无效")
+        chunks = snapshot.get("chunks")
+        if not isinstance(chunks, list) or len(chunks) > 6:
+            raise ValueError("RAG snapshot chunks 无效")
+        project_id = snapshot.get("project_id")
+        if project_id is not None and (not isinstance(project_id, str) or not project_id):
+            raise ValueError("RAG snapshot Project 无效")
+        if chunks and project_id is None:
+            raise ValueError("RAG snapshot 缺少 Project")
+        for index, chunk in enumerate(chunks, 1):
+            if not isinstance(chunk, dict) or set(chunk) != {
+                "citation_id", "chunk_id", "content_sha256", "title", "locator"
+            }:
+                raise ValueError("RAG snapshot Chunk 契约无效")
+            if chunk["citation_id"] != f"K{index}":
+                raise ValueError("RAG snapshot citation 顺序无效")
+            if not isinstance(chunk["chunk_id"], str) or not chunk["chunk_id"]:
+                raise ValueError("RAG snapshot chunk_id 无效")
+            cls._rag_hash(chunk["content_sha256"])
+            if not isinstance(chunk["title"], str) or len(chunk["title"]) > 500:
+                raise ValueError("RAG snapshot title 无效")
+            if not isinstance(chunk["locator"], dict):
+                raise ValueError("RAG snapshot locator 无效")
+        return snapshot
+
+    def _build_rag_snapshot_tx(self, conn, project_id, query):
+        project = conn.execute(
+            "SELECT rag_enabled FROM projects WHERE id=?", (project_id,)
+        ).fetchone()
+        if not project:
+            raise ResourceNotFound("Project 不存在")
+        snapshot = {"v": 1, "project_id": project_id, "chunks": []}
+        if not project["rag_enabled"] or not isinstance(query, str) or not query.strip():
+            return snapshot
+        candidates = self._search_rag_chunks_tx(
+            conn, project_id, query, MAX_RAG_SEARCH_CANDIDATES
+        )
+        seen_hashes, per_document, total_chars = set(), {}, 0
+        for candidate in candidates:
+            digest, document_id = candidate["content_sha256"], candidate["document_id"]
+            if digest in seen_hashes or per_document.get(document_id, 0) >= 2:
+                continue
+            if total_chars + candidate["char_count"] > MAX_RAG_CONTEXT_CHARS:
+                continue
+            try:
+                locator = json.loads(candidate["locator_json"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(locator, dict):
+                continue
+            citation = f"K{len(snapshot['chunks']) + 1}"
+            snapshot["chunks"].append({
+                "citation_id": citation,
+                "chunk_id": candidate["id"],
+                "content_sha256": digest,
+                "title": candidate["document_title"][:500],
+                "locator": locator,
+            })
+            seen_hashes.add(digest)
+            per_document[document_id] = per_document.get(document_id, 0) + 1
+            total_chars += candidate["char_count"]
+            if len(snapshot["chunks"]) >= 6:
+                break
+        self._rag_snapshot_json(snapshot)
+        return snapshot
+
+    def freeze_run_rag_snapshot(self, run_id, query):
+        """Freeze once; repeated calls return the first persisted snapshot."""
+        with self._write() as conn:
+            row = conn.execute("""
+                SELECT r.rag_snapshot_json,s.project_id
+                FROM runs AS r JOIN sessions AS s ON s.id=r.session_id
+                WHERE r.id=?
+            """, (run_id,)).fetchone()
+            if not row:
+                raise ResourceNotFound("Run 不存在")
+            existing = self._parse_rag_snapshot(row["rag_snapshot_json"])
+            if "project_id" in existing:
+                return existing
+            snapshot = self._build_rag_snapshot_tx(conn, row["project_id"], query)
+            encoded = self._rag_snapshot_json(snapshot)
+            updated = conn.execute("""
+                UPDATE runs SET rag_snapshot_json=?
+                WHERE id=? AND rag_snapshot_json='{"v":1,"chunks":[]}'
+            """, (encoded, run_id))
+            if updated.rowcount != 1:
+                current = conn.execute(
+                    "SELECT rag_snapshot_json FROM runs WHERE id=?", (run_id,)
+                ).fetchone()
+                return self._parse_rag_snapshot(current["rag_snapshot_json"])
+            return snapshot
+
+    def _rag_available_rows_tx(self, conn, snapshot):
+        chunk_ids = [item["chunk_id"] for item in snapshot["chunks"]]
+        project_id = snapshot.get("project_id")
+        if not chunk_ids or not project_id:
+            return {}
+        placeholders = ",".join("?" for _ in chunk_ids)
+        rows = conn.execute(f"""
+            SELECT c.*,d.title AS document_title,d.mime_type
+            FROM knowledge_chunks AS c
+            JOIN knowledge_documents AS d
+              ON d.id=c.document_id AND d.project_id=c.project_id
+            WHERE c.id IN ({placeholders})
+              AND c.project_id=? AND d.project_id=?
+              AND d.status='ready' AND d.deleted_at IS NULL
+        """, (*chunk_ids, project_id, project_id)).fetchall()
+        return {row["id"]: dict(row) for row in rows}
+
+    def hydrate_run_rag_chunks(self, run_id, max_chars=MAX_RAG_CONTEXT_CHARS):
+        if type(max_chars) is not int or not 1 <= max_chars <= MAX_RAG_CONTEXT_CHARS:
+            raise ValueError(f"max_chars 必须为 1..{MAX_RAG_CONTEXT_CHARS}")
+        with self._lock:
+            run = self._conn.execute(
+                "SELECT rag_snapshot_json FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if not run:
+                raise ResourceNotFound("Run 不存在")
+            snapshot = self._parse_rag_snapshot(run["rag_snapshot_json"])
+            available = self._rag_available_rows_tx(self._conn, snapshot)
+            hydrated, total = [], 0
+            for frozen in snapshot["chunks"]:
+                row = available.get(frozen["chunk_id"])
+                if not row or row["content_sha256"] != frozen["content_sha256"]:
+                    continue
+                if total + row["char_count"] > max_chars:
+                    continue
+                hydrated.append({
+                    "citation_id": frozen["citation_id"],
+                    "chunk_id": frozen["chunk_id"],
+                    "document_id": row["document_id"],
+                    "content_sha256": frozen["content_sha256"],
+                    "title": frozen["title"],
+                    "locator": frozen["locator"],
+                    "content": row["content"],
+                })
+                total += row["char_count"]
+            return hydrated
+
+    def get_run_rag_sources(self, run_id):
+        with self._lock:
+            run = self._conn.execute(
+                "SELECT rag_snapshot_json FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if not run:
+                raise ResourceNotFound("Run 不存在")
+            snapshot = self._parse_rag_snapshot(run["rag_snapshot_json"])
+            available = self._rag_available_rows_tx(self._conn, snapshot)
+            return [{
+                **frozen,
+                "available": (
+                    frozen["chunk_id"] in available and
+                    available[frozen["chunk_id"]]["content_sha256"] ==
+                    frozen["content_sha256"]
+                ),
+            } for frozen in snapshot["chunks"]]
+
+    def get_run_rag_source(self, run_id, citation_id):
+        with self._lock:
+            run = self._conn.execute(
+                "SELECT rag_snapshot_json FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if not run:
+                raise ResourceNotFound("Run 不存在")
+            snapshot = self._parse_rag_snapshot(run["rag_snapshot_json"])
+            frozen = next(
+                (item for item in snapshot["chunks"] if item["citation_id"] == citation_id),
+                None,
+            )
+            if not frozen:
+                raise ResourceNotFound("Run 引用不存在")
+            row = self._rag_available_rows_tx(self._conn, snapshot).get(frozen["chunk_id"])
+            available = bool(
+                row and row["content_sha256"] == frozen["content_sha256"]
+            )
+            result = {**frozen, "available": available}
+            if not available:
+                result["unavailable_reason"] = "source_unavailable"
+                return result
+            result["document_id"] = row["document_id"]
+            result["content"] = row["content"]
+            return result
+
+    def get_rag_status(self, project_id=None):
+        with self._lock:
+            if project_id is not None and not self._conn.execute(
+                "SELECT 1 FROM projects WHERE id=?", (project_id,)
+            ).fetchone():
+                raise ResourceNotFound("Project 不存在")
+            where, params = ("WHERE project_id=?", (project_id,)) if project_id else ("", ())
+            rows = self._conn.execute(f"""
+                SELECT status,COUNT(*) AS count FROM knowledge_documents
+                {where} GROUP BY status
+            """, params).fetchall()
+            active_where = (
+                "WHERE project_id=? AND deleted_at IS NULL"
+                if project_id else "WHERE deleted_at IS NULL"
+            )
+            totals = self._conn.execute(f"""
+                SELECT COALESCE(SUM(size),0) AS source_bytes,
+                       COALESCE(SUM(chunk_count),0) AS chunk_count,
+                       MIN(CASE WHEN status='pending' THEN created_at END) AS oldest_pending_at,
+                       MAX(indexed_at) AS last_indexed_at
+                FROM knowledge_documents {active_where}
+            """, params).fetchone()
+            project = None if project_id is None else self._conn.execute(
+                "SELECT rag_enabled FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            counts = {status: 0 for status in (
+                "pending", "indexing", "ready", "failed", "deleting", "deleted"
+            )}
+            counts.update({row["status"]: row["count"] for row in rows})
+            return {
+                "capability": "available" if self._rag_fts_available else "unavailable",
+                "rag_enabled": None if project is None else bool(project["rag_enabled"]),
+                "documents": counts,
+                "queue_depth": counts["pending"] + counts["indexing"],
+                "source_bytes": totals["source_bytes"],
+                "chunk_count": totals["chunk_count"],
+                "oldest_pending_at": totals["oldest_pending_at"],
+                "last_indexed_at": totals["last_indexed_at"],
+            }
 
     @staticmethod
     def _workspace_values(name, root_path, kind, max_mode):
@@ -1700,7 +2680,7 @@ class Database:
     def get_messages(self, session_id):
         rows = self._query_all(
             """
-            SELECT role, content, tool_calls_json, tool_call_id
+            SELECT role, content, tool_calls_json, tool_call_id, run_id
             FROM messages
             WHERE session_id = ?
             ORDER BY sequence
@@ -1712,6 +2692,7 @@ class Database:
             message = {
                 "role": row["role"],
                 "content": row["content"],
+                "run_id": row["run_id"],
             }
             if row["tool_calls_json"]:
                 message["tool_calls"] = json.loads(row["tool_calls_json"])
@@ -2688,7 +3669,8 @@ class Database:
         return grants
 
     def _insert_run_tx(self, conn, task, idempotency_key, options,
-                       config_snapshot, tool_snapshot, *, request_hash=None):
+                       config_snapshot, tool_snapshot, *, request_hash=None,
+                       rag_query=None):
         if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key.strip()) <= 200:
             raise ValueError("Idempotency-Key 必须为 1..200 字符")
         key = idempotency_key.strip()
@@ -2702,7 +3684,7 @@ class Database:
                 raise IdempotencyKeyReused("Idempotency-Key 已用于不同请求")
             return dict(existing), False
         session = conn.execute(
-            "SELECT archived_at FROM sessions WHERE id=?", (task["session_id"],)
+            "SELECT archived_at,project_id FROM sessions WHERE id=?", (task["session_id"],)
         ).fetchone()
         if not session or session["archived_at"] is not None:
             raise ResourceNotFound("Agent 不存在或已归档")
@@ -2739,32 +3721,40 @@ class Database:
         attempt = conn.execute(
             "SELECT COALESCE(MAX(attempt),0)+1 FROM runs WHERE task_id=?", (task["id"],)
         ).fetchone()[0]
+        if rag_query is None:
+            rag_query = "\n".join((task["goal"], task["acceptance_json"]))
+        rag_snapshot = self._build_rag_snapshot_tx(
+            conn, session["project_id"], rag_query
+        )
+        rag_snapshot_json = self._rag_snapshot_json(rag_snapshot)
         run_id, now = str(uuid.uuid4()), _utc_now()
         conn.execute("""
             INSERT INTO runs
                 (id,task_id,session_id,attempt,idempotency_key,request_hash,status,
                  config_snapshot_json,tool_snapshot_json,context_max_sequence,
-                 created_at,updated_at,effective_grant_json)
-            VALUES (?,?,?,?,?,?,'queued',?,?,?,?,?,?)
+                 created_at,updated_at,effective_grant_json,rag_snapshot_json)
+            VALUES (?,?,?,?,?,?,'queued',?,?,?,?,?,?,?)
         """, (run_id, task["id"], task["session_id"], attempt, key, fingerprint,
               _json(config_snapshot), _json(tool_snapshot), cutoff, now, now,
-              _json({"grants": sorted(grants)})))
+              _json({"grants": sorted(grants)}), rag_snapshot_json))
         self._append_event_tx(conn, run_id, "run.queued", {"attempt": attempt},
                               dedupe_key=f"{run_id}:run.queued")
         return dict(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()), True
 
     def create_run(self, task_id, idempotency_key, options=None,
-                   config_snapshot=None, tool_snapshot=None):
+                   config_snapshot=None, tool_snapshot=None, rag_query=None):
         with self._write() as conn:
             task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 raise ResourceNotFound("Task 不存在")
             return self._insert_run_tx(conn, task, idempotency_key,
                                        {} if options is None else options,
-                                       config_snapshot, tool_snapshot)
+                                       config_snapshot, tool_snapshot,
+                                       rag_query=rag_query)
 
     def create_legacy_chat_run(self, agent_id, goal, idempotency_key, options=None,
-                               config_snapshot=None, tool_snapshot=None):
+                               config_snapshot=None, tool_snapshot=None,
+                               rag_query=None):
         options = {} if options is None else options
         if not isinstance(options, dict):
             raise ValueError("Run options 必须为对象")
@@ -2787,7 +3777,8 @@ class Database:
             task = self._insert_task_tx(conn, agent_id, goal, None, None)
             run, _ = self._insert_run_tx(conn, task, idempotency_key, options,
                                          config_snapshot, tool_snapshot,
-                                         request_hash=fingerprint)
+                                         request_hash=fingerprint,
+                                         rag_query=rag_query)
             return task, run
 
     def get_run(self, run_id):

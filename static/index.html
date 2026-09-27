@@ -116,11 +116,53 @@
           </div>
         </section>
 
+        <section class="info-section open" id="knowledgeSection">
+          <button class="info-section-toggle" type="button">
+            <span>Project 知识库</span><span class="chevron" aria-hidden="true">⌄</span>
+          </button>
+          <div class="info-section-body">
+            <p id="knowledgeProjectName">请选择 Project</p>
+            <div class="knowledge-capability-row">
+              <span id="ragCapability" class="knowledge-state unknown" aria-live="polite">能力未知</span>
+              <label class="knowledge-toggle">
+                <input id="ragEnabledToggle" type="checkbox" disabled>
+                启用 RAG
+              </label>
+            </div>
+            <p class="knowledge-disclosure">启用后，命中的知识片段会随 Run 发送给当前模型 Provider。</p>
+            <div class="knowledge-actions">
+              <input id="knowledgeFileInput" type="file" accept=".xlsx,.pptx,.docx,.pdf,.csv,.txt,.md,.json,.log" hidden>
+              <button id="knowledgeUploadBtn" class="small-btn" type="button" disabled>上传资料</button>
+              <button id="refreshKnowledgeBtn" class="small-btn" type="button" disabled>刷新</button>
+            </div>
+            <p id="knowledgeCapacity" class="knowledge-capacity" aria-live="polite">0 个文档</p>
+            <ul id="knowledgeDocumentList" class="task-list knowledge-list" aria-live="polite"></ul>
+            <form id="knowledgeSearchForm" class="knowledge-search">
+              <label for="knowledgeSearchInput">检索预览</label>
+              <div>
+                <input id="knowledgeSearchInput" type="search" maxlength="4000" placeholder="输入关键词" disabled>
+                <button id="knowledgeSearchBtn" class="small-btn" type="submit" disabled>检索</button>
+              </div>
+            </form>
+            <ul id="knowledgeSearchResults" class="task-list knowledge-results" aria-live="polite"></ul>
+          </div>
+        </section>
+
         <section class="info-section open" id="runSection">
           <button class="info-section-toggle" type="button">
             <span>Run 快照</span><span class="chevron" aria-hidden="true">⌄</span>
           </button>
           <div class="info-section-body"><p id="runSnapshot">尚未选择 Run</p></div>
+        </section>
+
+        <section class="info-section open" id="runKnowledgeSection">
+          <button class="info-section-toggle" type="button">
+            <span>Run 引用来源</span><span class="chevron" aria-hidden="true">⌄</span>
+          </button>
+          <div class="info-section-body">
+            <ul id="runKnowledgeSources" class="task-list knowledge-results" aria-live="polite"></ul>
+            <pre id="citationDetail" class="citation-detail" aria-live="polite">尚未选择引用</pre>
+          </div>
         </section>
 
         <section class="info-section open" id="approvalsSection">

@@ -149,7 +149,7 @@ class MigrationTest(unittest.TestCase):
             create_v0_database(path)
 
             db = Database(path)
-            self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 7)
             defaults = db._query_all(
                 "SELECT id FROM projects WHERE is_default = 1"
             )
@@ -189,7 +189,7 @@ class MigrationTest(unittest.TestCase):
                 )
 
             first_snapshot = snapshot(db)
-            backups = list(path.parent.glob("legacy.db.pre-v6-*.bak"))
+            backups = list(path.parent.glob("legacy.db.pre-v7-*.bak"))
             self.assertEqual(len(backups), 1)
             with closing(sqlite3.connect(backups[0])) as backup:
                 self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 0)
@@ -202,9 +202,9 @@ class MigrationTest(unittest.TestCase):
             try:
                 self.assertEqual(snapshot(reopened), first_snapshot)
                 self.assertEqual(
-                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 6
+                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 7
                 )
-                self.assertEqual(len(list(path.parent.glob("legacy.db.pre-v6-*.bak"))), 1)
+                self.assertEqual(len(list(path.parent.glob("legacy.db.pre-v7-*.bak"))), 1)
             finally:
                 reopened.close()
 
@@ -219,12 +219,12 @@ class MigrationTest(unittest.TestCase):
                 conn.commit()
             db = Database(path)
             try:
-                self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 6)
+                self.assertEqual(db._conn.execute("PRAGMA user_version").fetchone()[0], 7)
                 self.assertEqual(db.get_settings()["credential_base_url"],
                                  "https://api.example/v1")
                 self.assertEqual(db._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
                 self.assertEqual(db._conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
-                backups = list(path.parent.glob("v2.db.pre-v6-*.bak"))
+                backups = list(path.parent.glob("v2.db.pre-v7-*.bak"))
                 self.assertEqual(len(backups), 1)
                 with closing(sqlite3.connect(backups[0])) as backup:
                     self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 2)
@@ -239,7 +239,7 @@ class MigrationTest(unittest.TestCase):
             db = Database(path)
             try:
                 self.assertEqual(
-                    db._conn.execute("PRAGMA user_version").fetchone()[0], 6
+                    db._conn.execute("PRAGMA user_version").fetchone()[0], 7
                 )
                 settings = db.get_settings()
                 self.assertEqual(settings["api_key_encrypted"], "legacy-ciphertext")
@@ -250,7 +250,7 @@ class MigrationTest(unittest.TestCase):
             reopened = Database(path)
             try:
                 self.assertEqual(
-                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 6
+                    reopened._conn.execute("PRAGMA user_version").fetchone()[0], 7
                 )
                 self.assertIsNone(reopened.get_settings()["credential_base_url"])
             finally:
@@ -294,7 +294,7 @@ class MigrationTest(unittest.TestCase):
             upgraded = Database(path)
             try:
                 row = upgraded.get_mcp_server("legacy")
-                self.assertEqual(upgraded._conn.execute("PRAGMA user_version").fetchone()[0], 6)
+                self.assertEqual(upgraded._conn.execute("PRAGMA user_version").fetchone()[0], 7)
                 self.assertEqual(row["enabled"], 0)
                 self.assertIsNone(row["approved_config_hash"])
                 self.assertEqual(row["approved_tools_json"], "{}")
@@ -528,7 +528,7 @@ class P2AgentSchemaTest(unittest.TestCase):
         self.assertEqual(len(self.db.list_agent_tree()), 4)
         self.assertEqual(len(self.db.list_agent_tree(include_archived=True)), 6)
 
-    def test_v3_to_v5_preserves_history_and_foreign_keys(self):
+    def test_v3_to_current_preserves_history_and_foreign_keys(self):
         with patch("backend.db.SCHEMA_VERSION", 3):
             old = Database(Path(self.tmp.name) / "v3.db")
             session_id = "historical-v3"
@@ -552,7 +552,7 @@ class P2AgentSchemaTest(unittest.TestCase):
             old.close()
         upgraded = Database(Path(self.tmp.name) / "v3.db")
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded._conn.execute("PRAGMA user_version").fetchone()[0], 6)
+        self.assertEqual(upgraded._conn.execute("PRAGMA user_version").fetchone()[0], 7)
         self.assertIsNone(upgraded.get_session(session_id)["agent_role"])
         self.assertEqual(upgraded.get_run("historical-run")["effective_grant_json"],
                          '{"grants":["read_only"]}')
@@ -1059,7 +1059,7 @@ class P3WorkspaceStorageTest(unittest.TestCase):
             SELECT content FROM messages WHERE run_id=? AND role='tool'
         """, (running["id"],))["content"])
 
-    def test_v4_to_v5_keeps_legacy_tasks_and_uploads_unbound(self):
+    def test_v4_to_current_keeps_legacy_tasks_and_uploads_unbound(self):
         legacy_path = Path(self.tmp.name) / "v4.db"
         with patch("backend.db.SCHEMA_VERSION", 4):
             old = Database(legacy_path)
@@ -1073,12 +1073,12 @@ class P3WorkspaceStorageTest(unittest.TestCase):
             old.close()
         upgraded = Database(legacy_path)
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded._conn.execute("PRAGMA user_version").fetchone()[0], 6)
+        self.assertEqual(upgraded._conn.execute("PRAGMA user_version").fetchone()[0], 7)
         legacy = upgraded.get_task("legacy-task")
         self.assertEqual((legacy["workspace_id"], legacy["workspace_mode"]), (None, None))
         self.assertIsNotNone(upgraded.get_upload("upload-1"))
         self.assertEqual(upgraded._query_one("SELECT COUNT(*) AS n FROM artifacts")["n"], 0)
-        self.assertEqual(len(list(legacy_path.parent.glob("v4.db.pre-v6-*.bak"))), 1)
+        self.assertEqual(len(list(legacy_path.parent.glob("v4.db.pre-v7-*.bak"))), 1)
         self.assertEqual(upgraded._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_workspace_contract_grants_and_internal_delegation_inherit(self):

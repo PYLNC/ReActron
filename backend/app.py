@@ -63,7 +63,7 @@ _api_router_loaded = False
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """先冻结 MCP 注册表再启动 Runner，关闭时按相反顺序。"""
+    """先准备 DB/MCP/RAG 再启动 Runner，关闭时按相反顺序。"""
     global _api_router_loaded
 
     cfg = load_config()
@@ -97,6 +97,18 @@ async def lifespan(application: FastAPI):
         manager.clear_registry()
         logger.warning("MCP 启动刷新失败；本次启动禁用全部 MCP 工具")
 
+    rag_indexer = None
+    try:
+        from backend.rag import get_indexer
+
+        rag_indexer = get_indexer(db)
+        await rag_indexer.start()
+        logger.info("RAG 索引器已启动")
+    except Exception:
+        # RAG is an optional capability: failure must not take down the Agent runtime.
+        rag_indexer = None
+        logger.warning("RAG 索引器启动失败；本次启动禁用后台索引")
+
     from backend.runtime import get_runner
     runner = get_runner()
     try:
@@ -110,8 +122,12 @@ async def lifespan(application: FastAPI):
         try:
             await runner.close()
         finally:
-            db.close()
-            logger.info("应用关闭：数据库连接已关闭")
+            try:
+                if rag_indexer is not None:
+                    await rag_indexer.close()
+            finally:
+                db.close()
+                logger.info("应用关闭：数据库连接已关闭")
 
 
 app = FastAPI(title="ReActron Agent 框架", version="0.9.0", lifespan=lifespan)

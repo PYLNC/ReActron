@@ -41,6 +41,20 @@ const eventList = document.getElementById("eventList");
 const newSessionBtn = document.getElementById("newSessionBtn");
 const newProjectBtn = document.getElementById("newProjectBtn");
 const projectAssignSelect = document.getElementById("projectAssignSelect");
+const knowledgeProjectName = document.getElementById("knowledgeProjectName");
+const ragCapability = document.getElementById("ragCapability");
+const ragEnabledToggle = document.getElementById("ragEnabledToggle");
+const knowledgeUploadBtn = document.getElementById("knowledgeUploadBtn");
+const knowledgeFileInput = document.getElementById("knowledgeFileInput");
+const refreshKnowledgeBtn = document.getElementById("refreshKnowledgeBtn");
+const knowledgeCapacity = document.getElementById("knowledgeCapacity");
+const knowledgeDocumentList = document.getElementById("knowledgeDocumentList");
+const knowledgeSearchForm = document.getElementById("knowledgeSearchForm");
+const knowledgeSearchInput = document.getElementById("knowledgeSearchInput");
+const knowledgeSearchBtn = document.getElementById("knowledgeSearchBtn");
+const knowledgeSearchResults = document.getElementById("knowledgeSearchResults");
+const runKnowledgeSources = document.getElementById("runKnowledgeSources");
+const citationDetail = document.getElementById("citationDetail");
 const sessionsPanel = document.getElementById("sessionsPanel");
 const infoPanel = document.getElementById("infoPanel");
 const toggleSessionsBtn = document.getElementById("toggleSessionsBtn");
@@ -89,6 +103,12 @@ let typingEl = null;
 let activeToolCard = null;
 let mcpServers = [];
 const mcpDiscoveryByServer = new Map();
+let knowledgeProjectId = null;
+let knowledgeCapability = "unknown";
+let knowledgePollTimer = null;
+let runSourceMap = new Map();
+const runSourcesByRun = new Map();
+let citationDetailRequest = 0;
 
 
 // 统一输出到浏览器控制台，方便观察 SSE 事件流
@@ -303,7 +323,7 @@ function renderMarkdown(text) {
 }
 
 
-function appendBubble(role, text) {
+function appendBubble(role, text, runId = null) {
   const row = document.createElement("div");
   row.className = "message " + role;
 
@@ -313,6 +333,8 @@ function appendBubble(role, text) {
 
   const body = document.createElement("div");
   body.className = "message-body";
+  if (!body.dataset) body.dataset = {};
+  body.dataset.runId = runId || "";
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
@@ -347,6 +369,7 @@ function appendBubble(role, text) {
 
   body.appendChild(bubble);
   body.appendChild(meta);
+  if (role === "assistant") appendCitationMap(body, text, runId);
   row.appendChild(avatar);
   row.appendChild(body);
 
@@ -354,7 +377,7 @@ function appendBubble(role, text) {
   chatEl.appendChild(row);
   scrollToBottom();
 
-  return { row, bubble, meta };
+  return { row, body, bubble, meta };
 }
 
 
@@ -485,12 +508,14 @@ async function createProject() {
 async function deleteProject(projectId) {
   const project = projects.find((item) => item.id === projectId);
   if (!project) return;
-  if (!window.confirm("删除项目“" + project.name + "”？会话会移入默认项目。")) return;
+  if (!window.confirm("删除项目“" + project.name + "”？会话和知识文档会移入默认项目；" +
+      "重复知识会合并，已写入历史的内容不会撤回。")) return;
   try {
     const response = await fetch("/api/projects/" + projectId, { method: "DELETE" });
     if (!response.ok) return;
     await loadProjects();
     await refreshSessions();
+    if (!projects.some((item) => item.id === knowledgeProjectId)) clearKnowledgePanel();
   } catch (err) {
     log("删除项目失败: " + err.message);
   }
@@ -513,8 +538,414 @@ async function assignActiveSessionProject() {
     if (!response.ok) return;
     await refreshSessions();
     await loadProjects();
+    await loadKnowledge(projectId);
   } catch (err) {
     log("归入项目失败: " + err.message);
+  }
+}
+
+
+function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KiB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MiB";
+}
+
+
+function locatorValue(value) {
+  if (!value) return {};
+  if (typeof value === "object") return value;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (_err) {
+    return {};
+  }
+}
+
+
+function formatLocator(value) {
+  const locator = locatorValue(value);
+  const labels = [];
+  if (locator.sheet) labels.push("Sheet " + locator.sheet);
+  if (locator.slide != null) labels.push("Slide " + locator.slide);
+  if (locator.json_path) labels.push(locator.json_path);
+  if (locator.row_start != null) {
+    labels.push("row " + locator.row_start +
+      (locator.row_end != null && locator.row_end !== locator.row_start ? "-" + locator.row_end : ""));
+  }
+  if (locator.line_start != null) {
+    labels.push("line " + locator.line_start +
+      (locator.line_end != null && locator.line_end !== locator.line_start ? "-" + locator.line_end : ""));
+  }
+  return labels.join(" · ") || "位置未知";
+}
+
+
+function normalizeRagCapability(data) {
+  let value = data && (data.capability ?? data.rag_capability);
+  let reason = data && (data.capability_reason || data.unavailable_reason || null);
+  if (value && typeof value === "object") {
+    reason = value.reason || value.error_code || reason;
+    value = value.status || value.state;
+  }
+  if (value === true || data && data.fts_available === true) value = "available";
+  if (value === false || data && data.fts_available === false) value = "unavailable";
+  if (!['available', 'unavailable'].includes(value)) value = "unknown";
+  return { status: value, reason };
+}
+
+
+function setRagCapability(status, reason) {
+  knowledgeCapability = status;
+  ragCapability.className = "knowledge-state " + status;
+  ragCapability.textContent = status === "available" ? "RAG 可用" :
+    status === "unavailable" ? "RAG 不可用" : "能力未知";
+  ragCapability.title = reason || "";
+  const usable = status === "available" && Boolean(knowledgeProjectId);
+  ragEnabledToggle.disabled = !usable;
+  knowledgeUploadBtn.disabled = !usable;
+  knowledgeSearchInput.disabled = !usable;
+  knowledgeSearchBtn.disabled = !usable;
+}
+
+
+function clearKnowledgePanel(message = "请选择 Project") {
+  if (knowledgePollTimer) clearTimeout(knowledgePollTimer);
+  knowledgePollTimer = null;
+  knowledgeProjectId = null;
+  knowledgeProjectName.textContent = message;
+  ragEnabledToggle.checked = false;
+  refreshKnowledgeBtn.disabled = true;
+  knowledgeCapacity.textContent = "0 个文档";
+  knowledgeDocumentList.replaceChildren();
+  knowledgeSearchResults.replaceChildren();
+  setRagCapability("unknown");
+}
+
+
+function renderKnowledgeDocuments(data) {
+  const documents = Array.isArray(data.documents) ? data.documents :
+    Array.isArray(data.items) ? data.items : [];
+  knowledgeDocumentList.replaceChildren();
+  const visible = documents.filter((document) => document.status !== "deleted");
+  const totalBytes = visible.reduce((total, document) => total + (Number(document.size) || 0), 0);
+  const totalChunks = visible.reduce((total, document) => total + (Number(document.chunk_count) || 0), 0);
+  const maximum = data.limits && Number(data.limits.max_upload_bytes || data.limits.max_file_bytes) ||
+    Number(data.max_upload_bytes) || 0;
+  knowledgeCapacity.textContent = visible.length + " 个文档 · " + formatBytes(totalBytes) +
+    " · " + totalChunks + " chunks" + (maximum ? " · 单文件上限 " + formatBytes(maximum) : "");
+
+  if (!visible.length) {
+    const empty = document.createElement("li");
+    empty.textContent = "当前 Project 尚无知识文档";
+    knowledgeDocumentList.appendChild(empty);
+  }
+  for (const documentRow of visible) {
+    const documentId = documentRow.document_id || documentRow.id;
+    const item = document.createElement("li");
+    const title = document.createElement("strong");
+    title.textContent = documentRow.title || "未命名文档";
+    const status = document.createElement("small");
+    status.textContent = (documentRow.status || "unknown") + " · " +
+      formatBytes(documentRow.size) + " · " + (Number(documentRow.chunk_count) || 0) + " chunks" +
+      (documentRow.error_code ? " · " + documentRow.error_code : "");
+    item.appendChild(title);
+    item.appendChild(status);
+
+    if (documentRow.status === "failed" && documentId) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.textContent = "重试";
+      retry.addEventListener("click", () => retryKnowledgeDocument(documentId));
+      item.appendChild(retry);
+    }
+    if (documentId && !["deleting", "deleted"].includes(documentRow.status)) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "删除";
+      remove.addEventListener("click", () => deleteKnowledgeDocument(documentId, documentRow.title));
+      item.appendChild(remove);
+    }
+    knowledgeDocumentList.appendChild(item);
+  }
+
+  if (documents.some((document) => ["pending", "indexing", "deleting"].includes(document.status))) {
+    const projectId = knowledgeProjectId;
+    knowledgePollTimer = setTimeout(() => loadKnowledge(projectId), 2000);
+  }
+}
+
+
+async function loadKnowledge(projectId = projectAssignSelect.value) {
+  if (knowledgePollTimer) clearTimeout(knowledgePollTimer);
+  knowledgePollTimer = null;
+  if (!projectId) {
+    clearKnowledgePanel();
+    return;
+  }
+  knowledgeProjectId = projectId;
+  const project = projects.find((item) => item.id === projectId);
+  knowledgeProjectName.textContent = project ? project.name : "Project " + projectId;
+  refreshKnowledgeBtn.disabled = false;
+  try {
+    const data = await apiJson("/api/projects/" + encodeURIComponent(projectId) + "/knowledge");
+    if (knowledgeProjectId !== projectId) return;
+    const capability = normalizeRagCapability(data);
+    setRagCapability(capability.status, capability.reason);
+    ragEnabledToggle.checked = data.rag_enabled === true;
+    renderKnowledgeDocuments(data);
+  } catch (err) {
+    if (knowledgeProjectId !== projectId) return;
+    knowledgeDocumentList.replaceChildren();
+    const item = document.createElement("li");
+    item.textContent = err.status === 503 ? "本机 SQLite 不支持所需的 FTS5/trigram 能力" :
+      "知识库状态读取失败";
+    knowledgeDocumentList.appendChild(item);
+    setRagCapability(err.status === 503 ? "unavailable" : "unknown", err.code || err.message);
+  }
+}
+
+
+async function updateRagEnabled() {
+  const projectId = knowledgeProjectId;
+  if (!projectId || knowledgeCapability !== "available") return;
+  const enabled = ragEnabledToggle.checked;
+  ragEnabledToggle.disabled = true;
+  try {
+    await apiJson("/api/projects/" + encodeURIComponent(projectId) + "/rag-enabled", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    const project = projects.find((item) => item.id === projectId);
+    if (project) project.rag_enabled = enabled;
+  } catch (err) {
+    ragEnabledToggle.checked = !enabled;
+    appendNote("RAG 开关更新失败: " + err.message);
+  } finally {
+    if (knowledgeProjectId === projectId) setRagCapability(knowledgeCapability);
+  }
+}
+
+
+async function uploadKnowledgeFile(event) {
+  const file = event.target.files && event.target.files[0];
+  const projectId = knowledgeProjectId;
+  if (!file || !projectId || knowledgeCapability !== "available") return;
+  const formData = new FormData();
+  formData.append("file", file);
+  knowledgeUploadBtn.disabled = true;
+  try {
+    await apiJson("/api/projects/" + encodeURIComponent(projectId) + "/knowledge", {
+      method: "POST", body: formData,
+    });
+    appendNote("知识文档已上传并等待索引: " + file.name);
+    await loadKnowledge(projectId);
+  } catch (err) {
+    appendNote("知识文档上传失败: " + err.message);
+  } finally {
+    knowledgeFileInput.value = "";
+    if (knowledgeProjectId === projectId) setRagCapability(knowledgeCapability);
+  }
+}
+
+
+async function retryKnowledgeDocument(documentId) {
+  const projectId = knowledgeProjectId;
+  if (!projectId) return;
+  try {
+    await apiJson("/api/projects/" + encodeURIComponent(projectId) + "/knowledge/" +
+      encodeURIComponent(documentId) + "/retry", { method: "POST" });
+    await loadKnowledge(projectId);
+  } catch (err) {
+    appendNote("知识文档重试失败: " + err.message);
+  }
+}
+
+
+async function deleteKnowledgeDocument(documentId, title) {
+  const projectId = knowledgeProjectId;
+  if (!projectId || !window.confirm("删除知识文档“" + (title || documentId) +
+      "”？已发送给模型或写入历史的内容无法撤回。")) return;
+  try {
+    await apiJson("/api/projects/" + encodeURIComponent(projectId) + "/knowledge/" +
+      encodeURIComponent(documentId), { method: "DELETE" });
+    await loadKnowledge(projectId);
+    if (activeRunId) await loadRunSources(activeRunId);
+  } catch (err) {
+    appendNote("知识文档删除失败: " + err.message);
+  }
+}
+
+
+function renderKnowledgeSearchResults(data) {
+  const results = Array.isArray(data.matches) ? data.matches :
+    Array.isArray(data.results) ? data.results : [];
+  knowledgeSearchResults.replaceChildren();
+  if (!results.length) {
+    const empty = document.createElement("li");
+    empty.textContent = "没有命中";
+    knowledgeSearchResults.appendChild(empty);
+    return;
+  }
+  for (const [index, result] of results.entries()) {
+    const item = document.createElement("li");
+    const heading = document.createElement("strong");
+    heading.textContent = (result.citation_id || "K" + (index + 1)) + " · " +
+      (result.title || "未命名文档");
+    const locator = document.createElement("small");
+    locator.textContent = formatLocator(result.locator || result.locator_json);
+    const preview = document.createElement("p");
+    preview.textContent = result.preview || result.content || "无预览";
+    item.appendChild(heading);
+    item.appendChild(locator);
+    item.appendChild(preview);
+    knowledgeSearchResults.appendChild(item);
+  }
+}
+
+
+async function searchKnowledge(event) {
+  event.preventDefault();
+  const projectId = knowledgeProjectId;
+  const query = knowledgeSearchInput.value.trim();
+  if (!projectId || !query || knowledgeCapability !== "available") return;
+  knowledgeSearchBtn.disabled = true;
+  try {
+    const data = await apiJson("/api/projects/" + encodeURIComponent(projectId) +
+      "/knowledge/search", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, top_k: 6 }) });
+    if (knowledgeProjectId === projectId) renderKnowledgeSearchResults(data);
+  } catch (err) {
+    knowledgeSearchResults.replaceChildren();
+    const item = document.createElement("li");
+    item.textContent = err.status === 503 ? "RAG 当前不可用" : "检索失败: " + err.message;
+    knowledgeSearchResults.appendChild(item);
+  } finally {
+    if (knowledgeProjectId === projectId) knowledgeSearchBtn.disabled = false;
+  }
+}
+
+
+function clearRunSources(message = "尚未选择 Run") {
+  citationDetailRequest += 1;
+  runSourceMap = new Map();
+  runKnowledgeSources.replaceChildren();
+  const item = document.createElement("li");
+  item.textContent = message;
+  runKnowledgeSources.appendChild(item);
+  citationDetail.textContent = "尚未选择引用";
+  refreshCitationMappings();
+}
+
+
+async function showCitationDetail(runId, citationId) {
+  const requestId = ++citationDetailRequest;
+  const source = (runSourcesByRun.get(runId) || new Map()).get(citationId);
+  if (!source) {
+    citationDetail.textContent = citationId + " · unknown\n该引用不在当前 Run 的冻结来源中。";
+    return;
+  }
+  citationDetail.textContent = citationId + " · " + (source.title || "未命名文档") + "\n" +
+    formatLocator(source.locator || source.locator_json) + "\n" +
+    (source.available === false ? "unavailable · " +
+      (source.unavailable_reason || source.reason || "资料已删除、漂移或不可用") : "正在加载预览…");
+  try {
+    const detail = await apiJson("/api/runs/" + encodeURIComponent(runId) +
+      "/knowledge-sources/" + encodeURIComponent(citationId));
+    if (requestId !== citationDetailRequest) return;
+    citationDetail.textContent = citationId + " · " + (detail.title || source.title || "未命名文档") +
+      "\n" + formatLocator(detail.locator || detail.locator_json || source.locator) + "\n" +
+      (detail.available === false ? "unavailable · " +
+        (detail.unavailable_reason || "资料已删除、漂移或不可用") : detail.preview || "无预览");
+  } catch (err) {
+    if (requestId === citationDetailRequest) {
+      citationDetail.textContent = citationId + " · unknown\n详情读取失败: " + err.message;
+    }
+  }
+}
+
+
+function renderRunSources(data, runId) {
+  const sources = Array.isArray(data.sources) ? data.sources : [];
+  runSourceMap = new Map();
+  runKnowledgeSources.replaceChildren();
+  if (!sources.length) {
+    const empty = document.createElement("li");
+    empty.textContent = "此 Run 没有冻结知识来源";
+    runKnowledgeSources.appendChild(empty);
+  }
+  for (const source of sources) {
+    const citationId = source.citation_id || source.citation;
+    if (!citationId) continue;
+    runSourceMap.set(citationId, source);
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "[" + citationId + "] " + (source.title || "未命名文档");
+    if (source.available === false) button.className = "unavailable";
+    button.addEventListener("click", () => showCitationDetail(runId, citationId));
+    const locator = document.createElement("small");
+    locator.textContent = formatLocator(source.locator || source.locator_json) +
+      (source.available === false ? " · unavailable" : " · available");
+    item.appendChild(button);
+    item.appendChild(locator);
+    runKnowledgeSources.appendChild(item);
+  }
+  if (runId) runSourcesByRun.set(runId, new Map(runSourceMap));
+  citationDetail.textContent = sources.length ? "选择 [Kx] 查看冻结来源详情" : "尚未选择引用";
+  refreshCitationMappings(runId);
+}
+
+
+async function loadRunSources(runId) {
+  try {
+    const data = await apiJson("/api/runs/" + encodeURIComponent(runId) + "/knowledge-sources");
+    const sources = Array.isArray(data.sources) ? data.sources : [];
+    runSourcesByRun.set(runId, new Map(sources.map((source) =>
+      [source.citation_id || source.citation, source]).filter(([citationId]) => citationId)));
+    refreshCitationMappings(runId);
+    if (activeRunId === runId) renderRunSources(data, runId);
+  } catch (err) {
+    if (activeRunId !== runId) return;
+    clearRunSources(err.status === 503 ? "RAG unavailable" : "Run 来源状态 unknown");
+    citationDetail.textContent = err.status === 503 ? "unavailable" : "unknown · " + err.message;
+  }
+}
+
+
+function appendCitationMap(body, text, runId) {
+  const existing = body.querySelector && body.querySelector(".citation-map");
+  if (existing) existing.remove();
+  const matches = [...new Set((String(text || "").match(/\[K[1-9]\d*\]/g) || []))];
+  if (!matches.length) return;
+  const map = document.createElement("div");
+  map.className = "citation-map";
+  const sourceMap = runSourcesByRun.get(runId) || new Map();
+  for (const token of matches) {
+    const citationId = token.slice(1, -1);
+    const source = sourceMap.get(citationId);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = token;
+    if (!source) button.className = "unknown";
+    else if (source.available === false) button.className = "unavailable";
+    button.title = !source ? "unknown" : source.available === false ? "unavailable" : source.title || "available";
+    button.addEventListener("click", () => showCitationDetail(runId, citationId));
+    map.appendChild(button);
+  }
+  body.appendChild(map);
+}
+
+
+function refreshCitationMappings(runId = null) {
+  if (!chatEl.querySelectorAll) return;
+  for (const body of chatEl.querySelectorAll(".message.assistant .message-body")) {
+    const messageRunId = body.dataset && body.dataset.runId || null;
+    if (runId && messageRunId !== runId) continue;
+    const bubble = body.querySelector(".bubble");
+    appendCitationMap(body, bubble ? bubble.textContent : "", messageRunId);
   }
 }
 
@@ -1228,6 +1659,7 @@ async function refreshSessions() {
 
 async function openSession(sessionId) {
   closeRunSubscription();
+  clearRunSources();
   activeRunId = null;
   activeTaskId = null;
   clearTaskWorkspace();
@@ -1253,15 +1685,23 @@ async function openSession(sessionId) {
     );
     if (data.session) {
       projectAssignSelect.value = data.session.project_id || "";
+      await loadKnowledge(data.session.project_id || "");
+    } else {
+      clearKnowledgePanel();
     }
+    const historicalRunIds = new Set();
     for (const message of data.messages || []) {
       if (message.role === "user" && message.content) {
         appendBubble("user", message.content);
       } else if (message.role === "assistant" && message.content) {
-        appendBubble("assistant", message.content);
+        appendBubble("assistant", message.content, message.run_id || null);
+        if (message.run_id && /\[K[1-9]\d*\]/.test(message.content)) {
+          historicalRunIds.add(message.run_id);
+        }
         restoredAssistantTexts.add(message.content);
       }
     }
+    await Promise.all([...historicalRunIds].map((runId) => loadRunSources(runId)));
     renderSessions();
     await loadTasks(sessionId, true);
     await loadApprovals();
@@ -1283,6 +1723,7 @@ async function createNewSession() {
     return;
   }
   closeRunSubscription();
+  clearRunSources();
   activeRunId = null;
   streaming = false;
   runAllowedActions = [];
@@ -1301,6 +1742,7 @@ async function createNewSession() {
     localStorage.setItem(ACTIVE_SESSION_KEY, session.id);
     currentSessionHasMessages = false;
     projectAssignSelect.value = session.project_id || "";
+    await loadKnowledge(session.project_id || "");
     clearChat();
     taskList.replaceChildren();
     eventList.replaceChildren();
@@ -1337,6 +1779,7 @@ async function deleteSession(sessionId) {
     sessions = sessions.filter((session) => session.id !== sessionId);
     if (activeSessionId === sessionId) {
       closeRunSubscription();
+      clearRunSources();
       activeSessionId = null;
       renderAgentTree();
       activeRunId = null;
@@ -1352,6 +1795,7 @@ async function deleteSession(sessionId) {
       eventList.replaceChildren();
       approvalList.replaceChildren();
       runBar.hidden = true;
+      clearKnowledgePanel();
     }
     renderSessions();
   } catch (err) {
@@ -1719,7 +2163,12 @@ async function uploadFile(event) {
 async function apiJson(url, options) {
   const response = await fetch(url, options);
   const data = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(errorMessage(data, "HTTP " + response.status));
+  if (!response.ok) {
+    const error = new Error(errorMessage(data, "HTTP " + response.status));
+    error.status = response.status;
+    error.code = data && data.code;
+    throw error;
+  }
   return data;
 }
 
@@ -1955,8 +2404,9 @@ async function repairMessage(event) {
     assistantMessage = null;
     return;
   }
-  if (!assistantMessage) assistantMessage = appendBubble("assistant", "");
+  if (!assistantMessage) assistantMessage = appendBubble("assistant", "", event.run_id);
   assistantMessage.bubble.innerHTML = renderMarkdown(content);
+  appendCitationMap(assistantMessage.body, content, event.run_id);
   assistantMessage = null;
   assistantDraft = "";
   hideTyping();
@@ -1969,7 +2419,7 @@ async function handleRunEvent(event) {
       event.event_id <= (lastEventIdByRun[runId] || 0)) return;
   const data = event.data || {};
   if (event.type === "model.output.delta") {
-    if (!assistantMessage) assistantMessage = appendBubble("assistant", "");
+    if (!assistantMessage) assistantMessage = appendBubble("assistant", "", runId);
     assistantDraft += data.text || data.content || "";
     assistantMessage.bubble.innerHTML = renderMarkdown(assistantDraft);
     hideTyping();
@@ -2029,11 +2479,14 @@ function subscribeRun(runId) {
 async function openRun(runId, restore = false) {
   closeRunSubscription();
   activeRunId = runId;
+  clearRunSources("正在加载冻结来源…");
   lastEventIdByRun[runId] = 0;
   eventList.replaceChildren();
   assistantDraft = "";
   assistantMessage = null;
   const run = await loadRunSnapshot(runId);
+  if (activeRunId !== runId) return;
+  await loadRunSources(runId);
   if (activeRunId !== runId) return;
   restoreThroughEventId = restore ? run.last_event_id : 0;
   if (!restore) restoredAssistantTexts = new Set();
@@ -2109,7 +2562,15 @@ workspaceSelect.addEventListener("change", renderWorkspaceModeOptions);
 viewTaskDiffBtn.addEventListener("click", viewTaskDiff);
 cleanupTaskBtn.addEventListener("click", cleanupTaskWorkspace);
 newProjectBtn.addEventListener("click", createProject);
-projectAssignSelect.addEventListener("change", assignActiveSessionProject);
+projectAssignSelect.addEventListener("change", async () => {
+  if (activeSessionId) await assignActiveSessionProject();
+  else await loadKnowledge(projectAssignSelect.value);
+});
+ragEnabledToggle.addEventListener("change", updateRagEnabled);
+knowledgeUploadBtn.addEventListener("click", () => knowledgeFileInput.click());
+knowledgeFileInput.addEventListener("change", uploadKnowledgeFile);
+refreshKnowledgeBtn.addEventListener("click", () => loadKnowledge(knowledgeProjectId));
+knowledgeSearchForm.addEventListener("submit", searchKnowledge);
 settingsBtn.addEventListener("click", openSettings);
 closeSettingsBtn.addEventListener("click", closeSettings);
 settingsForm.addEventListener("submit", saveSettings);
@@ -2139,6 +2600,8 @@ document.querySelectorAll(".info-section-toggle").forEach((button) => {
 setPanelState("sessions", localStorage.getItem("countboter_panel_sessions") !== "0");
 setPanelState("info", localStorage.getItem("countboter_panel_info") !== "0");
 syncMcpTransportFields();
+clearKnowledgePanel();
+clearRunSources();
 
 bootstrapIfNeeded().then((ready) => {
   if (ready) {

@@ -1,6 +1,7 @@
 """API 路由：设置、会话、健康检查、工具列表和 SSE 聊天。"""
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -30,8 +31,12 @@ from backend.schemas import (
     MCPServerApprovalRequest,
     MCPServerCreateRequest,
     MCPServerEnabledRequest,
+    KnowledgeDocumentResponse,
+    KnowledgeSearchRequest,
+    KnowledgeSourcesResponse,
     ProjectCreateRequest,
     ProjectRenameRequest,
+    RAGEnabledRequest,
     RunCreateRequest,
     RunControlRequest,
     RunResponse,
@@ -102,6 +107,12 @@ public_router = APIRouter(prefix="/api")
 UPLOAD_DIR = DATA_DIR / "uploads"
 ALLOWED_UPLOAD_EXTENSIONS = {".xlsx", ".pptx", ".csv", ".txt", ".md", ".json", ".log"}
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024
+KNOWLEDGE_DIR = DATA_DIR / "knowledge"
+ALLOWED_KNOWLEDGE_EXTENSIONS = ALLOWED_UPLOAD_EXTENSIONS | {".docx", ".pdf"}
+MAX_KNOWLEDGE_DOCUMENTS = 500
+MAX_KNOWLEDGE_PROJECT_BYTES = 512 * 1024 * 1024
+KNOWLEDGE_PREVIEW_CHARS = 1200
+_knowledge_upload_lock = asyncio.Lock()
 SAFE_AGENT_GRANTS = frozenset({
     "read_only", "control.delegate_task", "control.send_agent_message",
     "control.get_task_status", "control.wait_for_tasks", "control.cancel_task",
@@ -129,6 +140,75 @@ def _error_response(status_code: int, code: str, message: str, details=None):
             "trace_id": uuid.uuid4().hex,
         },
     )
+
+
+def _rag_unavailable():
+    return _error_response(
+        503,
+        "rag_unavailable",
+        "本机 SQLite 不支持所需的 FTS5/trigram 能力",
+    )
+
+
+def _safe_unlink(path: Path) -> None:
+    """Best-effort cleanup must never replace the API result being returned."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("临时文件清理失败：%s", type(exc).__name__)
+
+
+def _knowledge_document_response(row: dict) -> dict:
+    """Project safe-list: storage paths, hashes, and leases never leave the Host API."""
+    return KnowledgeDocumentResponse(
+        document_id=row["id"],
+        title=row["title"],
+        size=row["size"],
+        mime_type=row.get("mime_type"),
+        status=row["status"],
+        error_code=row.get("error_code"),
+        chunk_count=row.get("chunk_count", 0),
+        indexed_at=row.get("indexed_at"),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    ).model_dump()
+
+
+def _knowledge_source_response(row: dict) -> dict:
+    result = {
+        "citation_id": row["citation_id"],
+        "chunk_id": row["chunk_id"],
+        "title": row["title"],
+        "locator": row.get("locator") if isinstance(row.get("locator"), dict) else {},
+        "available": row.get("available") is True,
+    }
+    if not result["available"]:
+        result["unavailable_reason"] = row.get("unavailable_reason") or "source_unavailable"
+    return result
+
+
+def _rag_query_for_task(task: dict) -> str:
+    """Build the bounded deterministic query from trusted Task fields."""
+    parts = [task.get("goal") or ""]
+    try:
+        acceptance = json.loads(task.get("acceptance_json") or "[]")
+    except (TypeError, ValueError):
+        acceptance = []
+    if isinstance(acceptance, list):
+        parts.extend(item for item in acceptance if isinstance(item, str))
+    return "\n".join(parts)[:4000]
+
+
+def _wake_rag_indexer():
+    """Wake the existing process-local indexer without importing it during module import."""
+    try:
+        from backend.rag import get_indexer
+
+        indexer = get_indexer(db)
+        indexer.wake()
+    except (ImportError, RuntimeError):
+        # Startup polling/recovery remains authoritative; an upload must stay durable.
+        return
 
 
 def _mcp_tool_response(tool: dict) -> dict | None:
@@ -672,12 +752,20 @@ async def create_run(
     if not key:
         return _error_response(400, "idempotency_key_required", "缺少 Idempotency-Key")
     try:
+        task = await asyncio.to_thread(db.get_task, task_id)
+        if not task:
+            return _error_response(404, "not_found", "资源不存在")
+        rag_query = _rag_query_for_task(task)
         try:
-            row, _created = await asyncio.to_thread(db.create_run, task_id, key)
+            row, _created = await asyncio.to_thread(
+                db.create_run, task_id, key, None, None, None, rag_query,
+            )
         except WorkspaceUnavailable:
             # A Git write Task persists its checkout identity before any Run exists.
             await asyncio.to_thread(_workspace_service().coordinate_git_worktrees, db)
-            row, _created = await asyncio.to_thread(db.create_run, task_id, key)
+            row, _created = await asyncio.to_thread(
+                db.create_run, task_id, key, None, None, None, rag_query,
+            )
     except Exception as exc:
         return _repository_error(exc)
     _runner().wake()
@@ -692,6 +780,38 @@ async def get_run(run_id: str):
     if not row:
         return _error_response(404, "not_found", "资源不存在")
     return await asyncio.to_thread(_run_response, row)
+
+
+@router.get("/runs/{run_id}/knowledge-sources", response_model=KnowledgeSourcesResponse)
+async def get_run_knowledge_sources(run_id: str):
+    run = await asyncio.to_thread(db.get_run, run_id)
+    if not run:
+        return _error_response(404, "not_found", "资源不存在")
+    try:
+        snapshot = json.loads(run.get("rag_snapshot_json") or "{}")
+        project_id = snapshot.get("project_id") if isinstance(snapshot, dict) else None
+        rows = await asyncio.to_thread(db.get_run_rag_sources, run_id)
+    except Exception as exc:
+        return _repository_error(exc)
+    return {
+        "run_id": run_id,
+        "project_id": project_id,
+        "sources": [_knowledge_source_response(row) for row in rows],
+    }
+
+
+@router.get("/runs/{run_id}/knowledge-sources/{citation_id}")
+async def get_run_knowledge_source(run_id: str, citation_id: str):
+    if not await asyncio.to_thread(db.get_run, run_id):
+        return _error_response(404, "not_found", "资源不存在")
+    try:
+        row = await asyncio.to_thread(db.get_run_rag_source, run_id, citation_id)
+    except Exception as exc:
+        return _repository_error(exc)
+    result = _knowledge_source_response(row)
+    if result["available"]:
+        result["preview"] = row.get("content", "")[:KNOWLEDGE_PREVIEW_CHARS]
+    return result
 
 
 @router.post("/runs/{run_id}/control", status_code=202, response_model=RunResponse)
@@ -1142,7 +1262,7 @@ async def upload_file(file: UploadFile = File(...)):
             raise
         db.register_upload(file_id, filename, stored_path, size, file.content_type, parsed)
     except Exception:
-        stored_path.unlink(missing_ok=True)
+        _safe_unlink(stored_path)
         raise
 
     logger.info("上传文件完成：file_id=%s，size=%d", file_id, size)
@@ -1348,6 +1468,187 @@ async def list_projects():
     return {"projects": projects}
 
 
+@router.get("/rag/status")
+async def rag_status():
+    """Return aggregate capability and queue state without exposing document data."""
+    try:
+        return await asyncio.to_thread(db.get_rag_status)
+    except Exception as exc:
+        return _repository_error(exc)
+
+
+@router.get("/projects/{project_id}/knowledge")
+async def list_project_knowledge(project_id: str):
+    try:
+        status, rows = await asyncio.gather(
+            asyncio.to_thread(db.get_rag_status, project_id),
+            asyncio.to_thread(db.list_rag_documents, project_id),
+        )
+    except Exception as exc:
+        return _repository_error(exc)
+    return {
+        **status,
+        "project_id": project_id,
+        "documents": [_knowledge_document_response(row) for row in rows],
+        "limits": {
+            "max_upload_bytes": MAX_UPLOAD_SIZE,
+            "max_project_bytes": MAX_KNOWLEDGE_PROJECT_BYTES,
+            "max_documents": MAX_KNOWLEDGE_DOCUMENTS,
+            "extensions": sorted(ALLOWED_KNOWLEDGE_EXTENSIONS),
+        },
+    }
+
+
+@router.post("/projects/{project_id}/knowledge")
+async def upload_project_knowledge(
+    project_id: str,
+    response: Response,
+    file: UploadFile = File(...),
+):
+    """Persist one immutable Project-scoped source and queue it for indexing."""
+    if not await asyncio.to_thread(db.get_project, project_id):
+        return _error_response(404, "not_found", "资源不存在")
+    if not await asyncio.to_thread(db.rag_fts_available):
+        return _rag_unavailable()
+
+    filename = Path(file.filename or "").name.strip()
+    extension = Path(filename).suffix.lower()
+    if not filename or len(filename) > 500 or extension not in ALLOWED_KNOWLEDGE_EXTENSIONS:
+        return _error_response(415, "upload_type_mismatch", "文件类型不受支持")
+
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+    document_id = str(uuid.uuid4())
+    stored_path = (KNOWLEDGE_DIR / f"{document_id}{extension}").resolve()
+    if stored_path.parent != KNOWLEDGE_DIR.resolve():
+        return _error_response(422, "invalid_request", "知识文件路径无效")
+
+    digest = hashlib.sha256()
+    size = 0
+    keep_file = False
+    try:
+        with stored_path.open("xb") as handle:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_SIZE:
+                    return _error_response(413, "upload_limit_exceeded", "上传文件超过限制")
+                digest.update(chunk)
+                handle.write(chunk)
+        if size == 0:
+            return _error_response(422, "invalid_request", "知识文件不能为空")
+
+        async with _knowledge_upload_lock:
+            rows = await asyncio.to_thread(db.list_rag_documents, project_id)
+            duplicate = next(
+                (row for row in rows if row.get("content_sha256") == digest.hexdigest()),
+                None,
+            )
+            if duplicate:
+                return _knowledge_document_response(duplicate)
+            if len(rows) >= MAX_KNOWLEDGE_DOCUMENTS:
+                return _error_response(413, "knowledge_capacity_exceeded", "Project 文档数已达上限")
+            if sum(row["size"] for row in rows) + size > MAX_KNOWLEDGE_PROJECT_BYTES:
+                return _error_response(413, "knowledge_capacity_exceeded", "Project 知识容量已达上限")
+            row, created = await asyncio.to_thread(
+                db.register_rag_document,
+                project_id,
+                filename,
+                stored_path,
+                size,
+                (file.content_type or None),
+                digest.hexdigest(),
+                1,
+                document_id,
+            )
+        if created:
+            keep_file = True
+            response.status_code = 201
+            _wake_rag_indexer()
+        logger.info("知识文档已登记：document_id=%s size=%d", row["id"], size)
+        return _knowledge_document_response(row)
+    except Exception as exc:
+        if getattr(exc, "code", None) or isinstance(exc, ValueError):
+            return _repository_error(exc)
+        raise
+    finally:
+        await file.close()
+        if not keep_file:
+            _safe_unlink(stored_path)
+
+
+@router.get(
+    "/projects/{project_id}/knowledge/{document_id}",
+    response_model=KnowledgeDocumentResponse,
+)
+async def get_project_knowledge(project_id: str, document_id: str):
+    if not await asyncio.to_thread(db.get_project, project_id):
+        return _error_response(404, "not_found", "资源不存在")
+    row = await asyncio.to_thread(db.get_rag_document, project_id, document_id)
+    if not row:
+        return _error_response(404, "not_found", "资源不存在")
+    return _knowledge_document_response(row)
+
+
+@router.delete("/projects/{project_id}/knowledge/{document_id}", status_code=202)
+async def delete_project_knowledge(project_id: str, document_id: str):
+    try:
+        row = await asyncio.to_thread(db.soft_delete_rag_document, project_id, document_id)
+    except Exception as exc:
+        return _repository_error(exc)
+    _wake_rag_indexer()
+    return _knowledge_document_response(row)
+
+
+@router.post("/projects/{project_id}/knowledge/{document_id}/retry", status_code=202)
+async def retry_project_knowledge(project_id: str, document_id: str):
+    try:
+        row = await asyncio.to_thread(db.retry_rag_document, project_id, document_id)
+    except Exception as exc:
+        return _repository_error(exc)
+    _wake_rag_indexer()
+    return _knowledge_document_response(row)
+
+
+@router.put("/projects/{project_id}/rag-enabled")
+async def set_project_rag_enabled(project_id: str, payload: RAGEnabledRequest):
+    if not await asyncio.to_thread(db.get_project, project_id):
+        return _error_response(404, "not_found", "资源不存在")
+    if payload.enabled and not await asyncio.to_thread(db.rag_fts_available):
+        return _rag_unavailable()
+    try:
+        row = await asyncio.to_thread(db.set_project_rag_enabled, project_id, payload.enabled)
+    except Exception as exc:
+        return _repository_error(exc)
+    return {"project_id": row["id"], "rag_enabled": bool(row["rag_enabled"])}
+
+
+@router.post("/projects/{project_id}/knowledge/search")
+async def search_project_knowledge(project_id: str, payload: KnowledgeSearchRequest):
+    if not await asyncio.to_thread(db.get_project, project_id):
+        return _error_response(404, "not_found", "资源不存在")
+    if not await asyncio.to_thread(db.rag_fts_available):
+        return _rag_unavailable()
+    try:
+        rows = await asyncio.to_thread(
+            db.search_rag_chunks, project_id, payload.query, payload.top_k,
+        )
+    except Exception as exc:
+        return _repository_error(exc)
+    matches = []
+    for index, row in enumerate(rows, 1):
+        try:
+            locator = json.loads(row.get("locator_json") or "{}")
+        except (TypeError, ValueError):
+            locator = {}
+        matches.append({
+            "citation_id": f"K{index}",
+            "chunk_id": row["id"],
+            "title": row.get("document_title") or row["title"],
+            "locator": locator if isinstance(locator, dict) else {},
+            "preview": row["content"][:KNOWLEDGE_PREVIEW_CHARS],
+        })
+    return {"project_id": project_id, "matches": matches}
+
+
 @router.post("/projects")
 async def create_project(payload: ProjectCreateRequest):
     """创建项目文件夹。"""
@@ -1469,7 +1770,14 @@ async def chat(payload: ChatRequest, request: Request,
 
     try:
         _task, run = await asyncio.to_thread(
-            db.create_legacy_chat_run, session_id, message, idempotency_key or uuid.uuid4().hex
+            db.create_legacy_chat_run,
+            session_id,
+            message,
+            idempotency_key or uuid.uuid4().hex,
+            None,
+            None,
+            None,
+            message[:4000],
         )
     except Exception as exc:
         return _repository_error(exc)

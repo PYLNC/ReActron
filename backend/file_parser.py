@@ -2,31 +2,76 @@
 
 import csv
 import json
+from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
+from typing import Any
 from zipfile import BadZipFile, ZipFile
 
 from openpyxl import load_workbook
 from pptx import Presentation
 
 
-def _check_zip_limits(path: Path) -> None:
+class DocumentExtractionError(ValueError):
+    """Safe, fixed-code extraction failure."""
+
+    code = "document_parse_failed"
+
+
+class DocumentLimitExceeded(DocumentExtractionError):
+    code = "document_limit_exceeded"
+
+
+class UnsupportedDocumentType(DocumentExtractionError):
+    code = "unsupported_document_type"
+
+
+class DocumentNoText(DocumentExtractionError):
+    code = "document_no_text"
+
+
+class DocumentExtractionTimeout(DocumentExtractionError):
+    code = "document_extraction_timeout"
+
+
+@dataclass(frozen=True)
+class DocumentSegment:
+    text: str
+    section: str
+    locator: dict[str, Any]
+
+
+def _check_zip_limits(path: Path, *, required: tuple[str, ...] = ()) -> None:
     """解析库打开 ZIP 前，拒绝明显的展开量与压缩比炸弹。"""
     try:
         with ZipFile(path) as archive:
             entries = archive.infolist()
             if len(entries) > 2_000:
-                raise ValueError("ZIP entry limit exceeded")
+                raise DocumentLimitExceeded("ZIP entry limit exceeded")
             total = 0
+            names = set()
             for item in entries:
+                name = item.filename.replace("\\", "/")
+                parts = PurePosixPath(name).parts
+                is_symlink = (item.external_attr >> 16) & 0o170000 == 0o120000
+                if (
+                    not name or "\x00" in name or name.startswith("/") or
+                    ".." in parts or (parts and ":" in parts[0]) or
+                    item.flag_bits & 1 or is_symlink or name in names
+                ):
+                    raise DocumentExtractionError("Invalid ZIP container")
+                names.add(name)
                 total += item.file_size
                 if (
                     item.file_size > 25 * 1024 * 1024
                     or total > 100 * 1024 * 1024
                     or item.file_size > max(item.compress_size, 1) * 100
                 ):
-                    raise ValueError("ZIP expansion limit exceeded")
+                    raise DocumentLimitExceeded("ZIP expansion limit exceeded")
+            if any(name not in names for name in required):
+                raise DocumentExtractionError("Invalid ZIP container")
     except BadZipFile as exc:
-        raise ValueError("Invalid ZIP container") from exc
+        raise DocumentExtractionError("Invalid ZIP container") from exc
 
 
 def _parse_excel(path: Path) -> dict:
@@ -82,16 +127,22 @@ def parse_uploaded_file(path: Path) -> dict:
     """根据扩展名解析文件并返回摘要。"""
     suffix = path.suffix.lower()
     if suffix == ".xlsx":
-        _check_zip_limits(path)
+        _check_zip_limits(path, required=("[Content_Types].xml", "xl/workbook.xml"))
         return _parse_excel(path)
     if suffix == ".pptx":
-        _check_zip_limits(path)
+        _check_zip_limits(path, required=("[Content_Types].xml", "ppt/presentation.xml"))
         return _parse_pptx(path)
     if suffix == ".csv":
         return _parse_csv(path)
     if suffix in (".txt", ".md", ".json", ".log"):
         return _parse_text(path)
     return {"type": "unsupported", "preview": ""}
+
+
+def extract_document(path: Path, *, timeout_seconds: float = 20.0) -> list[DocumentSegment]:
+    """Extract bounded full text in a killable child process."""
+    from backend.rag_extract import extract_document as extract
+    return extract(path, timeout_seconds=timeout_seconds)
 
 
 def to_json_safe(data) -> str:
